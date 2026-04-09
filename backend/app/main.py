@@ -39,11 +39,14 @@ app.add_middleware(
 # --- Routes ---
 from app.api.chat import router as chat_router  # noqa: E402
 from app.api.conversations import router as conversations_router  # noqa: E402
+from app.api.freight import router as freight_router  # noqa: E402
 from app.api.health import router as health_router  # noqa: E402
+from app.api.integrations import router as integrations_router  # noqa: E402
 from app.api.upload import router as upload_router  # noqa: E402
 
 app.include_router(health_router, tags=["health"])
 app.include_router(chat_router, prefix="/api", tags=["chat"])
 app.include_router(conversations_router, prefix="/api", tags=["conversations"])
+app.include_router(freight_router, prefix="/api", tags=["freight"])
+app.include_router(integrations_router, prefix="/api", tags=["integrations"])
 app.include_router(upload_router, prefix="/api", tags=["upload"])
-app.include_router(conversations_router, prefix="/api", tags=["conversations"])

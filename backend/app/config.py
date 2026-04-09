@@ -48,6 +48,23 @@ class Settings(BaseSettings):
     s3_bucket: str = "agent-content"
     s3_public_url: str = "http://localhost:9000/agent-content"
 
+    # Microsoft Graph / Outlook
+    microsoft_tenant_id: str = ""
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    microsoft_mailbox: str = ""
+    microsoft_graph_base_url: str = "https://graph.microsoft.com/v1.0"
+
+    # TMS integration
+    tms_base_url: str = ""
+    tms_api_key: str = ""
+    tms_timeout_seconds: int = 30
+
+    # Freight workflow defaults
+    quote_wait_minutes_default: int = 20
+    profit_margin_percent_default: float = 15.0
+    profit_margin_floor_default: float = 0.0
+
     @property
     def postgres_url(self) -> str:
         return (
@@ -58,6 +75,13 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.backend_cors_origins.split(",")]
+
+    @property
+    def microsoft_token_url(self) -> str:
+        return (
+            "https://login.microsoftonline.com/"
+            f"{self.microsoft_tenant_id}/oauth2/v2.0/token"
+        )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
