@@ -18,9 +18,11 @@ from app.memory.database import (
     get_session,
 )
 from app.schemas import (
+    AutomationPolicy,
     BidIntakeRequest,
     BidIntakeResponse,
     BidRecord,
+    BookingExecutionResponse,
     CarrierOutreachRequest,
     CarrierOutreachResponse,
     CarrierRecord,
@@ -35,6 +37,7 @@ from app.schemas import (
     OutlookIngestRequest,
     OutlookSyncRequest,
     OutlookSyncResponse,
+    OperatorAction,
     FreightOverviewCounts,
     FreightOverviewResponse,
     MarginPolicy,
@@ -43,6 +46,9 @@ from app.schemas import (
     ShipmentUpsertRequest,
     ShipmentStage,
     ReviewQueueItem,
+    ShipmentOperatorActionRequest,
+    ShipmentOperatorActionResponse,
+    ShipmentDocumentRecord,
     TmsHandoffRequest,
     TmsHandoffResponse,
     WorkflowEventRecord,
@@ -50,6 +56,8 @@ from app.schemas import (
     WorkflowEventType,
 )
 from app.services.freight_execution import (
+    collect_shipment_attachments,
+    confirm_booking_and_handoff,
     evaluate_shipment_bids,
     handoff_to_tms,
     intake_bid,
@@ -58,6 +66,7 @@ from app.services.freight_execution import (
 )
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
 from app.services.freight_inbox_agent import (
+    continue_phase1_workflow,
     evaluate_expired_quote_windows,
     run_freight_inbox_orchestrator,
 )
@@ -73,6 +82,7 @@ def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
     result.confidence = decision.confidence
     result.shipment_extracted = decision.shipment_extracted
     result.missing_fields = decision.missing_fields
+    result.ambiguity_reasons = decision.ambiguity_reasons
     result.manual_review_required = decision.manual_review_required
     result.next_action = decision.next_action
     result.acknowledgement_drafted = decision.acknowledgement_drafted
@@ -85,6 +95,55 @@ def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
     result.bid_amount = decision.bid_amount
     result.evaluation_triggered = decision.evaluation_triggered
     result.quote_auto_sent = decision.quote_auto_sent
+    result.booking_triggered = decision.booking_triggered
+    result.booking_confirmation_sent = decision.booking_confirmation_sent
+    result.tms_handoff_status = decision.tms_handoff_status
+
+
+def _build_automation_policy(
+    *,
+    auto_acknowledgement: bool,
+    acknowledgement_dry_run: bool,
+    auto_outreach: bool,
+    outreach_dry_run: bool,
+    auto_quote: bool,
+    quote_dry_run: bool,
+    auto_book: bool,
+    booking_dry_run: bool,
+) -> AutomationPolicy:
+    return AutomationPolicy(
+        auto_acknowledgement=auto_acknowledgement,
+        acknowledgement_dry_run=acknowledgement_dry_run,
+        auto_outreach=auto_outreach,
+        outreach_dry_run=outreach_dry_run,
+        auto_quote=auto_quote,
+        quote_dry_run=quote_dry_run,
+        auto_book=auto_book,
+        booking_dry_run=booking_dry_run,
+        allow_repeat_manual_review=False,
+    )
+
+
+async def _latest_inbound_message_for_shipment(
+    session: AsyncSession,
+    shipment: Shipment,
+    *,
+    sender: str | None = None,
+) -> EmailMessage | None:
+    if shipment.email_thread_id is None:
+        return None
+    result = await session.execute(
+        select(EmailMessage)
+        .where(
+            EmailMessage.thread_id == shipment.email_thread_id,
+            EmailMessage.direction == "inbound",
+        )
+        .order_by(EmailMessage.received_at.desc())
+    )
+    for message in result.scalars().all():
+        if sender is None or message.sender == sender:
+            return message
+    return None
 
 
 def _serialize_client(client: Client) -> ClientRecord:
@@ -134,7 +193,12 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         ai_intent=ai_payload.get("intent"),
         ai_confidence=ai_payload.get("confidence"),
         ai_missing_fields=list(ai_payload.get("missing_fields", []) or []),
+        ai_ambiguity_reasons=list(ai_payload.get("ambiguity_reasons", []) or []),
         ai_next_action=ai_payload.get("next_action"),
+        booking_state=ai_payload.get("booking_state"),
+        booking_error=ai_payload.get("booking_error"),
+        tms_handoff_status=ai_payload.get("tms_handoff_status"),
+        attachment_count=int(ai_payload.get("attachment_count", 0) or 0),
         manual_review_required=bool(ai_payload.get("manual_review_required", False)),
         created_at=shipment.created_at,
         updated_at=shipment.updated_at,
@@ -159,6 +223,9 @@ def _serialize_review_queue_item(event: WorkflowEvent) -> ReviewQueueItem:
         stage=event.stage,
         event_type=event.event_type,
         reason=str((event.payload_json or {}).get("reason", "")),
+        next_action=(event.payload_json or {}).get("next_action"),
+        missing_fields=list((event.payload_json or {}).get("missing_fields", []) or []),
+        ambiguity_reasons=list((event.payload_json or {}).get("ambiguity_reasons", []) or []),
         created_at=event.created_at,
     )
 
@@ -176,6 +243,17 @@ def _serialize_bid_record(bid: CarrierBid, carrier: Carrier) -> BidRecord:
         status=bid.status,
         score=dict(bid.score_json or {}),
         received_at=bid.received_at,
+    )
+
+
+def _serialize_document_record(document: dict) -> ShipmentDocumentRecord:
+    return ShipmentDocumentRecord(
+        id=document.get("id"),
+        name=document.get("name"),
+        document_type=str(document.get("document_type", "unknown")),
+        content_type=document.get("content_type"),
+        size=document.get("size"),
+        source_email_id=str(document.get("source_email_id", "")),
     )
 
 
@@ -197,10 +275,85 @@ async def _latest_ai_payloads(
         payload = dict(event.payload_json or {})
         if any(
             key in payload
-            for key in ("intent", "confidence", "missing_fields", "next_action", "manual_review_required")
+            for key in (
+                "intent",
+                "confidence",
+                "missing_fields",
+                "ambiguity_reasons",
+                "next_action",
+                "manual_review_required",
+            )
         ):
             payloads[event.shipment_id] = payload
     return payloads
+
+
+async def _latest_booking_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.shipment_id.in_(shipment_ids))
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        if event.shipment_id in payloads:
+            continue
+        payload = dict(event.payload_json or {})
+        if event.event_type == WorkflowEventType.TMS_HANDOFF_SENT.value:
+            payloads[event.shipment_id] = {
+                "booking_state": "booked" if payload.get("status") in {"submitted", "already_submitted"} else "booking_preview",
+                "tms_handoff_status": payload.get("status"),
+                "booking_error": None,
+                "attachment_count": payload.get("attachment_count", 0),
+            }
+        elif event.event_type == WorkflowEventType.EXCEPTION_RAISED.value and payload.get("reason") == "tms_handoff_failed":
+            payloads[event.shipment_id] = {
+                "booking_state": "booking_failed",
+                "tms_handoff_status": "failed",
+                "booking_error": payload.get("message"),
+                "attachment_count": 0,
+            }
+        elif event.event_type == WorkflowEventType.CUSTOMER_CONFIRMED.value:
+            payloads[event.shipment_id] = {
+                "booking_state": "booking_ready",
+                "tms_handoff_status": None,
+                "booking_error": None,
+                "attachment_count": 0,
+            }
+    return payloads
+
+
+async def _attachment_counts(
+    session: AsyncSession,
+    shipments: list[Shipment],
+) -> dict[UUID, int]:
+    counts: dict[UUID, int] = {}
+    for shipment in shipments:
+        if shipment.email_thread_id is None:
+            counts[shipment.id] = 0
+            continue
+        result = await session.execute(
+            select(EmailMessage).where(EmailMessage.thread_id == shipment.email_thread_id)
+        )
+        count = 0
+        seen: set[tuple[str | None, str | None]] = set()
+        for message in result.scalars().all():
+            payload = dict(message.raw_payload_json or {})
+            for item in payload.get("attachments") or payload.get("Attachments") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = (item.get("id"), item.get("name") or item.get("fileName") or item.get("filename"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                count += 1
+        counts[shipment.id] = count
+    return counts
 
 
 @router.get("/freight/foundation", response_model=FreightFoundationResponse)
@@ -363,7 +516,19 @@ async def list_shipments(session: AsyncSession = Depends(get_session)) -> list[S
     result = await session.execute(select(Shipment).order_by(Shipment.created_at.desc()))
     shipments = list(result.scalars().all())
     ai_payloads = await _latest_ai_payloads(session, [shipment.id for shipment in shipments])
-    return [_serialize_shipment(shipment, ai_payloads.get(shipment.id)) for shipment in shipments]
+    booking_payloads = await _latest_booking_payloads(session, [shipment.id for shipment in shipments])
+    attachment_counts = await _attachment_counts(session, shipments)
+    return [
+        _serialize_shipment(
+            shipment,
+            {
+                **(ai_payloads.get(shipment.id) or {}),
+                **(booking_payloads.get(shipment.id) or {}),
+                "attachment_count": attachment_counts.get(shipment.id, 0),
+            },
+        )
+        for shipment in shipments
+    ]
 
 
 @router.post("/freight/shipments", response_model=ShipmentRecord)
@@ -407,7 +572,16 @@ async def get_shipment(
     if shipment is None:
         raise HTTPException(status_code=404, detail="Shipment not found.")
     ai_payloads = await _latest_ai_payloads(session, [shipment.id])
-    return _serialize_shipment(shipment, ai_payloads.get(shipment.id))
+    booking_payloads = await _latest_booking_payloads(session, [shipment.id])
+    attachment_counts = await _attachment_counts(session, [shipment])
+    return _serialize_shipment(
+        shipment,
+        {
+            **(ai_payloads.get(shipment.id) or {}),
+            **(booking_payloads.get(shipment.id) or {}),
+            "attachment_count": attachment_counts.get(shipment.id, 0),
+        },
+    )
 
 
 @router.patch("/freight/shipments/{shipment_id}", response_model=ShipmentRecord)
@@ -475,6 +649,112 @@ async def freight_review_queue(
     return [_serialize_review_queue_item(event) for event in result.scalars().all()]
 
 
+@router.post(
+    "/freight/shipments/{shipment_id}/operator-action",
+    response_model=ShipmentOperatorActionResponse,
+)
+async def freight_operator_action(
+    shipment_id: UUID,
+    request: ShipmentOperatorActionRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentOperatorActionResponse:
+    """Run an operator-approved Phase 1 action on a shipment."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+
+    policy = _build_automation_policy(
+        auto_acknowledgement=True,
+        acknowledgement_dry_run=False,
+        auto_outreach=True,
+        outreach_dry_run=False,
+        auto_quote=True,
+        quote_dry_run=False,
+        auto_book=True,
+        booking_dry_run=False,
+    )
+
+    try:
+        if request.action in {OperatorAction.RESUME_WORKFLOW, OperatorAction.APPROVE_AND_CONTINUE}:
+            decision = await continue_phase1_workflow(session, shipment_id=shipment.id, policy=policy)
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message="Workflow continued from current state.",
+                next_action=decision.next_action,
+                manual_review_required=decision.manual_review_required,
+                acknowledgement_sent=decision.acknowledgement_drafted,
+                outreach_sent=decision.outreach_drafted,
+                evaluation_triggered=decision.evaluation_triggered,
+                quote_sent=decision.quote_auto_sent,
+                decision=decision,
+            )
+
+        if request.action == OperatorAction.RERUN_PARSING:
+            latest_message = await _latest_inbound_message_for_shipment(session, shipment)
+            if latest_message is None:
+                raise RuntimeError("No inbound email available to re-run parsing.")
+            decision = await run_freight_inbox_orchestrator(
+                session,
+                email_message_id=latest_message.id,
+                policy=policy,
+            )
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message="Parsing and decisioning re-run on the latest inbound email.",
+                next_action=decision.next_action,
+                manual_review_required=decision.manual_review_required,
+                acknowledgement_sent=decision.acknowledgement_drafted,
+                outreach_sent=decision.outreach_drafted,
+                evaluation_triggered=decision.evaluation_triggered,
+                quote_sent=decision.quote_auto_sent,
+                decision=decision,
+            )
+
+        if request.action == OperatorAction.RERUN_OUTREACH:
+            response = await create_carrier_outreach(
+                session,
+                shipment_id=shipment.id,
+                carrier_ids=[],
+                dry_run=False,
+                custom_message=None,
+            )
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message=f"Carrier outreach refreshed; {response.created_bids} new request(s) created across {response.targeted} carrier(s).",
+                next_action="waiting_bids",
+                outreach_sent=response.created_bids > 0,
+            )
+
+        if request.action == OperatorAction.RERUN_EVALUATION:
+            evaluation = await evaluate_shipment_bids(session, shipment.id)
+            quote_response = await send_customer_quote(
+                session,
+                shipment_id=shipment.id,
+                bid_id=evaluation.selected_bid_id,
+                dry_run=False,
+                custom_message=None,
+            )
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message=f"Evaluation re-run and customer quote sent at ${quote_response.final_amount:.2f}.",
+                next_action="customer_quote_sent",
+                evaluation_triggered=True,
+                quote_sent=True,
+            )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    raise HTTPException(status_code=400, detail="Unsupported operator action.")
+
+
 @router.get("/freight/shipments/{shipment_id}/bids", response_model=list[BidRecord])
 async def list_shipment_bids(
     shipment_id: UUID,
@@ -492,6 +772,19 @@ async def list_shipment_bids(
         .order_by(CarrierBid.received_at.desc())
     )
     return [_serialize_bid_record(bid, carrier) for bid, carrier in result.all()]
+
+
+@router.get("/freight/shipments/{shipment_id}/documents", response_model=list[ShipmentDocumentRecord])
+async def list_shipment_documents(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> list[ShipmentDocumentRecord]:
+    """Return typed document metadata collected from the shipment email thread."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    documents = await collect_shipment_attachments(session, shipment)
+    return [_serialize_document_record(document) for document in documents]
 
 
 @router.post(
@@ -611,6 +904,34 @@ async def freight_tms_handoff(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post(
+    "/freight/shipments/{shipment_id}/book",
+    response_model=BookingExecutionResponse,
+)
+async def freight_book_shipment(
+    shipment_id: UUID,
+    request: TmsHandoffRequest,
+    session: AsyncSession = Depends(get_session),
+) -> BookingExecutionResponse:
+    """Confirm booking, submit to TMS, and send customer booking confirmation."""
+    try:
+        handoff, confirmation = await confirm_booking_and_handoff(
+            session,
+            shipment_id=shipment_id,
+            bid_id=request.bid_id,
+            dry_run=request.dry_run,
+            custom_message=None,
+        )
+        return BookingExecutionResponse(
+            shipment_id=str(shipment_id),
+            dry_run=request.dry_run,
+            handoff=handoff,
+            confirmation=confirmation,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/freight/reference-preview")
 async def freight_reference_preview(subject: str = "New quote request") -> dict:
     """Preview deterministic quote reference generation and subject correlation."""
@@ -662,6 +983,16 @@ async def freight_outlook_ingest(
     session: AsyncSession = Depends(get_session),
 ) -> OutlookSyncResponse:
     """Normalize a provided Outlook message payload into freight workflow tables."""
+    policy = _build_automation_policy(
+        auto_acknowledgement=request.auto_acknowledge_new_shipment,
+        acknowledgement_dry_run=request.acknowledgement_dry_run,
+        auto_outreach=request.auto_prepare_outreach_for_new_shipment,
+        outreach_dry_run=request.outreach_dry_run,
+        auto_quote=request.auto_send_customer_quote,
+        quote_dry_run=request.customer_quote_dry_run,
+        auto_book=request.auto_book_on_confirmation,
+        booking_dry_run=request.booking_dry_run,
+    )
     client = OutlookGraphClient()
     mailbox_message = client.normalize_message(request.message)
     result = await ingest_outlook_message(
@@ -672,16 +1003,23 @@ async def freight_outlook_ingest(
     if result is None:
         return OutlookSyncResponse(imported=0, skipped=1, results=[])
 
-    try:
-        decision = await run_freight_inbox_orchestrator(session, email_message_id=result.email_message_id)
-        _apply_decision(result, decision)
-    except RuntimeError as exc:
-        result.manual_review_required = True
-        result.next_action = "manual_review"
-        result.intent = "orchestrator_error"
-        result.confidence = 0.0
-        result.missing_fields = []
-    expired = await evaluate_expired_quote_windows(session)
+    if result.created_message:
+        try:
+            decision = await run_freight_inbox_orchestrator(
+                session,
+                email_message_id=result.email_message_id,
+                policy=policy,
+            )
+            _apply_decision(result, decision)
+        except RuntimeError:
+            result.manual_review_required = True
+            result.next_action = "manual_review"
+            result.intent = "orchestrator_error"
+            result.confidence = 0.0
+            result.missing_fields = []
+    else:
+        result.next_action = "already_ingested"
+    expired = await evaluate_expired_quote_windows(session, policy=policy)
 
     return OutlookSyncResponse(
         imported=1,
@@ -703,6 +1041,16 @@ async def freight_outlook_sync(
     session: AsyncSession = Depends(get_session),
 ) -> OutlookSyncResponse:
     """Pull recent Outlook inbox messages and ingest them into workflow tables."""
+    policy = _build_automation_policy(
+        auto_acknowledgement=request.auto_acknowledge_new_shipments,
+        acknowledgement_dry_run=request.acknowledgement_dry_run,
+        auto_outreach=request.auto_prepare_outreach_for_new_shipments,
+        outreach_dry_run=request.outreach_dry_run,
+        auto_quote=request.auto_send_customer_quotes,
+        quote_dry_run=request.customer_quote_dry_run,
+        auto_book=request.auto_book_on_confirmation,
+        booking_dry_run=request.booking_dry_run,
+    )
     outlook = OutlookGraphClient()
     messages = await outlook.list_messages(limit=request.limit)
 
@@ -722,14 +1070,21 @@ async def freight_outlook_sync(
             skipped += 1
             continue
 
-        try:
-            decision = await run_freight_inbox_orchestrator(session, email_message_id=result.email_message_id)
-            _apply_decision(result, decision)
-        except RuntimeError:
-            result.manual_review_required = True
-            result.next_action = "manual_review"
-            result.intent = "orchestrator_error"
-            result.confidence = 0.0
+        if result.created_message:
+            try:
+                decision = await run_freight_inbox_orchestrator(
+                    session,
+                    email_message_id=result.email_message_id,
+                    policy=policy,
+                )
+                _apply_decision(result, decision)
+            except RuntimeError:
+                result.manual_review_required = True
+                result.next_action = "manual_review"
+                result.intent = "orchestrator_error"
+                result.confidence = 0.0
+        else:
+            result.next_action = "already_ingested"
         imported += 1
         parsed_shipments += 1 if result.shipment_extracted else 0
         auto_acknowledgements += 1 if result.acknowledgement_drafted else 0
@@ -740,7 +1095,7 @@ async def freight_outlook_sync(
         manual_reviews += 1 if result.manual_review_required else 0
         results.append(result)
 
-    expired = await evaluate_expired_quote_windows(session)
+    expired = await evaluate_expired_quote_windows(session, policy=policy)
     auto_evaluations += len(expired)
     auto_quotes += len([item for item in expired if item.quote_auto_sent])
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 
 from app.config import settings
@@ -55,7 +57,14 @@ class TmsConnector:
             "details": details,
         }
 
-    async def request(self, method: str, path: str, json: dict | None = None) -> dict:
+    async def request(
+        self,
+        method: str,
+        path: str,
+        json: dict | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict:
         """Make an authenticated request to the TMS API."""
         missing = self.missing_settings()
         if missing:
@@ -66,10 +75,22 @@ class TmsConnector:
             "Authorization": f"Bearer {settings.tms_api_key}",
             "Content-Type": "application/json",
         }
+        if idempotency_key:
+            headers["X-Idempotency-Key"] = idempotency_key
 
+        attempts = max(settings.tms_retry_attempts + 1, 1)
+        last_error: Exception | None = None
         async with httpx.AsyncClient(timeout=settings.tms_timeout_seconds) as client:
-            response = await client.request(method.upper(), url, headers=headers, json=json)
-            response.raise_for_status()
-            if not response.content:
-                return {}
-            return response.json()
+            for attempt in range(1, attempts + 1):
+                try:
+                    response = await client.request(method.upper(), url, headers=headers, json=json)
+                    response.raise_for_status()
+                    if not response.content:
+                        return {}
+                    return response.json()
+                except (httpx.TimeoutException, httpx.HTTPError) as exc:
+                    last_error = exc
+                    if attempt >= attempts:
+                        break
+                    await asyncio.sleep(min(attempt, 2))
+        raise RuntimeError(f"TMS request failed after {attempts} attempt(s): {last_error}")

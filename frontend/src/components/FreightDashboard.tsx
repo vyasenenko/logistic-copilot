@@ -79,7 +79,12 @@ interface ShipmentRecord {
   ai_intent: string | null;
   ai_confidence: number | null;
   ai_missing_fields: string[];
+  ai_ambiguity_reasons: string[];
   ai_next_action: string | null;
+  booking_state: string | null;
+  booking_error: string | null;
+  tms_handoff_status: string | null;
+  attachment_count: number;
   manual_review_required: boolean;
   created_at: string;
   updated_at: string;
@@ -92,6 +97,15 @@ interface WorkflowEventRecord {
   stage: string;
   payload: Record<string, unknown>;
   created_at: string;
+}
+
+interface ShipmentDocumentRecord {
+  id: string | null;
+  name: string | null;
+  document_type: string;
+  content_type: string | null;
+  size: number | null;
+  source_email_id: string;
 }
 
 interface BidRecord {
@@ -158,6 +172,7 @@ interface OutlookIngestResult {
   confidence: number | null;
   shipment_extracted: boolean;
   missing_fields: string[];
+  ambiguity_reasons: string[];
   manual_review_required: boolean;
   next_action: string | null;
   evaluation_triggered: boolean;
@@ -184,7 +199,30 @@ interface ReviewQueueItem {
   stage: string;
   event_type: string;
   reason: string;
+  next_action: string | null;
+  missing_fields: string[];
+  ambiguity_reasons: string[];
   created_at: string;
+}
+
+type OperatorAction =
+  | "resume_workflow"
+  | "approve_and_continue"
+  | "rerun_parsing"
+  | "rerun_outreach"
+  | "rerun_evaluation";
+
+interface ShipmentOperatorActionResponse {
+  shipment_id: string;
+  action: OperatorAction;
+  status: string;
+  message: string;
+  next_action: string;
+  manual_review_required: boolean;
+  acknowledgement_sent: boolean;
+  outreach_sent: boolean;
+  evaluation_triggered: boolean;
+  quote_sent: boolean;
 }
 
 interface CustomerQuoteResponse {
@@ -208,6 +246,19 @@ interface TmsHandoffResponse {
   response: Record<string, unknown>;
 }
 
+interface BookingExecutionResponse {
+  shipment_id: string;
+  dry_run: boolean;
+  handoff: TmsHandoffResponse;
+  confirmation: {
+    shipment_id: string;
+    client_email: string;
+    subject: string;
+    body: string;
+    dry_run: boolean;
+  };
+}
+
 const SHIPMENT_STATUS_STYLES: Record<string, string> = {
   received: "bg-sky-400/15 text-sky-200 border-sky-300/20",
   parsing: "bg-teal-400/15 text-teal-200 border-teal-300/20",
@@ -217,6 +268,8 @@ const SHIPMENT_STATUS_STYLES: Record<string, string> = {
   evaluating: "bg-rose-400/15 text-rose-200 border-rose-300/20",
   quoted: "bg-emerald-400/15 text-emerald-200 border-emerald-300/20",
   awaiting_confirmation: "bg-fuchsia-400/15 text-fuchsia-200 border-fuchsia-300/20",
+  booking_in_progress: "bg-lime-400/15 text-lime-100 border-lime-300/20",
+  booking_failed: "bg-red-500/15 text-red-100 border-red-400/20",
   booked: "bg-lime-400/15 text-lime-200 border-lime-300/20",
   expired: "bg-slate-400/15 text-slate-300 border-slate-300/20",
   declined: "bg-red-400/15 text-red-200 border-red-300/20",
@@ -288,10 +341,12 @@ export function FreightDashboard() {
   const [events, setEvents] = useState<WorkflowEventRecord[]>([]);
   const [bids, setBids] = useState<BidRecord[]>([]);
   const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
+  const [documents, setDocuments] = useState<ShipmentDocumentRecord[]>([]);
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [ackPreview, setAckPreview] = useState<ClientAcknowledgementResponse | null>(null);
   const [quotePreview, setQuotePreview] = useState<CustomerQuoteResponse | null>(null);
   const [tmsPreview, setTmsPreview] = useState<TmsHandoffResponse | null>(null);
+  const [bookingResult, setBookingResult] = useState<BookingExecutionResponse | null>(null);
   const [selectedShipmentId, setSelectedShipmentId] = useState<string | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [selectedCarrierId, setSelectedCarrierId] = useState<string | null>(null);
@@ -396,12 +451,14 @@ export function FreightDashboard() {
   }
 
   async function loadShipmentContext(shipmentId: string) {
-    const [eventData, bidData] = await Promise.all([
+    const [eventData, bidData, documentData] = await Promise.all([
       fetchJson<WorkflowEventRecord[]>(`/api/freight/shipments/${shipmentId}/events`),
       fetchJson<BidRecord[]>(`/api/freight/shipments/${shipmentId}/bids`),
+      fetchJson<ShipmentDocumentRecord[]>(`/api/freight/shipments/${shipmentId}/documents`),
     ]);
     setEvents(eventData);
     setBids(bidData);
+    setDocuments(documentData);
   }
 
   useEffect(() => {
@@ -412,10 +469,12 @@ export function FreightDashboard() {
     if (!selectedShipmentId) {
       setEvents([]);
       setBids([]);
+      setDocuments([]);
       setEvaluation(null);
       setAckPreview(null);
       setQuotePreview(null);
       setTmsPreview(null);
+      setBookingResult(null);
       return;
     }
 
@@ -423,9 +482,11 @@ export function FreightDashboard() {
     setAckPreview(null);
     setQuotePreview(null);
     setTmsPreview(null);
+    setBookingResult(null);
     void loadShipmentContext(selectedShipmentId).catch(() => {
       setEvents([]);
       setBids([]);
+      setDocuments([]);
     });
   }, [selectedShipmentId]);
 
@@ -616,9 +677,11 @@ export function FreightDashboard() {
         body: JSON.stringify({
           limit: 10,
           auto_acknowledge_new_shipments: true,
-          acknowledgement_dry_run: true,
+          acknowledgement_dry_run: false,
           auto_prepare_outreach_for_new_shipments: true,
-          outreach_dry_run: true,
+          outreach_dry_run: false,
+          auto_send_customer_quotes: true,
+          customer_quote_dry_run: false,
         }),
       });
       setNotice(
@@ -668,6 +731,48 @@ export function FreightDashboard() {
       await refreshAll();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to preview TMS handoff.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleBookShipment() {
+    if (!selectedShipment) return;
+    setSubmitting("book");
+    setError(null);
+    try {
+      const response = await fetchJson<BookingExecutionResponse>(`/api/freight/shipments/${selectedShipment.id}/book`, {
+        method: "POST",
+        body: JSON.stringify({ bid_id: evaluation?.selected_bid_id || selectedWinningBid?.id || null, dry_run: false }),
+      });
+      setBookingResult(response);
+      setNotice(`Load booked in TMS and confirmation sent to ${response.confirmation.client_email}.`);
+      await refreshAll();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to book shipment.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleOperatorAction(action: OperatorAction, shipmentId?: string) {
+    const targetShipmentId = shipmentId || selectedShipment?.id;
+    if (!targetShipmentId) return;
+    setSubmitting(action);
+    setError(null);
+    try {
+      const response = await fetchJson<ShipmentOperatorActionResponse>(
+        `/api/freight/shipments/${targetShipmentId}/operator-action`,
+        {
+          method: "POST",
+          body: JSON.stringify({ action }),
+        },
+      );
+      setNotice(response.message);
+      setSelectedShipmentId(targetShipmentId);
+      await refreshAll();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to run operator action.");
     } finally {
       setSubmitting(null);
     }
@@ -965,6 +1070,38 @@ export function FreightDashboard() {
                   </div>
 
                   <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
+                    <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><ClipboardCheck size={14} />Booking state</div>
+                    <div className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">State</p><p className="mt-2 text-white">{selectedShipment.booking_state ? selectedShipment.booking_state.replaceAll("_", " ") : "Not started"}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">TMS handoff</p><p className="mt-2 text-white">{selectedShipment.tms_handoff_status || "Not sent"}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Failure</p><p className="mt-2 text-white">{selectedShipment.booking_error || "None"}</p></div>
+                    </div>
+                    <div className="mt-3 rounded-2xl bg-slate-950/30 p-4 text-sm">
+                      <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Documents in thread</p>
+                      <p className="mt-2 text-white">{selectedShipment.attachment_count} attachment(s) available for TMS handoff</p>
+                    </div>
+                  </div>
+
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
+                    <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><Mail size={14} />Documents</div>
+                    <div className="mt-3 space-y-3">
+                      {documents.length === 0 && <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-4 text-sm text-[var(--text-muted)]">No document metadata found in this thread.</div>}
+                      {documents.map((document) => (
+                        <div key={`${document.source_email_id}-${document.id || document.name || "doc"}`} className="rounded-2xl bg-slate-950/30 p-4 text-sm">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="text-white">{document.name || "Unnamed attachment"}</p>
+                            <span className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">{document.document_type.replaceAll("_", " ")}</span>
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-3 text-xs text-[var(--text-muted)]">
+                            <span>{document.content_type || "unknown type"}</span>
+                            <span>{document.size ? `${document.size} bytes` : "size unknown"}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
                     <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><Sparkles size={14} />AI decision</div>
                     <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
                       <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Intent</p><p className="mt-2 text-white">{selectedShipment.ai_intent || "Not classified yet"}</p></div>
@@ -979,14 +1116,29 @@ export function FreightDashboard() {
                         ))}
                       </div>
                     )}
+                    {selectedShipment.ai_ambiguity_reasons.length > 0 ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {selectedShipment.ai_ambiguity_reasons.map((reason) => (
+                            <span key={reason} className="rounded-full bg-rose-300/10 px-3 py-1 text-xs text-rose-100">
+                              {reason.replaceAll("_", " ")}
+                            </span>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="grid gap-3 sm:grid-cols-2">
+                    <button onClick={() => void handleOperatorAction("resume_workflow")} disabled={submitting === "resume_workflow"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">{submitting === "resume_workflow" ? "Resuming..." : "Resume workflow"}</button>
+                    <button onClick={() => void handleOperatorAction("approve_and_continue")} disabled={submitting === "approve_and_continue"} className="action-button w-full bg-lime-300/15 text-lime-100 hover:bg-lime-300/20 disabled:opacity-50">{submitting === "approve_and_continue" ? "Approving..." : "Approve and continue"}</button>
+                    <button onClick={() => void handleOperatorAction("rerun_parsing")} disabled={submitting === "rerun_parsing"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">{submitting === "rerun_parsing" ? "Re-running..." : "Re-run parsing"}</button>
+                    <button onClick={() => void handleOperatorAction("rerun_outreach")} disabled={submitting === "rerun_outreach"} className="action-button w-full bg-orange-300/15 text-orange-100 hover:bg-orange-300/20 disabled:opacity-50">{submitting === "rerun_outreach" ? "Sending..." : "Re-run outreach"}</button>
+                    <button onClick={() => void handleOperatorAction("rerun_evaluation")} disabled={submitting === "rerun_evaluation" || bids.length === 0} className="action-button w-full bg-fuchsia-300/15 text-fuchsia-100 hover:bg-fuchsia-300/20 disabled:opacity-50">{submitting === "rerun_evaluation" ? "Evaluating..." : "Re-run evaluation"}</button>
                     <button onClick={() => void handlePreviewAcknowledgement()} disabled={submitting === "ack"} className="action-button w-full bg-violet-300/15 text-violet-100 hover:bg-violet-300/20 disabled:opacity-50">{submitting === "ack" ? "Preparing acknowledgment..." : "Preview customer ack"}</button>
                     <button onClick={() => void handleDryRunOutreach()} disabled={submitting === "outreach"} className="action-button w-full bg-[var(--accent-amber)] text-slate-950 hover:brightness-110">{submitting === "outreach" ? "Preparing..." : "Dry-run outreach"}</button>
                     <button onClick={() => void handleEvaluateBids()} disabled={submitting === "evaluate" || bids.length === 0} className="action-button w-full bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">{submitting === "evaluate" ? "Evaluating..." : "Evaluate bids"}</button>
                     <button onClick={() => void handlePreviewCustomerQuote()} disabled={submitting === "quote" || bids.length === 0} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "quote" ? "Building quote..." : "Preview customer quote"}</button>
                     <button onClick={() => void handlePreviewTmsHandoff()} disabled={submitting === "tms" || bids.length === 0} className="action-button w-full bg-rose-300/15 text-rose-100 hover:bg-rose-300/20 disabled:opacity-50">{submitting === "tms" ? "Preparing handoff..." : "Preview TMS handoff"}</button>
+                    <button onClick={() => void handleBookShipment()} disabled={submitting === "book" || bids.length === 0} className="action-button w-full bg-lime-300/15 text-lime-100 hover:bg-lime-300/20 disabled:opacity-50">{submitting === "book" ? "Booking..." : "Book load"}</button>
                   </div>
 
                   <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
@@ -1030,11 +1182,40 @@ export function FreightDashboard() {
 
                   {tmsPreview && <div className="rounded-[24px] border border-rose-300/20 bg-rose-300/10 p-4"><div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-rose-100"><ClipboardCheck size={14} />TMS preview</div><pre className="mt-3 overflow-x-auto whitespace-pre-wrap rounded-2xl bg-slate-950/40 p-4 text-xs text-rose-50">{JSON.stringify(tmsPreview.payload, null, 2)}</pre></div>}
 
+                  {bookingResult && <div className="rounded-[24px] border border-lime-300/20 bg-lime-300/10 p-4"><div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-lime-100"><ClipboardCheck size={14} />Booking completed</div><p className="mt-3 text-sm text-white">TMS status: {bookingResult.handoff.status}</p><p className="mt-1 text-sm text-lime-100">Confirmation sent to {bookingResult.confirmation.client_email}</p><p className="mt-3 text-sm text-white">{bookingResult.confirmation.subject}</p></div>}
+
                   <div className="space-y-3">
                     <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><Clock3 size={14} />Workflow timeline</div>
                     <div className="space-y-3">
                       {events.length === 0 && <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm text-[var(--text-muted)]">No events yet for this shipment.</div>}
-                      {events.map((eventRecord) => <div key={eventRecord.id} className="rounded-2xl border border-white/10 bg-white/5 p-4"><div className="flex items-center justify-between gap-3"><p className="text-sm font-medium text-white">{eventRecord.event_type.replaceAll("_", " ")}</p><span className="text-xs text-[var(--text-muted)]">{formatDate(eventRecord.created_at)}</span></div><p className="mt-1 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">{eventRecord.stage.replaceAll("_", " ")}</p></div>)}
+                      {events.map((eventRecord) => (
+                        <div key={eventRecord.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="text-sm font-medium text-white">{eventRecord.event_type.replaceAll("_", " ")}</p>
+                            <span className="text-xs text-[var(--text-muted)]">{formatDate(eventRecord.created_at)}</span>
+                          </div>
+                          <p className="mt-1 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">{eventRecord.stage.replaceAll("_", " ")}</p>
+                          {Boolean(eventRecord.payload.reason || eventRecord.payload.next_action) && (
+                            <p className="mt-2 text-sm text-[var(--text-muted)]">
+                              {String(eventRecord.payload.reason || eventRecord.payload.next_action).replaceAll("_", " ")}
+                            </p>
+                          )}
+                          {Array.isArray(eventRecord.payload.missing_fields) && eventRecord.payload.missing_fields.length > 0 && (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {(eventRecord.payload.missing_fields as string[]).map((field) => (
+                                <span key={field} className="rounded-full bg-amber-300/10 px-2 py-1 text-[11px] text-amber-100">{field}</span>
+                              ))}
+                            </div>
+                          )}
+                          {Array.isArray(eventRecord.payload.ambiguity_reasons) && eventRecord.payload.ambiguity_reasons.length > 0 && (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {(eventRecord.payload.ambiguity_reasons as string[]).map((reason) => (
+                                <span key={reason} className="rounded-full bg-rose-300/10 px-2 py-1 text-[11px] text-rose-100">{reason.replaceAll("_", " ")}</span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </div>
@@ -1072,13 +1253,22 @@ export function FreightDashboard() {
                 <div className="mt-4 space-y-3">
                   {reviewQueue.length === 0 && <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-5 text-sm text-[var(--text-muted)]">No manual review items.</div>}
                   {reviewQueue.slice(0, 5).map((item) => (
-                    <button key={item.workflow_event_id} onClick={() => setSelectedShipmentId(item.shipment_id)} className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:bg-white/10">
+                    <div key={item.workflow_event_id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                      <button onClick={() => setSelectedShipmentId(item.shipment_id)} className="w-full text-left transition hover:bg-white/0">
                       <div className="flex items-center justify-between gap-3">
                         <p className="text-sm font-medium text-white">{item.event_type.replaceAll("_", " ")}</p>
                         <span className="text-xs text-[var(--text-muted)]">{formatDate(item.created_at)}</span>
                       </div>
                       <p className="mt-2 text-sm text-[var(--text-muted)]">{item.reason || "Operator review requested"}</p>
-                    </button>
+                      {item.next_action && <p className="mt-2 text-xs uppercase tracking-[0.16em] text-cyan-100">Next: {item.next_action.replaceAll("_", " ")}</p>}
+                      {item.missing_fields.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.missing_fields.map((field) => <span key={field} className="rounded-full bg-amber-300/10 px-2 py-1 text-[11px] text-amber-100">{field}</span>)}</div>}
+                      {item.ambiguity_reasons.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.ambiguity_reasons.map((reason) => <span key={reason} className="rounded-full bg-rose-300/10 px-2 py-1 text-[11px] text-rose-100">{reason.replaceAll("_", " ")}</span>)}</div>}
+                      </button>
+                      <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                        <button onClick={() => void handleOperatorAction("resume_workflow", item.shipment_id)} disabled={submitting === "resume_workflow"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">Resume</button>
+                        <button onClick={() => void handleOperatorAction("approve_and_continue", item.shipment_id)} disabled={submitting === "approve_and_continue"} className="action-button w-full bg-lime-300/15 text-lime-100 hover:bg-lime-300/20 disabled:opacity-50">Approve</button>
+                      </div>
+                    </div>
                   ))}
                 </div>
               </div>

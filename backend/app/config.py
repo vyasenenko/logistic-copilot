@@ -1,14 +1,39 @@
 """AI Agent Backend — Configuration."""
 
-from pydantic_settings import BaseSettings
+from pathlib import Path
+from urllib.parse import quote_plus
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _env_file_for_settings() -> str | None:
+    """Inside Docker, Compose injects host .env into the process; skip dotenv to avoid precedence edge cases."""
+    if Path("/.dockerenv").exists():
+        return None
+    return ".env"
+
+
+_settings_env_kw: dict = {"env_file_encoding": "utf-8", "extra": "ignore"}
+_env_path = _env_file_for_settings()
+if _env_path:
+    _settings_env_kw["env_file"] = _env_path
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # LLM
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-chat"
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-20250514"
+    openai_model: str = "gpt-4o-mini"
+    llm_provider_order: str = "deepseek,openai,anthropic"
+    llm_temperature: float = 0.1
+    llm_primary_max_tokens: int = 8192
+    llm_fallback_max_tokens: int = 4096
     primary_model: str = "claude-sonnet-4-20250514"
     fallback_model: str = "gpt-4o-mini"
 
@@ -59,6 +84,7 @@ class Settings(BaseSettings):
     tms_base_url: str = ""
     tms_api_key: str = ""
     tms_timeout_seconds: int = 30
+    tms_retry_attempts: int = 2
 
     # Freight workflow defaults
     quote_wait_minutes_default: int = 20
@@ -67,10 +93,11 @@ class Settings(BaseSettings):
 
     @property
     def postgres_url(self) -> str:
-        return (
-            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        )
+        # Quote user/password so @ : / # etc. do not break the URL (asyncpg gaierror on wrong "host")
+        user = quote_plus(self.postgres_user)
+        password = quote_plus(self.postgres_password)
+        host = self.postgres_host.strip()
+        return f"postgresql+asyncpg://{user}:{password}@{host}:{self.postgres_port}/{self.postgres_db}"
 
     @property
     def cors_origins(self) -> list[str]:
@@ -83,7 +110,20 @@ class Settings(BaseSettings):
             f"{self.microsoft_tenant_id}/oauth2/v2.0/token"
         )
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    @property
+    def configured_llm_provider_order(self) -> list[str]:
+        providers = [provider.strip().lower() for provider in self.llm_provider_order.split(",")]
+        return [provider for provider in providers if provider in {"deepseek", "openai", "anthropic"}]
+
+    @property
+    def effective_anthropic_model(self) -> str:
+        return self.anthropic_model or self.primary_model
+
+    @property
+    def effective_openai_model(self) -> str:
+        return self.openai_model or self.fallback_model
+
+    model_config = SettingsConfigDict(**dict(_settings_env_kw))
 
 
 settings = Settings()

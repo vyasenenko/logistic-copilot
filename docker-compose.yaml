@@ -7,13 +7,16 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "${BACKEND_HTTP_PORT:-8000}:8000"
     env_file:
       - .env
     environment:
       - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
       - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
       - S3_ENDPOINT_URL=http://minio:9000
+      - BACKEND_CORS_ORIGINS=http://localhost:${FRONTEND_HTTP_PORT:-3000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -29,9 +32,10 @@ services:
   frontend:
     image: node:20-alpine
     ports:
-      - "3000:3000"
+      - "${FRONTEND_HTTP_PORT:-3000}:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      # Browser on host must use the published backend port (same as BACKEND_HTTP_PORT in .env)
+      - NEXT_PUBLIC_API_URL=http://localhost:${BACKEND_HTTP_PORT:-8000}
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
@@ -42,7 +46,7 @@ services:
   postgres:
     image: postgres:16-alpine
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PUBLISH_PORT:-5432}:5432"
     environment:
       POSTGRES_DB: agent_db
       POSTGRES_USER: agent
@@ -59,8 +63,8 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.13.0
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
 
@@ -68,8 +72,8 @@ services:
   minio:
     image: minio/minio:latest
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin

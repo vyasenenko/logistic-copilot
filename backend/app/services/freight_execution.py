@@ -14,6 +14,7 @@ from app.schemas import (
     BidIntakeRequest,
     BidIntakeResponse,
     BidRecord,
+    BookingConfirmationResponse,
     ClientAcknowledgementResponse,
     CustomerQuoteResponse,
     ShipmentEvaluationResponse,
@@ -24,6 +25,74 @@ from app.schemas import (
 from app.services.email_correlation import attach_quote_token, extract_quote_token
 from app.services.outlook import OutlookGraphClient
 from app.services.tms_connector import TmsConnector
+
+
+DOCUMENT_TYPE_RULES = (
+    ("rate_confirmation", ("rate confirmation", "rateconf", "rate-con")),
+    ("bill_of_lading", ("bol", "bill of lading")),
+    ("proof_of_delivery", ("pod", "proof of delivery")),
+    ("pickup_number", ("pickup number", "pu number", "pickup#")),
+    ("quote_sheet", ("quote", "pricing", "rate request")),
+)
+
+
+def classify_document_type(name: str | None, content_type: str | None) -> str:
+    haystack = f"{name or ''} {content_type or ''}".lower()
+    for document_type, hints in DOCUMENT_TYPE_RULES:
+        if any(hint in haystack for hint in hints):
+            return document_type
+    if (content_type or "").lower() in {"application/pdf", "image/png", "image/jpeg"}:
+        return "supporting_document"
+    return "unknown"
+
+
+def _extract_message_attachments(email_message: EmailMessage) -> list[dict]:
+    payload = dict(email_message.raw_payload_json or {})
+    raw_attachments = payload.get("attachments") or payload.get("Attachments") or []
+    attachments: list[dict] = []
+    for item in raw_attachments:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("fileName") or item.get("filename")
+        content_type = item.get("contentType") or item.get("@odata.mediaContentType")
+        size = item.get("size")
+        attachment_id = item.get("id")
+        if not name and not attachment_id:
+            continue
+        attachments.append(
+            {
+                "id": attachment_id,
+                "name": name,
+                "document_type": classify_document_type(name, content_type),
+                "content_type": content_type,
+                "size": size,
+                "source_email_id": str(email_message.id),
+            }
+        )
+    return attachments
+
+
+async def collect_shipment_attachments(
+    session: AsyncSession,
+    shipment: Shipment,
+) -> list[dict]:
+    if shipment.email_thread_id is None:
+        return []
+    result = await session.execute(
+        select(EmailMessage)
+        .where(EmailMessage.thread_id == shipment.email_thread_id)
+        .order_by(EmailMessage.received_at.asc())
+    )
+    attachments: list[dict] = []
+    seen: set[tuple[str | None, str | None]] = set()
+    for email_message in result.scalars().all():
+        for attachment in _extract_message_attachments(email_message):
+            key = (attachment.get("id"), attachment.get("name"))
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments.append(attachment)
+    return attachments
 
 
 def _display_name_from_email(email: str) -> str:
@@ -361,6 +430,21 @@ async def _get_selected_bid(session: AsyncSession, shipment: Shipment, bid_id: s
     return best
 
 
+async def _latest_workflow_event(
+    session: AsyncSession,
+    shipment_id: UUID,
+    event_type: str,
+) -> WorkflowEvent | None:
+    return await session.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment_id,
+            WorkflowEvent.event_type == event_type,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+
+
 async def send_customer_quote(
     session: AsyncSession,
     *,
@@ -463,8 +547,28 @@ async def handoff_to_tms(
     if shipment is None:
         raise RuntimeError("Shipment not found")
 
+    if not dry_run:
+        latest_handoff = await _latest_workflow_event(
+            session,
+            shipment.id,
+            WorkflowEventType.TMS_HANDOFF_SENT.value,
+        )
+        if shipment.status == ShipmentStage.BOOKED.value and latest_handoff is not None:
+            payload = dict((latest_handoff.payload_json or {}).get("payload", {}) or {})
+            response_payload = dict((latest_handoff.payload_json or {}).get("response", {}) or {})
+            existing_bid_id = str((latest_handoff.payload_json or {}).get("bid_id", bid_id or ""))
+            return TmsHandoffResponse(
+                shipment_id=str(shipment.id),
+                bid_id=existing_bid_id,
+                status="already_submitted",
+                dry_run=False,
+                payload=payload,
+                response=response_payload,
+            )
+
     bid, carrier = await _get_selected_bid(session, shipment, bid_id)
     client = await session.get(Client, shipment.client_id) if shipment.client_id else None
+    attachments = await collect_shipment_attachments(session, shipment)
     payload = {
         "shipment_id": str(shipment.id),
         "quote_token": shipment.quote_token,
@@ -492,15 +596,42 @@ async def handoff_to_tms(
             "currency": bid.currency,
             "eta_text": bid.eta_text,
         },
+        "documents": attachments,
     }
 
     connector = TmsConnector()
     response_payload: dict = {}
     status = "preview"
     if not dry_run:
-        response_payload = await connector.request("POST", "/loads", json=payload)
-        status = "submitted"
-        shipment.status = ShipmentStage.BOOKED.value
+        shipment.status = ShipmentStage.BOOKING_IN_PROGRESS.value
+        shipment.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+        try:
+            response_payload = await connector.request(
+                "POST",
+                "/loads",
+                json=payload,
+                idempotency_key=shipment.quote_token or str(shipment.id),
+            )
+            status = "submitted"
+            shipment.status = ShipmentStage.BOOKED.value
+        except RuntimeError as exc:
+            shipment.status = ShipmentStage.BOOKING_FAILED.value
+            shipment.updated_at = datetime.now(timezone.utc)
+            session.add(
+                WorkflowEvent(
+                    shipment_id=shipment.id,
+                    event_type=WorkflowEventType.EXCEPTION_RAISED.value,
+                    stage=shipment.status,
+                    payload_json={
+                        "reason": "tms_handoff_failed",
+                        "message": str(exc),
+                        "payload": payload,
+                    },
+                )
+            )
+            await session.commit()
+            raise
     else:
         shipment.status = ShipmentStage.AWAITING_CONFIRMATION.value
 
@@ -514,6 +645,10 @@ async def handoff_to_tms(
                 "bid_id": str(bid.id),
                 "carrier_id": str(carrier.id),
                 "dry_run": dry_run,
+                "payload": payload,
+                "response": response_payload,
+                "status": status,
+                "attachment_count": len(attachments),
             },
         )
     )
@@ -527,3 +662,115 @@ async def handoff_to_tms(
         payload=payload,
         response=response_payload,
     )
+
+
+async def send_booking_confirmation(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    dry_run: bool,
+    custom_message: str | None,
+) -> BookingConfirmationResponse:
+    """Send a booking confirmation back to the customer after TMS handoff."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise RuntimeError("Shipment not found")
+    if shipment.client_id is None:
+        raise RuntimeError("Shipment has no linked client")
+
+    client = await session.get(Client, shipment.client_id)
+    if client is None:
+        raise RuntimeError("Client not found for shipment")
+
+    if not dry_run and shipment.email_thread_id:
+        result = await session.execute(
+            select(EmailMessage)
+            .where(
+                EmailMessage.thread_id == shipment.email_thread_id,
+                EmailMessage.direction == "outbound",
+            )
+            .order_by(EmailMessage.received_at.desc())
+        )
+        for existing_confirmation in result.scalars().all():
+            if dict(existing_confirmation.raw_payload_json or {}).get("type") == "booking_confirmation":
+                return BookingConfirmationResponse(
+                    shipment_id=str(shipment.id),
+                    client_email=client.email,
+                    subject=existing_confirmation.subject,
+                    body=existing_confirmation.body_preview,
+                    dry_run=False,
+                )
+
+    subject = attach_quote_token(
+        f"Booking confirmed {shipment.origin or 'Origin'} to {shipment.destination or 'Destination'}",
+        shipment.quote_token or "Q-UNKNOWN",
+    )
+    body_lines = [
+        f"Hi {client.name},",
+        "",
+        "Your load is confirmed and has been booked in our system.",
+        f"Route: {shipment.origin or 'TBD'} to {shipment.destination or 'TBD'}",
+        f"Equipment: {shipment.equipment_type or 'TBD'}",
+        f"Pallets: {shipment.pallets if shipment.pallets is not None else 'TBD'}",
+        f"Weight (lb): {shipment.weight_lb if shipment.weight_lb is not None else 'TBD'}",
+    ]
+    if shipment.ready_at:
+        body_lines.append(
+            f"Scheduled ready time: {shipment.ready_at.astimezone(timezone.utc).isoformat()}"
+        )
+    if custom_message:
+        body_lines.extend(["", custom_message.strip()])
+    body_lines.extend(["", "We'll keep you updated with the next status changes."])
+    body = "\n".join(body_lines)
+
+    if not dry_run:
+        outlook = OutlookGraphClient()
+        await outlook.send_mail(subject=subject, body=body, recipients=[client.email])
+
+    if shipment.email_thread_id:
+        session.add(
+            EmailMessage(
+                thread_id=shipment.email_thread_id,
+                sender=settings.microsoft_mailbox or "unknown",
+                recipients_json=[client.email],
+                direction="outbound",
+                subject=subject,
+                body_preview=body[:1000],
+                raw_payload_json={"type": "booking_confirmation", "dry_run": dry_run},
+                received_at=datetime.now(timezone.utc),
+            )
+        )
+
+    await session.commit()
+
+    return BookingConfirmationResponse(
+        shipment_id=str(shipment.id),
+        client_email=client.email,
+        subject=subject,
+        body=body,
+        dry_run=dry_run,
+    )
+
+
+async def confirm_booking_and_handoff(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    bid_id: str | None,
+    dry_run: bool,
+    custom_message: str | None = None,
+) -> tuple[TmsHandoffResponse, BookingConfirmationResponse]:
+    """Execute the booking flow after customer confirmation."""
+    handoff = await handoff_to_tms(
+        session,
+        shipment_id=shipment_id,
+        bid_id=bid_id,
+        dry_run=dry_run,
+    )
+    confirmation = await send_booking_confirmation(
+        session,
+        shipment_id=shipment_id,
+        dry_run=dry_run,
+        custom_message=custom_message,
+    )
+    return handoff, confirmation

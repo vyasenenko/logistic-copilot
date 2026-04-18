@@ -3,7 +3,6 @@
 from uuid import uuid4
 
 from qdrant_client import AsyncQdrantClient, models
-from langchain_anthropic import ChatAnthropic
 
 from app.config import settings
 

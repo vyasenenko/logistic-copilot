@@ -24,6 +24,8 @@ class ShipmentStage(str, Enum):
     EVALUATING = "evaluating"
     QUOTED = "quoted"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
+    BOOKING_IN_PROGRESS = "booking_in_progress"
+    BOOKING_FAILED = "booking_failed"
     BOOKED = "booked"
     EXPIRED = "expired"
     DECLINED = "declined"
@@ -171,7 +173,12 @@ class ShipmentRecord(BaseModel):
     ai_intent: str | None = None
     ai_confidence: float | None = None
     ai_missing_fields: list[str] = Field(default_factory=list)
+    ai_ambiguity_reasons: list[str] = Field(default_factory=list)
     ai_next_action: str | None = None
+    booking_state: str | None = None
+    booking_error: str | None = None
+    tms_handoff_status: str | None = None
+    attachment_count: int = 0
     manual_review_required: bool = False
     created_at: datetime
     updated_at: datetime
@@ -184,6 +191,15 @@ class WorkflowEventRecord(BaseModel):
     stage: str
     payload: dict = Field(default_factory=dict)
     created_at: datetime
+
+
+class ShipmentDocumentRecord(BaseModel):
+    id: str | None = None
+    name: str | None = None
+    document_type: str
+    content_type: str | None = None
+    size: int | None = None
+    source_email_id: str
 
 
 class QuoteReference(BaseModel):
@@ -231,6 +247,10 @@ class OutlookSyncRequest(BaseModel):
     acknowledgement_dry_run: bool = True
     auto_prepare_outreach_for_new_shipments: bool = True
     outreach_dry_run: bool = True
+    auto_send_customer_quotes: bool = True
+    customer_quote_dry_run: bool = False
+    auto_book_on_confirmation: bool = True
+    booking_dry_run: bool = False
 
 
 class OutlookIngestRequest(BaseModel):
@@ -240,6 +260,10 @@ class OutlookIngestRequest(BaseModel):
     acknowledgement_dry_run: bool = True
     auto_prepare_outreach_for_new_shipment: bool = True
     outreach_dry_run: bool = True
+    auto_send_customer_quote: bool = True
+    customer_quote_dry_run: bool = False
+    auto_book_on_confirmation: bool = True
+    booking_dry_run: bool = False
 
 
 class OutlookIngestResult(BaseModel):
@@ -263,10 +287,14 @@ class OutlookIngestResult(BaseModel):
     confidence: float | None = None
     shipment_extracted: bool = False
     missing_fields: list[str] = Field(default_factory=list)
+    ambiguity_reasons: list[str] = Field(default_factory=list)
     manual_review_required: bool = False
     next_action: str | None = None
     evaluation_triggered: bool = False
     quote_auto_sent: bool = False
+    booking_triggered: bool = False
+    booking_confirmation_sent: bool = False
+    tms_handoff_status: str | None = None
     event_type: WorkflowEventType = WorkflowEventType.EMAIL_RECEIVED
 
 
@@ -299,6 +327,7 @@ class ShipmentExtractionResult(BaseModel):
     ready_at: datetime | None = None
     notes: str = ""
     missing_fields: list[str] = Field(default_factory=list)
+    ambiguity_reasons: list[str] = Field(default_factory=list)
     confidence: float = Field(0, ge=0, le=1)
 
 
@@ -308,7 +337,20 @@ class CarrierBidExtractionResult(BaseModel):
     currency: str = "USD"
     eta_text: str | None = None
     notes: str = ""
+    ambiguity_reasons: list[str] = Field(default_factory=list)
     confidence: float = Field(0, ge=0, le=1)
+
+
+class AutomationPolicy(BaseModel):
+    auto_acknowledgement: bool = True
+    acknowledgement_dry_run: bool = False
+    auto_outreach: bool = True
+    outreach_dry_run: bool = False
+    auto_quote: bool = True
+    quote_dry_run: bool = False
+    auto_book: bool = True
+    booking_dry_run: bool = False
+    allow_repeat_manual_review: bool = False
 
 
 class WorkflowDecisionResult(BaseModel):
@@ -319,6 +361,7 @@ class WorkflowDecisionResult(BaseModel):
     next_action: str
     shipment_extracted: bool = False
     missing_fields: list[str] = Field(default_factory=list)
+    ambiguity_reasons: list[str] = Field(default_factory=list)
     acknowledgement_drafted: bool = False
     acknowledgement_subject: str | None = None
     outreach_drafted: bool = False
@@ -329,6 +372,9 @@ class WorkflowDecisionResult(BaseModel):
     bid_amount: float | None = None
     evaluation_triggered: bool = False
     quote_auto_sent: bool = False
+    booking_triggered: bool = False
+    booking_confirmation_sent: bool = False
+    tms_handoff_status: str | None = None
     manual_review_required: bool = False
 
 
@@ -338,7 +384,36 @@ class ReviewQueueItem(BaseModel):
     stage: str
     event_type: str
     reason: str = ""
+    next_action: str | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    ambiguity_reasons: list[str] = Field(default_factory=list)
     created_at: datetime
+
+
+class OperatorAction(str, Enum):
+    RESUME_WORKFLOW = "resume_workflow"
+    APPROVE_AND_CONTINUE = "approve_and_continue"
+    RERUN_PARSING = "rerun_parsing"
+    RERUN_OUTREACH = "rerun_outreach"
+    RERUN_EVALUATION = "rerun_evaluation"
+
+
+class ShipmentOperatorActionRequest(BaseModel):
+    action: OperatorAction
+
+
+class ShipmentOperatorActionResponse(BaseModel):
+    shipment_id: str
+    action: OperatorAction
+    status: str
+    message: str
+    next_action: str
+    manual_review_required: bool = False
+    acknowledgement_sent: bool = False
+    outreach_sent: bool = False
+    evaluation_triggered: bool = False
+    quote_sent: bool = False
+    decision: WorkflowDecisionResult | None = None
 
 
 class CarrierOutreachRequest(BaseModel):
@@ -425,6 +500,14 @@ class ClientAcknowledgementResponse(BaseModel):
     dry_run: bool
 
 
+class BookingConfirmationResponse(BaseModel):
+    shipment_id: str
+    client_email: str
+    subject: str
+    body: str
+    dry_run: bool
+
+
 class CustomerQuoteRequest(BaseModel):
     bid_id: str | None = None
     dry_run: bool = True
@@ -455,6 +538,13 @@ class TmsHandoffResponse(BaseModel):
     dry_run: bool
     payload: dict = Field(default_factory=dict)
     response: dict = Field(default_factory=dict)
+
+
+class BookingExecutionResponse(BaseModel):
+    shipment_id: str
+    dry_run: bool
+    handoff: TmsHandoffResponse
+    confirmation: BookingConfirmationResponse
 
 
 class IntegrationStatus(BaseModel):
