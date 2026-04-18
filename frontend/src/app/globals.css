@@ -2,14 +2,36 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --bg-ink: #08111f;
+  --bg-ocean: #10253c;
+  --bg-mist: #12324b;
+  --panel: rgba(9, 20, 35, 0.76);
+  --panel-strong: rgba(7, 16, 28, 0.92);
+  --border-soft: rgba(148, 163, 184, 0.16);
+  --text-main: #e8f1f7;
+  --text-muted: #8aa1b5;
+  --accent-cyan: #63d4c8;
+  --accent-amber: #ffb86c;
+  --accent-rose: #f47d92;
+}
+
 * {
   box-sizing: border-box;
 }
 
+html {
+  min-height: 100%;
+}
+
 body {
-  background-color: #0a0a0a;
-  color: #ededed;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(99, 212, 200, 0.18), transparent 32%),
+    radial-gradient(circle at top right, rgba(255, 184, 108, 0.18), transparent 28%),
+    linear-gradient(160deg, var(--bg-ink), var(--bg-ocean) 42%, var(--bg-mist));
+  color: var(--text-main);
+  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
 }
 
 /* Custom scrollbar */
@@ -56,4 +78,39 @@ body {
 .markdown-content ol {
   padding-left: 1.5em;
   margin: 0.5em 0;
+}
+
+@layer components {
+  .glass-panel {
+    @apply rounded-[28px] border shadow-2xl backdrop-blur-xl;
+    background: var(--panel);
+    border-color: var(--border-soft);
+    box-shadow: 0 25px 80px rgba(3, 10, 18, 0.38);
+  }
+
+  .glass-panel-strong {
+    @apply rounded-[28px] border backdrop-blur-xl;
+    background: var(--panel-strong);
+    border-color: var(--border-soft);
+  }
+
+  .field-input {
+    @apply w-full rounded-2xl border px-4 py-3 text-sm outline-none transition;
+    background: rgba(10, 20, 32, 0.8);
+    border-color: rgba(148, 163, 184, 0.12);
+    color: var(--text-main);
+  }
+
+  .field-input::placeholder {
+    color: var(--text-muted);
+  }
+
+  .field-input:focus {
+    border-color: rgba(99, 212, 200, 0.75);
+    box-shadow: 0 0 0 4px rgba(99, 212, 200, 0.12);
+  }
+
+  .action-button {
+    @apply inline-flex items-center justify-center rounded-2xl px-4 py-3 text-sm font-medium transition;
+  }
 }

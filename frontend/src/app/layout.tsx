@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AI Agent",
-  description: "Universal AI Agent",
+  title: "Freight Control Tower",
+  description: "Outlook-first logistics workflow dashboard",
 };
 
 export default function RootLayout({

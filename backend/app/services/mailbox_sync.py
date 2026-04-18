@@ -6,7 +6,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.memory.database import Client, EmailMessage, EmailThread, Shipment, WorkflowEvent
+from app.memory.database import Carrier, Client, EmailMessage, EmailThread, Shipment, WorkflowEvent
 from app.schemas import OutlookIngestResult, ShipmentStage, WorkflowEventType
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
 from app.services.outlook import OutlookMailboxMessage
@@ -134,7 +134,6 @@ async def _find_or_create_shipment(
     await session.flush()
     return shipment, True
 
-
 async def ingest_outlook_message(
     session: AsyncSession,
     mailbox_message: OutlookMailboxMessage,
@@ -198,12 +197,17 @@ async def ingest_outlook_message(
     session.add(email_message)
     await session.flush()
 
-    client, created_client = await _find_or_create_client(
-        session,
-        sender_email=mailbox_message.sender_email,
-        sender_name=mailbox_message.sender_name,
-        create_if_missing=create_client_if_missing,
-    )
+    carrier = await session.scalar(select(Carrier).where(Carrier.email == mailbox_message.sender_email))
+
+    client = None
+    created_client = False
+    if carrier is None:
+        client, created_client = await _find_or_create_client(
+            session,
+            sender_email=mailbox_message.sender_email,
+            sender_name=mailbox_message.sender_name,
+            create_if_missing=create_client_if_missing,
+        )
 
     shipment, created_shipment = await _find_or_create_shipment(
         session,

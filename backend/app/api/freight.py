@@ -18,12 +18,19 @@ from app.memory.database import (
     get_session,
 )
 from app.schemas import (
+    BidIntakeRequest,
+    BidIntakeResponse,
+    BidRecord,
     CarrierOutreachRequest,
     CarrierOutreachResponse,
     CarrierRecord,
     CarrierUpsertRequest,
+    ClientAcknowledgementRequest,
+    ClientAcknowledgementResponse,
     ClientRecord,
     ClientUpsertRequest,
+    CustomerQuoteRequest,
+    CustomerQuoteResponse,
     FreightFoundationResponse,
     OutlookIngestRequest,
     OutlookSyncRequest,
@@ -31,18 +38,53 @@ from app.schemas import (
     FreightOverviewCounts,
     FreightOverviewResponse,
     MarginPolicy,
+    ShipmentEvaluationResponse,
     ShipmentRecord,
     ShipmentUpsertRequest,
     ShipmentStage,
+    ReviewQueueItem,
+    TmsHandoffRequest,
+    TmsHandoffResponse,
     WorkflowEventRecord,
+    WorkflowDecisionResult,
     WorkflowEventType,
 )
+from app.services.freight_execution import (
+    evaluate_shipment_bids,
+    handoff_to_tms,
+    intake_bid,
+    send_client_acknowledgement,
+    send_customer_quote,
+)
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
+from app.services.freight_inbox_agent import (
+    evaluate_expired_quote_windows,
+    run_freight_inbox_orchestrator,
+)
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
 
 router = APIRouter()
+
+
+def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
+    result.intent = decision.intent
+    result.confidence = decision.confidence
+    result.shipment_extracted = decision.shipment_extracted
+    result.missing_fields = decision.missing_fields
+    result.manual_review_required = decision.manual_review_required
+    result.next_action = decision.next_action
+    result.acknowledgement_drafted = decision.acknowledgement_drafted
+    result.acknowledgement_subject = decision.acknowledgement_subject
+    result.outreach_drafted = decision.outreach_drafted
+    result.outreach_subject = decision.outreach_subject
+    result.outreach_targeted = decision.outreach_targeted
+    result.bid_intaken = decision.bid_intaken
+    result.bid_id = decision.bid_id
+    result.bid_amount = decision.bid_amount
+    result.evaluation_triggered = decision.evaluation_triggered
+    result.quote_auto_sent = decision.quote_auto_sent
 
 
 def _serialize_client(client: Client) -> ClientRecord:
@@ -73,7 +115,8 @@ def _serialize_carrier(carrier: Carrier) -> CarrierRecord:
     )
 
 
-def _serialize_shipment(shipment: Shipment) -> ShipmentRecord:
+def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> ShipmentRecord:
+    ai_payload = ai_payload or {}
     return ShipmentRecord(
         id=str(shipment.id),
         client_id=str(shipment.client_id) if shipment.client_id else None,
@@ -88,6 +131,11 @@ def _serialize_shipment(shipment: Shipment) -> ShipmentRecord:
         ready_at=shipment.ready_at,
         margin_policy=dict(shipment.margin_policy_json or {}),
         notes=shipment.notes,
+        ai_intent=ai_payload.get("intent"),
+        ai_confidence=ai_payload.get("confidence"),
+        ai_missing_fields=list(ai_payload.get("missing_fields", []) or []),
+        ai_next_action=ai_payload.get("next_action"),
+        manual_review_required=bool(ai_payload.get("manual_review_required", False)),
         created_at=shipment.created_at,
         updated_at=shipment.updated_at,
     )
@@ -102,6 +150,57 @@ def _serialize_workflow_event(event: WorkflowEvent) -> WorkflowEventRecord:
         payload=dict(event.payload_json or {}),
         created_at=event.created_at,
     )
+
+
+def _serialize_review_queue_item(event: WorkflowEvent) -> ReviewQueueItem:
+    return ReviewQueueItem(
+        workflow_event_id=str(event.id),
+        shipment_id=str(event.shipment_id),
+        stage=event.stage,
+        event_type=event.event_type,
+        reason=str((event.payload_json or {}).get("reason", "")),
+        created_at=event.created_at,
+    )
+
+
+def _serialize_bid_record(bid: CarrierBid, carrier: Carrier) -> BidRecord:
+    return BidRecord(
+        id=str(bid.id),
+        shipment_id=str(bid.shipment_id),
+        carrier_id=str(carrier.id),
+        carrier_name=carrier.name,
+        carrier_email=carrier.email,
+        amount=bid.amount,
+        currency=bid.currency,
+        eta_text=bid.eta_text,
+        status=bid.status,
+        score=dict(bid.score_json or {}),
+        received_at=bid.received_at,
+    )
+
+
+async def _latest_ai_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.shipment_id.in_(shipment_ids))
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        if event.shipment_id in payloads:
+            continue
+        payload = dict(event.payload_json or {})
+        if any(
+            key in payload
+            for key in ("intent", "confidence", "missing_fields", "next_action", "manual_review_required")
+        ):
+            payloads[event.shipment_id] = payload
+    return payloads
 
 
 @router.get("/freight/foundation", response_model=FreightFoundationResponse)
@@ -262,7 +361,9 @@ async def update_carrier(
 async def list_shipments(session: AsyncSession = Depends(get_session)) -> list[ShipmentRecord]:
     """List all tracked shipments."""
     result = await session.execute(select(Shipment).order_by(Shipment.created_at.desc()))
-    return [_serialize_shipment(shipment) for shipment in result.scalars().all()]
+    shipments = list(result.scalars().all())
+    ai_payloads = await _latest_ai_payloads(session, [shipment.id for shipment in shipments])
+    return [_serialize_shipment(shipment, ai_payloads.get(shipment.id)) for shipment in shipments]
 
 
 @router.post("/freight/shipments", response_model=ShipmentRecord)
@@ -305,7 +406,8 @@ async def get_shipment(
     shipment = await session.get(Shipment, shipment_id)
     if shipment is None:
         raise HTTPException(status_code=404, detail="Shipment not found.")
-    return _serialize_shipment(shipment)
+    ai_payloads = await _latest_ai_payloads(session, [shipment.id])
+    return _serialize_shipment(shipment, ai_payloads.get(shipment.id))
 
 
 @router.patch("/freight/shipments/{shipment_id}", response_model=ShipmentRecord)
@@ -359,6 +461,39 @@ async def list_shipment_events(
     return [_serialize_workflow_event(event) for event in result.scalars().all()]
 
 
+@router.get("/freight/reviews", response_model=list[ReviewQueueItem])
+async def freight_review_queue(
+    session: AsyncSession = Depends(get_session),
+) -> list[ReviewQueueItem]:
+    """Return shipments requiring operator review."""
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value)
+        .order_by(WorkflowEvent.created_at.desc())
+        .limit(50)
+    )
+    return [_serialize_review_queue_item(event) for event in result.scalars().all()]
+
+
+@router.get("/freight/shipments/{shipment_id}/bids", response_model=list[BidRecord])
+async def list_shipment_bids(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> list[BidRecord]:
+    """Return all bids for a shipment."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+
+    result = await session.execute(
+        select(CarrierBid, Carrier)
+        .join(Carrier, Carrier.id == CarrierBid.carrier_id)
+        .where(CarrierBid.shipment_id == shipment_id)
+        .order_by(CarrierBid.received_at.desc())
+    )
+    return [_serialize_bid_record(bid, carrier) for bid, carrier in result.all()]
+
+
 @router.post(
     "/freight/shipments/{shipment_id}/outreach",
     response_model=CarrierOutreachResponse,
@@ -380,6 +515,97 @@ async def shipment_carrier_outreach(
             carrier_ids=request.carrier_ids,
             dry_run=request.dry_run,
             custom_message=request.custom_message,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/freight/bids/intake", response_model=BidIntakeResponse)
+async def freight_bid_intake(
+    request: BidIntakeRequest,
+    session: AsyncSession = Depends(get_session),
+) -> BidIntakeResponse:
+    """Intake a bid from a carrier reply or manual operator entry."""
+    try:
+        return await intake_bid(session, request)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/evaluate",
+    response_model=ShipmentEvaluationResponse,
+)
+async def freight_evaluate_shipment(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentEvaluationResponse:
+    """Evaluate received bids and recommend the best option."""
+    try:
+        return await evaluate_shipment_bids(session, shipment_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/acknowledge",
+    response_model=ClientAcknowledgementResponse,
+)
+async def freight_client_acknowledgement(
+    shipment_id: UUID,
+    request: ClientAcknowledgementRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ClientAcknowledgementResponse:
+    """Build or send the initial acknowledgement back to the customer."""
+    try:
+        return await send_client_acknowledgement(
+            session,
+            shipment_id=shipment_id,
+            dry_run=request.dry_run,
+            custom_message=request.custom_message,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/quote",
+    response_model=CustomerQuoteResponse,
+)
+async def freight_customer_quote(
+    shipment_id: UUID,
+    request: CustomerQuoteRequest,
+    session: AsyncSession = Depends(get_session),
+) -> CustomerQuoteResponse:
+    """Send or preview the customer quote based on the selected bid."""
+    try:
+        return await send_customer_quote(
+            session,
+            shipment_id=shipment_id,
+            bid_id=request.bid_id,
+            dry_run=request.dry_run,
+            custom_message=request.custom_message,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/tms-handoff",
+    response_model=TmsHandoffResponse,
+)
+async def freight_tms_handoff(
+    shipment_id: UUID,
+    request: TmsHandoffRequest,
+    session: AsyncSession = Depends(get_session),
+) -> TmsHandoffResponse:
+    """Preview or submit the selected shipment to the TMS."""
+    try:
+        return await handoff_to_tms(
+            session,
+            shipment_id=shipment_id,
+            bid_id=request.bid_id,
+            dry_run=request.dry_run,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -445,7 +671,30 @@ async def freight_outlook_ingest(
     )
     if result is None:
         return OutlookSyncResponse(imported=0, skipped=1, results=[])
-    return OutlookSyncResponse(imported=1, skipped=0, results=[result])
+
+    try:
+        decision = await run_freight_inbox_orchestrator(session, email_message_id=result.email_message_id)
+        _apply_decision(result, decision)
+    except RuntimeError as exc:
+        result.manual_review_required = True
+        result.next_action = "manual_review"
+        result.intent = "orchestrator_error"
+        result.confidence = 0.0
+        result.missing_fields = []
+    expired = await evaluate_expired_quote_windows(session)
+
+    return OutlookSyncResponse(
+        imported=1,
+        skipped=0,
+        parsed_shipments=1 if result.shipment_extracted else 0,
+        auto_acknowledgements=1 if result.acknowledgement_drafted else 0,
+        auto_outreach=1 if result.outreach_drafted else 0,
+        auto_bids=1 if result.bid_intaken else 0,
+        auto_evaluations=len(expired) + (1 if result.evaluation_triggered else 0),
+        auto_quotes=len([item for item in expired if item.quote_auto_sent]) + (1 if result.quote_auto_sent else 0),
+        manual_reviews=1 if result.manual_review_required else 0,
+        results=[result],
+    )
 
 
 @router.post("/freight/outlook/sync", response_model=OutlookSyncResponse)
@@ -459,13 +708,51 @@ async def freight_outlook_sync(
 
     imported = 0
     skipped = 0
+    parsed_shipments = 0
+    auto_acknowledgements = 0
+    auto_outreach = 0
+    auto_bids = 0
+    auto_evaluations = 0
+    auto_quotes = 0
+    manual_reviews = 0
     results = []
     for message in messages:
         result = await ingest_outlook_message(session, message)
         if result is None:
             skipped += 1
             continue
+
+        try:
+            decision = await run_freight_inbox_orchestrator(session, email_message_id=result.email_message_id)
+            _apply_decision(result, decision)
+        except RuntimeError:
+            result.manual_review_required = True
+            result.next_action = "manual_review"
+            result.intent = "orchestrator_error"
+            result.confidence = 0.0
         imported += 1
+        parsed_shipments += 1 if result.shipment_extracted else 0
+        auto_acknowledgements += 1 if result.acknowledgement_drafted else 0
+        auto_outreach += 1 if result.outreach_drafted else 0
+        auto_bids += 1 if result.bid_intaken else 0
+        auto_evaluations += 1 if result.evaluation_triggered else 0
+        auto_quotes += 1 if result.quote_auto_sent else 0
+        manual_reviews += 1 if result.manual_review_required else 0
         results.append(result)
 
-    return OutlookSyncResponse(imported=imported, skipped=skipped, results=results)
+    expired = await evaluate_expired_quote_windows(session)
+    auto_evaluations += len(expired)
+    auto_quotes += len([item for item in expired if item.quote_auto_sent])
+
+    return OutlookSyncResponse(
+        imported=imported,
+        skipped=skipped,
+        parsed_shipments=parsed_shipments,
+        auto_acknowledgements=auto_acknowledgements,
+        auto_outreach=auto_outreach,
+        auto_bids=auto_bids,
+        auto_evaluations=auto_evaluations,
+        auto_quotes=auto_quotes,
+        manual_reviews=manual_reviews,
+        results=results,
+    )

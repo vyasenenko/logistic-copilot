@@ -1,0 +1,31 @@
+# Normalize line endings for cross-platform clones
+* text=auto
+
+# Scripts: force LF (Linux/macOS servers, CI)
+*.sh text eol=lf
+
+# Sources
+*.py text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# Frontend / mobile text
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.dart text eol=lf
+
+# Binary assets (no EOL conversion)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary

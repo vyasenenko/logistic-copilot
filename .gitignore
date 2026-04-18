@@ -9,22 +9,37 @@ build/
 *.egg
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.log
 
-# Node
+# Node / Next.js
 node_modules/
 .next/
 out/
+.turbo
+.vercel
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Environment
 .env
 .env.local
 .env.*.local
 
-# IDE
+# IDE / editors
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
@@ -33,8 +48,27 @@ Thumbs.db
 # Docker
 docker-compose.override.yml
 
-# Data
+# Data / local DB
 *.db
 *.sqlite3
 qdrant_storage/
 postgres_data/
+
+# Flutter / Dart (mobile/)
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+**/flutter/ephemeral/
+**/build/
+**/ios/Pods/
+**/ios/.symlinks/
+**/android/.gradle/
+**/android/captures/
+**/android/**/generated/
+*.iml
+
+# Certificates / keys (never commit real secrets)
+*.pem
+*.p12
+id_rsa
+id_ed25519
