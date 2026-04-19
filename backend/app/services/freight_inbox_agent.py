@@ -22,14 +22,19 @@ from app.schemas import (
 )
 from app.services.freight_ai import (
     classify_email_intent,
+    extract_carrier_status_update,
     extract_carrier_bid,
     extract_shipment_details,
+    extract_status_request,
 )
 from app.services.freight_execution import (
     confirm_booking_and_handoff,
     evaluate_shipment_bids,
+    fetch_tms_shipment_status,
     intake_bid,
+    push_carrier_status_to_tms,
     send_client_acknowledgement,
+    send_customer_status_reply,
     send_customer_quote,
 )
 from app.services.freight_outreach import create_carrier_outreach
@@ -130,6 +135,25 @@ async def run_freight_inbox_orchestrator(
             email_message=email_message,
             shipment=shipment,
             client=client,
+            intent_result=intent_result,
+            email_context=email_context,
+            policy=policy,
+        )
+    if intent_result.intent == "customer_status_request":
+        return await _handle_customer_status_request(
+            session,
+            email_message=email_message,
+            shipment=shipment,
+            client=client,
+            intent_result=intent_result,
+            email_context=email_context,
+        )
+    if intent_result.intent == "carrier_status_update":
+        return await _handle_carrier_status_update(
+            session,
+            email_message=email_message,
+            shipment=shipment,
+            carrier=carrier,
             intent_result=intent_result,
             email_context=email_context,
             policy=policy,
@@ -697,6 +721,144 @@ async def _handle_carrier_bid_reply(
     existing_bid = await session.scalar(
         select(CarrierBid).where(CarrierBid.email_message_id == email_message.id)
     )
+
+
+async def _handle_customer_status_request(
+    session: AsyncSession,
+    *,
+    email_message: EmailMessage,
+    shipment: Shipment,
+    client: Client | None,
+    intent_result: IntentResult,
+    email_context: dict,
+) -> WorkflowDecisionResult:
+    if client is None:
+        await _log_manual_review(
+            session,
+            shipment.id,
+            "Customer status request could not be mapped to a known client",
+            intent_result=intent_result,
+            review_type="customer_status_request_review",
+            next_action="approve_status_reply",
+        )
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=intent_result.confidence,
+            next_action="manual_review",
+            manual_review_required=True,
+        )
+
+    extraction = await extract_status_request(email_context)
+    if extraction.confidence < AUTO_INTENT_CONFIDENCE:
+        await _log_manual_review(
+            session,
+            shipment.id,
+            "Customer status request confidence too low",
+            intent_result=intent_result,
+            review_type="customer_status_request_review",
+            next_action="rerun_status_lookup",
+        )
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=extraction.confidence,
+            next_action="manual_review",
+            manual_review_required=True,
+        )
+    status_response = await fetch_tms_shipment_status(session, shipment_id=shipment.id)
+    reply = await send_customer_status_reply(
+        session,
+        shipment_id=shipment.id,
+        status_payload=status_response.payload,
+        dry_run=False,
+        custom_message=None,
+    )
+    return WorkflowDecisionResult(
+        email_message_id=str(email_message.id),
+        shipment_id=str(shipment.id),
+        intent=intent_result.intent,
+        confidence=extraction.confidence,
+        next_action="customer_status_sent",
+        status_lookup_triggered=True,
+        status_reply_sent=not reply.dry_run,
+    )
+
+
+async def _handle_carrier_status_update(
+    session: AsyncSession,
+    *,
+    email_message: EmailMessage,
+    shipment: Shipment,
+    carrier: Carrier | None,
+    intent_result: IntentResult,
+    email_context: dict,
+    policy: AutomationPolicy,
+) -> WorkflowDecisionResult:
+    if carrier is None:
+        await _log_manual_review(
+            session,
+            shipment.id,
+            "Carrier status update could not be mapped to known carrier",
+            intent_result=intent_result,
+            review_type="carrier_status_update_review",
+            next_action="rerun_tms_update",
+            allow_repeat=policy.allow_repeat_manual_review,
+        )
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=intent_result.confidence,
+            next_action="manual_review",
+            manual_review_required=True,
+        )
+
+    extraction = await extract_carrier_status_update(email_context)
+    if extraction.confidence < AUTO_BID_CONFIDENCE or extraction.ambiguity_reasons:
+        await _log_manual_review(
+            session,
+            shipment.id,
+            (
+                f"Ambiguous carrier status update: {', '.join(extraction.ambiguity_reasons)}"
+                if extraction.ambiguity_reasons
+                else "Carrier status update confidence too low"
+            ),
+            intent_result=intent_result,
+            review_type="carrier_status_update_review",
+            next_action="rerun_tms_update",
+            ambiguity_reasons=extraction.ambiguity_reasons,
+            allow_repeat=policy.allow_repeat_manual_review,
+        )
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=extraction.confidence,
+            next_action="manual_review",
+            ambiguity_reasons=extraction.ambiguity_reasons,
+            manual_review_required=True,
+        )
+
+    status_update = await push_carrier_status_to_tms(
+        session,
+        shipment_id=shipment.id,
+        status_text=extraction.status_text,
+        eta_text=extraction.eta_text,
+        location_text=extraction.location_text,
+        notes=extraction.notes,
+    )
+    return WorkflowDecisionResult(
+        email_message_id=str(email_message.id),
+        shipment_id=str(shipment.id),
+        intent=intent_result.intent,
+        confidence=extraction.confidence,
+        next_action="tms_status_updated",
+        tms_status_updated=True,
+        tms_handoff_status=status_update.status,
+    )
     if existing_bid is not None:
         return WorkflowDecisionResult(
             email_message_id=str(email_message.id),
@@ -888,6 +1050,9 @@ async def _log_manual_review(
     reason: str,
     *,
     intent_result: IntentResult,
+    review_type: str | None = None,
+    next_action: str = "manual_review",
+    ambiguity_reasons: list[str] | None = None,
     allow_repeat: bool = False,
 ) -> None:
     if not allow_repeat and await _has_open_review(session, shipment_id, reason):
@@ -900,8 +1065,11 @@ async def _log_manual_review(
         {
             "reason": reason,
             "intent": intent_result.intent,
+            "review_type": review_type,
             "confidence": intent_result.confidence,
-            "next_action": "manual_review",
+            "next_action": next_action,
+            "ambiguity_reasons": ambiguity_reasons or [],
+            "status_audit_kind": "status_review_required" if review_type and "status" in review_type else "manual_review_required",
             "manual_review_required": True,
         },
     )

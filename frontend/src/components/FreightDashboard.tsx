@@ -35,6 +35,18 @@ interface OverviewResponse {
     workflow_events: number;
   };
   active_stages: Record<string, number>;
+  status_metrics: {
+    lookups: number;
+    replies_drafted: number;
+    replies_sent: number;
+    carrier_updates_parsed: number;
+    carrier_updates_pushed: number;
+    review_required: number;
+    stale_shipments: number;
+  };
+  sla: {
+    status_stale_after_hours: number;
+  };
   integrations: Record<string, string>;
 }
 
@@ -85,6 +97,18 @@ interface ShipmentRecord {
   booking_error: string | null;
   tms_handoff_status: string | null;
   attachment_count: number;
+  document_summary: Record<string, number>;
+  missing_document_types: string[];
+  booking_review_warning: string | null;
+  booking_review_required: boolean;
+  last_known_status: string | null;
+  last_known_eta: string | null;
+  last_known_location: string | null;
+  last_status_source: string | null;
+  last_status_event_at: string | null;
+  status_review_required: boolean;
+  status_stale: boolean;
+  status_sla_hours: number | null;
   manual_review_required: boolean;
   created_at: string;
   updated_at: string;
@@ -105,6 +129,10 @@ interface ShipmentDocumentRecord {
   document_type: string;
   content_type: string | null;
   size: number | null;
+  extracted_text_preview: string | null;
+  extracted_fields: Record<string, string | number>;
+  extraction_method: string | null;
+  ocr_status: string | null;
   source_email_id: string;
 }
 
@@ -177,6 +205,9 @@ interface OutlookIngestResult {
   next_action: string | null;
   evaluation_triggered: boolean;
   quote_auto_sent: boolean;
+  status_lookup_triggered: boolean;
+  status_reply_sent: boolean;
+  tms_status_updated: boolean;
   event_type: string;
 }
 
@@ -189,6 +220,8 @@ interface OutlookSyncResponse {
   auto_bids: number;
   auto_evaluations: number;
   auto_quotes: number;
+  auto_status_replies: number;
+  auto_tms_status_updates: number;
   manual_reviews: number;
   results: OutlookIngestResult[];
 }
@@ -198,10 +231,13 @@ interface ReviewQueueItem {
   shipment_id: string;
   stage: string;
   event_type: string;
+  review_type: string | null;
   reason: string;
   next_action: string | null;
   missing_fields: string[];
   ambiguity_reasons: string[];
+  missing_document_types: string[];
+  booking_review_warning: string | null;
   created_at: string;
 }
 
@@ -210,7 +246,10 @@ type OperatorAction =
   | "approve_and_continue"
   | "rerun_parsing"
   | "rerun_outreach"
-  | "rerun_evaluation";
+  | "rerun_evaluation"
+  | "rerun_status_lookup"
+  | "rerun_tms_update"
+  | "approve_status_reply";
 
 interface ShipmentOperatorActionResponse {
   shipment_id: string;
@@ -223,6 +262,25 @@ interface ShipmentOperatorActionResponse {
   outreach_sent: boolean;
   evaluation_triggered: boolean;
   quote_sent: boolean;
+}
+
+interface CustomerStatusReplyResponse {
+  shipment_id: string;
+  client_email: string;
+  subject: string;
+  body: string;
+  dry_run: boolean;
+}
+
+interface CarrierStatusUpdateResponse {
+  shipment_id: string;
+  status: string;
+  dry_run: boolean;
+  status_text: string | null;
+  eta_text: string | null;
+  location_text: string | null;
+  notes: string | null;
+  payload: Record<string, unknown>;
 }
 
 interface CustomerQuoteResponse {
@@ -286,6 +344,18 @@ const EMPTY_OVERVIEW: OverviewResponse = {
     workflow_events: 0,
   },
   active_stages: {},
+  status_metrics: {
+    lookups: 0,
+    replies_drafted: 0,
+    replies_sent: 0,
+    carrier_updates_parsed: 0,
+    carrier_updates_pushed: 0,
+    review_required: 0,
+    stale_shipments: 0,
+  },
+  sla: {
+    status_stale_after_hours: 24,
+  },
   integrations: {},
 };
 
@@ -320,6 +390,59 @@ function formatDate(value: string | null) {
   }).format(new Date(value));
 }
 
+function formatAge(value: string | null) {
+  if (!value) return "No status activity yet";
+  const diffMs = Date.now() - new Date(value).getTime();
+  if (Number.isNaN(diffMs)) return "Unknown";
+  const diffMinutes = Math.max(0, Math.round(diffMs / 60000));
+  if (diffMinutes < 60) return `${diffMinutes}m ago`;
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 48) return `${diffHours}h ago`;
+  const diffDays = Math.round(diffHours / 24);
+  return `${diffDays}d ago`;
+}
+
+function payloadValue(payload: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.length > 0) return value;
+    if (typeof value === "number") return String(value);
+  }
+  const nestedPayload = payload.payload;
+  if (nestedPayload && typeof nestedPayload === "object" && !Array.isArray(nestedPayload)) {
+    const record = nestedPayload as Record<string, unknown>;
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === "string" && value.length > 0) return value;
+      if (typeof value === "number") return String(value);
+    }
+  }
+  const nestedResponse = payload.response;
+  if (nestedResponse && typeof nestedResponse === "object" && !Array.isArray(nestedResponse)) {
+    const record = nestedResponse as Record<string, unknown>;
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === "string" && value.length > 0) return value;
+      if (typeof value === "number") return String(value);
+    }
+  }
+  return "--";
+}
+
+function statusAuditLabel(eventRecord: WorkflowEventRecord) {
+  const auditKind = typeof eventRecord.payload.status_audit_kind === "string" ? eventRecord.payload.status_audit_kind : null;
+  if (auditKind) {
+    return auditKind.replaceAll("_", " ");
+  }
+  if (eventRecord.event_type === "tms_status_lookup") return "lookup";
+  if (eventRecord.event_type === "customer_status_sent") {
+    return eventRecord.payload.dry_run ? "reply drafted" : "reply sent";
+  }
+  if (eventRecord.event_type === "tms_status_updated") return "carrier update pushed";
+  if (eventRecord.event_type === "manual_review_required") return "status review required";
+  return eventRecord.event_type.replaceAll("_", " ");
+}
+
 function ShipmentStatusPill({ status }: { status: string }) {
   return (
     <span
@@ -345,6 +468,8 @@ export function FreightDashboard() {
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [ackPreview, setAckPreview] = useState<ClientAcknowledgementResponse | null>(null);
   const [quotePreview, setQuotePreview] = useState<CustomerQuoteResponse | null>(null);
+  const [statusReplyPreview, setStatusReplyPreview] = useState<CustomerStatusReplyResponse | null>(null);
+  const [carrierStatusPreview, setCarrierStatusPreview] = useState<CarrierStatusUpdateResponse | null>(null);
   const [tmsPreview, setTmsPreview] = useState<TmsHandoffResponse | null>(null);
   const [bookingResult, setBookingResult] = useState<BookingExecutionResponse | null>(null);
   const [selectedShipmentId, setSelectedShipmentId] = useState<string | null>(null);
@@ -387,6 +512,13 @@ export function FreightDashboard() {
     eta_text: "Tomorrow pickup / next-day delivery",
     raw_email: "Best rate we can do is 1000 all in.",
   });
+  const [statusReplyMessage, setStatusReplyMessage] = useState("");
+  const [carrierStatusForm, setCarrierStatusForm] = useState({
+    status_text: "",
+    eta_text: "",
+    location_text: "",
+    notes: "",
+  });
 
   const selectedShipment = useMemo(
     () => shipments.find((shipment) => shipment.id === selectedShipmentId) || null,
@@ -405,6 +537,16 @@ export function FreightDashboard() {
     if (!bidId) return null;
     return bids.find((bid) => bid.id === bidId) || evaluation.results.find((bid) => bid.id === bidId) || null;
   }, [bids, evaluation]);
+  const statusEvents = useMemo(
+    () =>
+      events.filter((eventRecord) =>
+        ["tms_status_lookup", "customer_status_sent", "tms_status_updated"].includes(eventRecord.event_type) ||
+        (eventRecord.event_type === "manual_review_required" &&
+          typeof eventRecord.payload.review_type === "string" &&
+          eventRecord.payload.review_type.includes("status")),
+      ),
+    [events],
+  );
 
   async function loadDashboard() {
     setLoading(true);
@@ -473,6 +615,8 @@ export function FreightDashboard() {
       setEvaluation(null);
       setAckPreview(null);
       setQuotePreview(null);
+      setStatusReplyPreview(null);
+      setCarrierStatusPreview(null);
       setTmsPreview(null);
       setBookingResult(null);
       return;
@@ -481,6 +625,8 @@ export function FreightDashboard() {
     setEvaluation(null);
     setAckPreview(null);
     setQuotePreview(null);
+    setStatusReplyPreview(null);
+    setCarrierStatusPreview(null);
     setTmsPreview(null);
     setBookingResult(null);
     void loadShipmentContext(selectedShipmentId).catch(() => {
@@ -685,7 +831,7 @@ export function FreightDashboard() {
         }),
       });
       setNotice(
-        `Outlook sync imported ${response.imported} thread(s), skipped ${response.skipped}, parsed ${response.parsed_shipments} shipment(s), sent ${response.auto_acknowledgements} acknowledgment(s), sent ${response.auto_outreach} outreach flow(s), captured ${response.auto_bids} bid(s), triggered ${response.auto_evaluations} evaluation(s), sent ${response.auto_quotes} quote(s), and flagged ${response.manual_reviews} review item(s).`,
+        `Outlook sync imported ${response.imported} thread(s), skipped ${response.skipped}, parsed ${response.parsed_shipments} shipment(s), sent ${response.auto_acknowledgements} acknowledgment(s), sent ${response.auto_outreach} outreach flow(s), captured ${response.auto_bids} bid(s), triggered ${response.auto_evaluations} evaluation(s), sent ${response.auto_quotes} quote(s), sent ${response.auto_status_replies} status update(s), pushed ${response.auto_tms_status_updates} carrier update(s) to TMS, and flagged ${response.manual_reviews} review item(s).`,
       );
       setLastSyncSummary(response);
       await refreshAll();
@@ -712,6 +858,111 @@ export function FreightDashboard() {
       await refreshAll();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to preview customer quote.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handlePreviewStatusReply() {
+    if (!selectedShipment) return;
+    setSubmitting("status_preview");
+    setError(null);
+    try {
+      const response = await fetchJson<CustomerStatusReplyResponse>(
+        `/api/freight/shipments/${selectedShipment.id}/status-reply`,
+        {
+          method: "POST",
+          body: JSON.stringify({ dry_run: true, custom_message: statusReplyMessage || null }),
+        },
+      );
+      setStatusReplyPreview(response);
+      setNotice(`Status reply draft prepared for ${response.client_email}.`);
+      await refreshAll();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to preview status reply.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleSendStatusReply() {
+    if (!selectedShipment) return;
+    setSubmitting("status_send");
+    setError(null);
+    try {
+      const response = await fetchJson<CustomerStatusReplyResponse>(
+        `/api/freight/shipments/${selectedShipment.id}/status-reply`,
+        {
+          method: "POST",
+          body: JSON.stringify({ dry_run: false, custom_message: statusReplyMessage || null }),
+        },
+      );
+      setStatusReplyPreview(response);
+      setNotice(`Status reply sent to ${response.client_email}.`);
+      await refreshAll();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to send status reply.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handlePreviewCarrierStatusUpdate() {
+    if (!selectedShipment) return;
+    setSubmitting("carrier_status_preview");
+    setError(null);
+    try {
+      const response = await fetchJson<CarrierStatusUpdateResponse>(
+        `/api/freight/shipments/${selectedShipment.id}/carrier-status-update`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            dry_run: true,
+            status_text: carrierStatusForm.status_text || null,
+            eta_text: carrierStatusForm.eta_text || null,
+            location_text: carrierStatusForm.location_text || null,
+            notes: carrierStatusForm.notes || null,
+          }),
+        },
+      );
+      setCarrierStatusPreview(response);
+      setCarrierStatusForm({
+        status_text: response.status_text || "",
+        eta_text: response.eta_text || "",
+        location_text: response.location_text || "",
+        notes: response.notes || "",
+      });
+      setNotice("Carrier status update draft prepared.");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to preview carrier status update.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleSendCarrierStatusUpdate() {
+    if (!selectedShipment) return;
+    setSubmitting("carrier_status_send");
+    setError(null);
+    try {
+      const response = await fetchJson<CarrierStatusUpdateResponse>(
+        `/api/freight/shipments/${selectedShipment.id}/carrier-status-update`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            dry_run: false,
+            status_text: carrierStatusForm.status_text || null,
+            eta_text: carrierStatusForm.eta_text || null,
+            location_text: carrierStatusForm.location_text || null,
+            notes: carrierStatusForm.notes || null,
+          }),
+        },
+      );
+      setCarrierStatusPreview(response);
+      setNotice("Carrier status update sent to TMS.");
+      await refreshAll();
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to send carrier status update.");
     } finally {
       setSubmitting(null);
     }
@@ -799,6 +1050,13 @@ export function FreightDashboard() {
       detail: `${overview.counts.email_threads} normalized threads in Outlook`,
       icon: Mail,
       accent: "from-rose-300/30 to-rose-500/5",
+    },
+    {
+      label: "Status replies",
+      value: overview.status_metrics.replies_sent,
+      detail: `${overview.status_metrics.lookups} lookups, ${overview.status_metrics.review_required} status reviews`,
+      icon: RadioTower,
+      accent: "from-emerald-300/30 to-emerald-500/5",
     },
   ];
 
@@ -930,6 +1188,20 @@ export function FreightDashboard() {
                             <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Weight</p><p className="mt-1 text-base font-medium text-white">{shipment.weight_lb ?? "--"} lb</p></div>
                             <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Ready</p><p className="mt-1 text-base font-medium text-white">{formatDate(shipment.ready_at)}</p></div>
                           </div>
+                          {(shipment.status_stale || shipment.status_review_required) && (
+                            <div className="mt-4 flex flex-wrap gap-2">
+                              {shipment.status_stale && (
+                                <span className="rounded-full bg-amber-300/10 px-3 py-1 text-xs text-amber-100">
+                                  Status stale over {shipment.status_sla_hours || overview.sla.status_stale_after_hours}h
+                                </span>
+                              )}
+                              {shipment.status_review_required && (
+                                <span className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">
+                                  Status review required
+                                </span>
+                              )}
+                            </div>
+                          )}
                         </button>
                       ))}
                     </div>
@@ -1070,6 +1342,26 @@ export function FreightDashboard() {
                   </div>
 
                   <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
+                    <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><RadioTower size={14} />Status tracking</div>
+                    <div className="mt-3 grid gap-3 text-sm sm:grid-cols-4">
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Status</p><p className="mt-2 text-white">{selectedShipment.last_known_status ? selectedShipment.last_known_status.replaceAll("_", " ") : "Unknown"}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">ETA</p><p className="mt-2 text-white">{selectedShipment.last_known_eta || "Not available"}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Location</p><p className="mt-2 text-white">{selectedShipment.last_known_location || "Not available"}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Source</p><p className="mt-2 text-white">{selectedShipment.last_status_source ? selectedShipment.last_status_source.replaceAll("_", " ") : "No updates yet"}</p></div>
+                    </div>
+                    <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Last status activity</p><p className="mt-2 text-white">{formatAge(selectedShipment.last_status_event_at)}</p><p className="mt-1 text-xs text-[var(--text-muted)]">{selectedShipment.last_status_event_at ? formatDate(selectedShipment.last_status_event_at) : "No timeline signal yet"}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">SLA health</p><p className="mt-2 text-white">{selectedShipment.status_stale ? "Needs operator attention" : "Within SLA"}</p><p className="mt-1 text-xs text-[var(--text-muted)]">Threshold: {selectedShipment.status_sla_hours || overview.sla.status_stale_after_hours}h without status activity</p></div>
+                    </div>
+                    {(selectedShipment.status_stale || selectedShipment.status_review_required) && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {selectedShipment.status_stale && <span className="rounded-full bg-amber-300/10 px-3 py-1 text-xs text-amber-100">Status follow-up overdue</span>}
+                        {selectedShipment.status_review_required && <span className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">Status review queued</span>}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
                     <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><ClipboardCheck size={14} />Booking state</div>
                     <div className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
                       <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">State</p><p className="mt-2 text-white">{selectedShipment.booking_state ? selectedShipment.booking_state.replaceAll("_", " ") : "Not started"}</p></div>
@@ -1079,7 +1371,37 @@ export function FreightDashboard() {
                     <div className="mt-3 rounded-2xl bg-slate-950/30 p-4 text-sm">
                       <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Documents in thread</p>
                       <p className="mt-2 text-white">{selectedShipment.attachment_count} attachment(s) available for TMS handoff</p>
+                      {Object.keys(selectedShipment.document_summary).length > 0 && (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {Object.entries(selectedShipment.document_summary).map(([documentType, count]) => (
+                            <span key={documentType} className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">
+                              {documentType.replaceAll("_", " ")}: {count}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {selectedShipment.missing_document_types.length > 0 && (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {selectedShipment.missing_document_types.map((documentType) => (
+                            <span key={documentType} className="rounded-full bg-amber-300/10 px-3 py-1 text-xs text-amber-100">
+                              Missing {documentType.replaceAll("_", " ")}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
+                    {selectedShipment.booking_review_warning && (
+                      <div className="mt-3 rounded-2xl border border-amber-300/20 bg-amber-300/10 p-4 text-sm text-amber-50">
+                        <p className="text-xs uppercase tracking-[0.16em] text-amber-100">Booking review warning</p>
+                        <p className="mt-2">{selectedShipment.booking_review_warning}</p>
+                      </div>
+                    )}
+                    {selectedShipment.booking_review_required && (
+                      <div className="mt-3 rounded-2xl border border-rose-300/20 bg-rose-300/10 p-4 text-sm text-rose-50">
+                        <p className="text-xs uppercase tracking-[0.16em] text-rose-100">Operator follow-up</p>
+                        <p className="mt-2">Review document coverage before relying on this booking as fully complete.</p>
+                      </div>
+                    )}
                   </div>
 
                   <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
@@ -1095,7 +1417,23 @@ export function FreightDashboard() {
                           <div className="mt-2 flex flex-wrap gap-3 text-xs text-[var(--text-muted)]">
                             <span>{document.content_type || "unknown type"}</span>
                             <span>{document.size ? `${document.size} bytes` : "size unknown"}</span>
+                            {document.extraction_method && <span>{document.extraction_method.replaceAll("_", " ")}</span>}
+                            {document.ocr_status && <span>OCR: {document.ocr_status.replaceAll("_", " ")}</span>}
                           </div>
+                          {Object.keys(document.extracted_fields).length > 0 && (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {Object.entries(document.extracted_fields).map(([field, value]) => (
+                                <span key={field} className="rounded-full bg-emerald-300/10 px-3 py-1 text-xs text-emerald-100">
+                                  {field.replaceAll("_", " ")}: {String(value)}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {document.extracted_text_preview && (
+                            <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-3 text-xs text-[var(--text-muted)]">
+                              {document.extracted_text_preview}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -1133,6 +1471,13 @@ export function FreightDashboard() {
                     <button onClick={() => void handleOperatorAction("rerun_parsing")} disabled={submitting === "rerun_parsing"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">{submitting === "rerun_parsing" ? "Re-running..." : "Re-run parsing"}</button>
                     <button onClick={() => void handleOperatorAction("rerun_outreach")} disabled={submitting === "rerun_outreach"} className="action-button w-full bg-orange-300/15 text-orange-100 hover:bg-orange-300/20 disabled:opacity-50">{submitting === "rerun_outreach" ? "Sending..." : "Re-run outreach"}</button>
                     <button onClick={() => void handleOperatorAction("rerun_evaluation")} disabled={submitting === "rerun_evaluation" || bids.length === 0} className="action-button w-full bg-fuchsia-300/15 text-fuchsia-100 hover:bg-fuchsia-300/20 disabled:opacity-50">{submitting === "rerun_evaluation" ? "Evaluating..." : "Re-run evaluation"}</button>
+                    <button onClick={() => void handleOperatorAction("rerun_status_lookup")} disabled={submitting === "rerun_status_lookup"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "rerun_status_lookup" ? "Refreshing..." : "Re-run status lookup"}</button>
+                    <button onClick={() => void handleOperatorAction("rerun_tms_update")} disabled={submitting === "rerun_tms_update"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">{submitting === "rerun_tms_update" ? "Re-sending..." : "Re-run TMS update"}</button>
+                    <button onClick={() => void handleOperatorAction("approve_status_reply")} disabled={submitting === "approve_status_reply"} className="action-button w-full bg-teal-300/15 text-teal-100 hover:bg-teal-300/20 disabled:opacity-50">{submitting === "approve_status_reply" ? "Sending..." : "Approve status reply"}</button>
+                    <button onClick={() => void handlePreviewStatusReply()} disabled={submitting === "status_preview"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "status_preview" ? "Preparing..." : "Preview status reply"}</button>
+                    <button onClick={() => void handleSendStatusReply()} disabled={submitting === "status_send"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">{submitting === "status_send" ? "Sending..." : "Send status reply"}</button>
+                    <button onClick={() => void handlePreviewCarrierStatusUpdate()} disabled={submitting === "carrier_status_preview"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">{submitting === "carrier_status_preview" ? "Preparing..." : "Preview carrier update"}</button>
+                    <button onClick={() => void handleSendCarrierStatusUpdate()} disabled={submitting === "carrier_status_send"} className="action-button w-full bg-blue-300/15 text-blue-100 hover:bg-blue-300/20 disabled:opacity-50">{submitting === "carrier_status_send" ? "Sending..." : "Send carrier update"}</button>
                     <button onClick={() => void handlePreviewAcknowledgement()} disabled={submitting === "ack"} className="action-button w-full bg-violet-300/15 text-violet-100 hover:bg-violet-300/20 disabled:opacity-50">{submitting === "ack" ? "Preparing acknowledgment..." : "Preview customer ack"}</button>
                     <button onClick={() => void handleDryRunOutreach()} disabled={submitting === "outreach"} className="action-button w-full bg-[var(--accent-amber)] text-slate-950 hover:brightness-110">{submitting === "outreach" ? "Preparing..." : "Dry-run outreach"}</button>
                     <button onClick={() => void handleEvaluateBids()} disabled={submitting === "evaluate" || bids.length === 0} className="action-button w-full bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">{submitting === "evaluate" ? "Evaluating..." : "Evaluate bids"}</button>
@@ -1180,9 +1525,98 @@ export function FreightDashboard() {
 
                   {quotePreview && <div className="rounded-[24px] border border-emerald-300/20 bg-emerald-300/10 p-4"><div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-emerald-100"><Mail size={14} />Customer quote preview</div><p className="mt-3 text-sm text-white">{quotePreview.subject}</p><p className="mt-2 whitespace-pre-wrap text-sm text-emerald-50">{quotePreview.body}</p></div>}
 
+                  <div className="rounded-[24px] border border-cyan-300/20 bg-cyan-300/10 p-4">
+                    <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-cyan-100"><Mail size={14} />Status reply draft</div>
+                    <textarea
+                      className="field-input mt-3 min-h-[110px] resize-none"
+                      placeholder="Optional operator note to append to the status reply"
+                      value={statusReplyMessage}
+                      onChange={(event) => setStatusReplyMessage(event.target.value)}
+                    />
+                    {statusReplyPreview ? (
+                      <div className="mt-3">
+                        <p className="text-sm text-white">{statusReplyPreview.subject}</p>
+                        <p className="mt-2 whitespace-pre-wrap text-sm text-cyan-50">{statusReplyPreview.body}</p>
+                      </div>
+                    ) : (
+                      <p className="mt-3 text-sm text-cyan-50">Preview a status reply to review the exact customer-facing message before sending.</p>
+                    )}
+                  </div>
+
+                  <div className="rounded-[24px] border border-sky-300/20 bg-sky-300/10 p-4">
+                    <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-sky-100"><RadioTower size={14} />Carrier status update review</div>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                      <input
+                        className="field-input"
+                        placeholder="Status text"
+                        value={carrierStatusForm.status_text}
+                        onChange={(event) => setCarrierStatusForm((current) => ({ ...current, status_text: event.target.value }))}
+                      />
+                      <input
+                        className="field-input"
+                        placeholder="ETA text"
+                        value={carrierStatusForm.eta_text}
+                        onChange={(event) => setCarrierStatusForm((current) => ({ ...current, eta_text: event.target.value }))}
+                      />
+                      <input
+                        className="field-input"
+                        placeholder="Location text"
+                        value={carrierStatusForm.location_text}
+                        onChange={(event) => setCarrierStatusForm((current) => ({ ...current, location_text: event.target.value }))}
+                      />
+                      <input
+                        className="field-input"
+                        placeholder="Notes"
+                        value={carrierStatusForm.notes}
+                        onChange={(event) => setCarrierStatusForm((current) => ({ ...current, notes: event.target.value }))}
+                      />
+                    </div>
+                    {carrierStatusPreview ? (
+                      <div className="mt-3 rounded-2xl border border-sky-300/20 bg-slate-950/30 p-4 text-sm text-sky-50">
+                        <p className="text-xs uppercase tracking-[0.16em] text-sky-100">Prepared payload</p>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                          <div><p className="text-xs uppercase tracking-[0.16em] text-sky-100">Status</p><p className="mt-1 text-white">{carrierStatusPreview.status_text || "None"}</p></div>
+                          <div><p className="text-xs uppercase tracking-[0.16em] text-sky-100">ETA</p><p className="mt-1 text-white">{carrierStatusPreview.eta_text || "None"}</p></div>
+                          <div><p className="text-xs uppercase tracking-[0.16em] text-sky-100">Location</p><p className="mt-1 text-white">{carrierStatusPreview.location_text || "None"}</p></div>
+                        </div>
+                        {carrierStatusPreview.notes && <p className="mt-3 text-sky-50">{carrierStatusPreview.notes}</p>}
+                      </div>
+                    ) : (
+                      <p className="mt-3 text-sm text-sky-50">Preview the structured carrier update, adjust any field if needed, then send it to TMS.</p>
+                    )}
+                  </div>
+
                   {tmsPreview && <div className="rounded-[24px] border border-rose-300/20 bg-rose-300/10 p-4"><div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-rose-100"><ClipboardCheck size={14} />TMS preview</div><pre className="mt-3 overflow-x-auto whitespace-pre-wrap rounded-2xl bg-slate-950/40 p-4 text-xs text-rose-50">{JSON.stringify(tmsPreview.payload, null, 2)}</pre></div>}
 
                   {bookingResult && <div className="rounded-[24px] border border-lime-300/20 bg-lime-300/10 p-4"><div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-lime-100"><ClipboardCheck size={14} />Booking completed</div><p className="mt-3 text-sm text-white">TMS status: {bookingResult.handoff.status}</p><p className="mt-1 text-sm text-lime-100">Confirmation sent to {bookingResult.confirmation.client_email}</p><p className="mt-3 text-sm text-white">{bookingResult.confirmation.subject}</p></div>}
+
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><Map size={14} />TMS status timeline</div>
+                    <div className="space-y-3">
+                      {statusEvents.length === 0 && <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm text-[var(--text-muted)]">No status sync events yet for this shipment.</div>}
+                      {statusEvents.map((eventRecord) => (
+                        <div key={`status-${eventRecord.id}`} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="text-sm font-medium text-white">{statusAuditLabel(eventRecord)}</p>
+                            <span className="text-xs text-[var(--text-muted)]">{formatDate(eventRecord.created_at)}</span>
+                          </div>
+                          <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">{eventRecord.event_type.replaceAll("_", " ")}</p>
+                          <div className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Status</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "status_label", "status", "status_text").replaceAll("_", " ")}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">ETA</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "eta_label", "eta", "eta_text")}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Location</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "location_label", "location", "location_text")}</p></div>
+                          </div>
+                          <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Milestone</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "milestone_label", "milestone")}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Source</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "status_source", "source")}</p></div>
+                          </div>
+                          {typeof eventRecord.payload.reason === "string" && eventRecord.payload.reason.length > 0 && (
+                            <p className="mt-3 text-sm text-[var(--text-muted)]">{eventRecord.payload.reason}</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
 
                   <div className="space-y-3">
                     <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><Clock3 size={14} />Workflow timeline</div>
@@ -1214,6 +1648,20 @@ export function FreightDashboard() {
                               ))}
                             </div>
                           )}
+                          {typeof eventRecord.payload.booking_review_warning === "string" && eventRecord.payload.booking_review_warning.length > 0 && (
+                            <div className="mt-3 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-3 py-3 text-xs text-amber-50">
+                              {eventRecord.payload.booking_review_warning}
+                            </div>
+                          )}
+                          {Array.isArray(eventRecord.payload.missing_document_types) && eventRecord.payload.missing_document_types.length > 0 && (
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {(eventRecord.payload.missing_document_types as string[]).map((documentType) => (
+                                <span key={documentType} className="rounded-full bg-amber-300/10 px-2 py-1 text-[11px] text-amber-100">
+                                  Missing {documentType.replaceAll("_", " ")}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -1234,6 +1682,19 @@ export function FreightDashboard() {
                 <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><ClipboardCheck size={16} /> TMS connector</span><span className="text-white">Preview-ready</span></div>
               </div>
 
+              <div className="mt-6 rounded-[24px] border border-white/10 bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Status ops health</p>
+                <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
+                  <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Replies sent: {overview.status_metrics.replies_sent}</div>
+                  <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Lookups: {overview.status_metrics.lookups}</div>
+                  <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Carrier pushes: {overview.status_metrics.carrier_updates_pushed}</div>
+                  <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Status reviews: {overview.status_metrics.review_required}</div>
+                  <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Draft replies: {overview.status_metrics.replies_drafted}</div>
+                  <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Stale shipments: {overview.status_metrics.stale_shipments}</div>
+                </div>
+                <p className="mt-3 text-xs text-[var(--text-muted)]">SLA baseline: a shipment is marked stale after {overview.sla.status_stale_after_hours}h without status activity while still in an active status workflow.</p>
+              </div>
+
               {lastSyncSummary && (
                 <div className="mt-6 rounded-[24px] border border-cyan-300/20 bg-cyan-300/10 p-4">
                   <p className="text-xs uppercase tracking-[0.18em] text-cyan-100">Last sync summary</p>
@@ -1244,6 +1705,8 @@ export function FreightDashboard() {
                     <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Auto bids: {lastSyncSummary.auto_bids}</div>
                     <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Auto evaluations: {lastSyncSummary.auto_evaluations}</div>
                     <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Auto quotes: {lastSyncSummary.auto_quotes}</div>
+                    <div className="rounded-2xl bg-slate-950/30 p-4 text-white">Status replies: {lastSyncSummary.auto_status_replies}</div>
+                    <div className="rounded-2xl bg-slate-950/30 p-4 text-white">TMS status updates: {lastSyncSummary.auto_tms_status_updates}</div>
                   </div>
                 </div>
               )}
@@ -1259,14 +1722,37 @@ export function FreightDashboard() {
                         <p className="text-sm font-medium text-white">{item.event_type.replaceAll("_", " ")}</p>
                         <span className="text-xs text-[var(--text-muted)]">{formatDate(item.created_at)}</span>
                       </div>
+                      {item.review_type && (
+                        <div className="mt-3">
+                          <span className={`rounded-full px-2 py-1 text-[11px] ${item.review_type.includes("status") ? "bg-cyan-300/10 text-cyan-100" : "bg-white/10 text-white"}`}>
+                            {item.review_type.replaceAll("_", " ")}
+                          </span>
+                        </div>
+                      )}
                       <p className="mt-2 text-sm text-[var(--text-muted)]">{item.reason || "Operator review requested"}</p>
                       {item.next_action && <p className="mt-2 text-xs uppercase tracking-[0.16em] text-cyan-100">Next: {item.next_action.replaceAll("_", " ")}</p>}
                       {item.missing_fields.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.missing_fields.map((field) => <span key={field} className="rounded-full bg-amber-300/10 px-2 py-1 text-[11px] text-amber-100">{field}</span>)}</div>}
                       {item.ambiguity_reasons.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.ambiguity_reasons.map((reason) => <span key={reason} className="rounded-full bg-rose-300/10 px-2 py-1 text-[11px] text-rose-100">{reason.replaceAll("_", " ")}</span>)}</div>}
+                      {item.missing_document_types.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.missing_document_types.map((documentType) => <span key={documentType} className="rounded-full bg-amber-300/10 px-2 py-1 text-[11px] text-amber-100">Missing {documentType.replaceAll("_", " ")}</span>)}</div>}
+                      {item.booking_review_warning && <div className="mt-3 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-3 py-3 text-xs text-amber-50">{item.booking_review_warning}</div>}
                       </button>
                       <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                        <button onClick={() => void handleOperatorAction("resume_workflow", item.shipment_id)} disabled={submitting === "resume_workflow"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">Resume</button>
-                        <button onClick={() => void handleOperatorAction("approve_and_continue", item.shipment_id)} disabled={submitting === "approve_and_continue"} className="action-button w-full bg-lime-300/15 text-lime-100 hover:bg-lime-300/20 disabled:opacity-50">Approve</button>
+                        {item.review_type === "customer_status_request_review" ? (
+                          <>
+                            <button onClick={() => void handleOperatorAction("rerun_status_lookup", item.shipment_id)} disabled={submitting === "rerun_status_lookup"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Refresh status</button>
+                            <button onClick={() => void handleOperatorAction("approve_status_reply", item.shipment_id)} disabled={submitting === "approve_status_reply"} className="action-button w-full bg-teal-300/15 text-teal-100 hover:bg-teal-300/20 disabled:opacity-50">Approve reply</button>
+                          </>
+                        ) : item.review_type === "carrier_status_update_review" ? (
+                          <>
+                            <button onClick={() => void handleOperatorAction("rerun_tms_update", item.shipment_id)} disabled={submitting === "rerun_tms_update"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">Replay update</button>
+                            <button onClick={() => void handleOperatorAction("rerun_status_lookup", item.shipment_id)} disabled={submitting === "rerun_status_lookup"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Check TMS status</button>
+                          </>
+                        ) : (
+                          <>
+                            <button onClick={() => void handleOperatorAction("resume_workflow", item.shipment_id)} disabled={submitting === "resume_workflow"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">Resume</button>
+                            <button onClick={() => void handleOperatorAction("approve_and_continue", item.shipment_id)} disabled={submitting === "approve_and_continue"} className="action-button w-full bg-lime-300/15 text-lime-100 hover:bg-lime-300/20 disabled:opacity-50">Approve</button>
+                          </>
+                        )}
                       </div>
                     </div>
                   ))}

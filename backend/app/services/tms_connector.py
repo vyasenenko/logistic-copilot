@@ -94,3 +94,46 @@ class TmsConnector:
                         break
                     await asyncio.sleep(min(attempt, 2))
         raise RuntimeError(f"TMS request failed after {attempts} attempt(s): {last_error}")
+
+    async def fetch_shipment_status(self, shipment_key: str) -> dict:
+        """Fetch the latest shipment status from the TMS."""
+        try:
+            return await self.request("GET", f"/loads/{shipment_key}/status")
+        except RuntimeError:
+            # Local fallback so Phase 3 can work before a real TMS status API is wired.
+            return {
+                "shipment_key": shipment_key,
+                "status": "in_transit",
+                "eta": "Tomorrow by 10:00 AM",
+                "location": "Columbus, OH",
+                "milestone": "linehaul_in_progress",
+                "source": "fallback_mock",
+            }
+
+    async def push_shipment_update(
+        self,
+        shipment_key: str,
+        *,
+        status_text: str | None,
+        eta_text: str | None,
+        location_text: str | None,
+        notes: str | None,
+    ) -> dict:
+        """Push a carrier status update into the TMS."""
+        payload = {
+            "shipment_key": shipment_key,
+            "status_text": status_text,
+            "eta_text": eta_text,
+            "location_text": location_text,
+            "notes": notes,
+        }
+        try:
+            response = await self.request(
+                "POST",
+                f"/loads/{shipment_key}/updates",
+                json=payload,
+                idempotency_key=f"status-update:{shipment_key}:{status_text or 'none'}:{eta_text or 'none'}:{location_text or 'none'}",
+            )
+            return {"status": "submitted", "response": response, "payload": payload}
+        except RuntimeError:
+            return {"status": "accepted_mock", "response": {"source": "fallback_mock"}, "payload": payload}

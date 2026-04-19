@@ -45,6 +45,9 @@ class WorkflowEventType(str, Enum):
     CUSTOMER_CONFIRMED = "customer_confirmed"
     MANUAL_REVIEW_REQUIRED = "manual_review_required"
     TMS_HANDOFF_SENT = "tms_handoff_sent"
+    TMS_STATUS_LOOKUP = "tms_status_lookup"
+    CUSTOMER_STATUS_SENT = "customer_status_sent"
+    TMS_STATUS_UPDATED = "tms_status_updated"
     EXCEPTION_RAISED = "exception_raised"
 
 
@@ -179,6 +182,18 @@ class ShipmentRecord(BaseModel):
     booking_error: str | None = None
     tms_handoff_status: str | None = None
     attachment_count: int = 0
+    document_summary: dict[str, int] = Field(default_factory=dict)
+    missing_document_types: list[str] = Field(default_factory=list)
+    booking_review_warning: str | None = None
+    booking_review_required: bool = False
+    last_known_status: str | None = None
+    last_known_eta: str | None = None
+    last_known_location: str | None = None
+    last_status_source: str | None = None
+    last_status_event_at: datetime | None = None
+    status_review_required: bool = False
+    status_stale: bool = False
+    status_sla_hours: int | None = None
     manual_review_required: bool = False
     created_at: datetime
     updated_at: datetime
@@ -199,6 +214,10 @@ class ShipmentDocumentRecord(BaseModel):
     document_type: str
     content_type: str | None = None
     size: int | None = None
+    extracted_text_preview: str | None = None
+    extracted_fields: dict = Field(default_factory=dict)
+    extraction_method: str | None = None
+    ocr_status: str | None = None
     source_email_id: str
 
 
@@ -235,9 +254,25 @@ class FreightOverviewCounts(BaseModel):
     workflow_events: int = 0
 
 
+class FreightStatusMetrics(BaseModel):
+    lookups: int = 0
+    replies_drafted: int = 0
+    replies_sent: int = 0
+    carrier_updates_parsed: int = 0
+    carrier_updates_pushed: int = 0
+    review_required: int = 0
+    stale_shipments: int = 0
+
+
+class FreightSlaSummary(BaseModel):
+    status_stale_after_hours: int = 24
+
+
 class FreightOverviewResponse(BaseModel):
     counts: FreightOverviewCounts
     active_stages: dict[str, int] = Field(default_factory=dict)
+    status_metrics: FreightStatusMetrics = Field(default_factory=FreightStatusMetrics)
+    sla: FreightSlaSummary = Field(default_factory=FreightSlaSummary)
     integrations: dict[str, str] = Field(default_factory=dict)
 
 
@@ -295,6 +330,9 @@ class OutlookIngestResult(BaseModel):
     booking_triggered: bool = False
     booking_confirmation_sent: bool = False
     tms_handoff_status: str | None = None
+    status_lookup_triggered: bool = False
+    status_reply_sent: bool = False
+    tms_status_updated: bool = False
     event_type: WorkflowEventType = WorkflowEventType.EMAIL_RECEIVED
 
 
@@ -307,6 +345,8 @@ class OutlookSyncResponse(BaseModel):
     auto_bids: int = 0
     auto_evaluations: int = 0
     auto_quotes: int = 0
+    auto_status_replies: int = 0
+    auto_tms_status_updates: int = 0
     manual_reviews: int = 0
     results: list[OutlookIngestResult] = Field(default_factory=list)
 
@@ -336,6 +376,24 @@ class CarrierBidExtractionResult(BaseModel):
     amount: float | None = Field(None, ge=0)
     currency: str = "USD"
     eta_text: str | None = None
+    notes: str = ""
+    ambiguity_reasons: list[str] = Field(default_factory=list)
+    confidence: float = Field(0, ge=0, le=1)
+
+
+class StatusRequestExtractionResult(BaseModel):
+    intent: str = "customer_status_request"
+    request_type: str = "general_status"
+    requested_fields: list[str] = Field(default_factory=list)
+    notes: str = ""
+    confidence: float = Field(0, ge=0, le=1)
+
+
+class CarrierStatusUpdateExtractionResult(BaseModel):
+    intent: str = "carrier_status_update"
+    status_text: str | None = None
+    eta_text: str | None = None
+    location_text: str | None = None
     notes: str = ""
     ambiguity_reasons: list[str] = Field(default_factory=list)
     confidence: float = Field(0, ge=0, le=1)
@@ -375,6 +433,9 @@ class WorkflowDecisionResult(BaseModel):
     booking_triggered: bool = False
     booking_confirmation_sent: bool = False
     tms_handoff_status: str | None = None
+    status_lookup_triggered: bool = False
+    status_reply_sent: bool = False
+    tms_status_updated: bool = False
     manual_review_required: bool = False
 
 
@@ -383,10 +444,13 @@ class ReviewQueueItem(BaseModel):
     shipment_id: str
     stage: str
     event_type: str
+    review_type: str | None = None
     reason: str = ""
     next_action: str | None = None
     missing_fields: list[str] = Field(default_factory=list)
     ambiguity_reasons: list[str] = Field(default_factory=list)
+    missing_document_types: list[str] = Field(default_factory=list)
+    booking_review_warning: str | None = None
     created_at: datetime
 
 
@@ -396,6 +460,9 @@ class OperatorAction(str, Enum):
     RERUN_PARSING = "rerun_parsing"
     RERUN_OUTREACH = "rerun_outreach"
     RERUN_EVALUATION = "rerun_evaluation"
+    RERUN_STATUS_LOOKUP = "rerun_status_lookup"
+    RERUN_TMS_UPDATE = "rerun_tms_update"
+    APPROVE_STATUS_REPLY = "approve_status_reply"
 
 
 class ShipmentOperatorActionRequest(BaseModel):
@@ -538,6 +605,44 @@ class TmsHandoffResponse(BaseModel):
     dry_run: bool
     payload: dict = Field(default_factory=dict)
     response: dict = Field(default_factory=dict)
+
+
+class TmsStatusResponse(BaseModel):
+    shipment_id: str
+    status: str
+    payload: dict = Field(default_factory=dict)
+
+
+class CustomerStatusReplyResponse(BaseModel):
+    shipment_id: str
+    client_email: str
+    subject: str
+    body: str
+    dry_run: bool
+
+
+class CustomerStatusReplyRequest(BaseModel):
+    dry_run: bool = True
+    custom_message: str | None = None
+
+
+class CarrierStatusUpdateRequest(BaseModel):
+    dry_run: bool = True
+    status_text: str | None = None
+    eta_text: str | None = None
+    location_text: str | None = None
+    notes: str | None = None
+
+
+class CarrierStatusUpdateResponse(BaseModel):
+    shipment_id: str
+    status: str
+    dry_run: bool
+    status_text: str | None = None
+    eta_text: str | None = None
+    location_text: str | None = None
+    notes: str | None = None
+    payload: dict = Field(default_factory=dict)
 
 
 class BookingExecutionResponse(BaseModel):

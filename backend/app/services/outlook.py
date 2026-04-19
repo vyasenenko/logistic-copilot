@@ -120,6 +120,22 @@ class OutlookGraphClient:
             },
         )
 
+    async def _fetch_message_attachments(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        message_id: str,
+    ) -> list[dict]:
+        url = f"{self.base_url}/users/{settings.microsoft_mailbox}/messages/{message_id}/attachments"
+        params = {
+            "$top": "10",
+            "$select": "id,name,contentType,size,isInline,contentBytes",
+        }
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        return [item for item in data.get("value", []) if isinstance(item, dict)]
+
     def normalize_message(self, payload: dict) -> OutlookMailboxMessage:
         """Convert a Graph message payload into a stable internal shape."""
         sender = (payload.get("from") or {}).get("emailAddress") or {}
@@ -160,7 +176,7 @@ class OutlookGraphClient:
             "$orderby": "receivedDateTime desc",
             "$select": (
                 "id,conversationId,internetMessageId,subject,bodyPreview,"
-                "from,toRecipients,receivedDateTime"
+                "from,toRecipients,receivedDateTime,hasAttachments"
             ),
         }
 
@@ -168,8 +184,19 @@ class OutlookGraphClient:
             response = await client.get(url, params=params)
             response.raise_for_status()
             data = response.json()
+            items = [item for item in data.get("value", []) if isinstance(item, dict)]
+            for item in items:
+                if not item.get("hasAttachments") or not item.get("id"):
+                    continue
+                try:
+                    item["attachments"] = await self._fetch_message_attachments(
+                        client,
+                        message_id=str(item["id"]),
+                    )
+                except Exception:
+                    item["attachments"] = []
 
-        return [self.normalize_message(item) for item in data.get("value", [])]
+        return [self.normalize_message(item) for item in items]
 
     async def send_mail(
         self,

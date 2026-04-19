@@ -6,7 +6,13 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from app.agent.llm import try_get_primary_llm
-from app.schemas import CarrierBidExtractionResult, IntentResult, ShipmentExtractionResult
+from app.schemas import (
+    CarrierBidExtractionResult,
+    CarrierStatusUpdateExtractionResult,
+    IntentResult,
+    ShipmentExtractionResult,
+    StatusRequestExtractionResult,
+)
 
 ROUTE_FROM_TO_PATTERN = re.compile(
     r"(?:from\s+(?P<origin>.+?)\s+to\s+(?P<destination>.+?))(?:\s|$|,|\.)",
@@ -42,6 +48,8 @@ TIME_ONLY_PATTERN = re.compile(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", re.IGNOR
 QUOTE_REQUEST_HINTS = ("quote", "need to move", "need moved", "move", "load", "pickup", "delivery", "pallet", "lb", "lbs")
 BID_HINTS = ("all in", "can do", "rate", "quote back", "our quote", "best rate", "$")
 CONFIRM_HINTS = ("ok book", "please book", "book it", "go ahead and book", "approved")
+STATUS_REQUEST_HINTS = ("eta", "status", "update", "where is", "where's", "location", "arrive", "delivery status")
+CARRIER_STATUS_HINTS = ("arrived", "loaded", "empty", "unloaded", "detained", "running late", "eta", "currently in", "gps", "location")
 EQUIPMENT_ALIASES = {
     "van": "Dry Van",
     "dry van": "Dry Van",
@@ -99,7 +107,7 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
         prompt = (
             "Classify the freight inbox email intent. "
             "Allowed intents: new_quote_request, carrier_bid_reply, "
-            "customer_quote_confirmation, customer_clarification, noise_or_unhandled. "
+            "customer_quote_confirmation, customer_clarification, customer_status_request, carrier_status_update, noise_or_unhandled. "
             "Return high confidence only when the intent is clear.\n\n"
             f"{_context_blob(email_context)}"
         )
@@ -156,16 +164,66 @@ async def extract_carrier_bid(email_context: dict) -> CarrierBidExtractionResult
         return heuristics
 
 
+async def extract_status_request(email_context: dict) -> StatusRequestExtractionResult:
+    """Extract the requested status detail from a customer email."""
+    heuristics = _extract_status_request_with_heuristics(email_context)
+    llm = _choose_llm()
+    if llm is None:
+        return heuristics
+
+    try:
+        structured = llm.with_structured_output(StatusRequestExtractionResult)
+        prompt = (
+            "Extract a structured customer shipment status request. "
+            "Use intent customer_status_request. Populate request_type, requested_fields, notes and confidence. "
+            "Typical fields are eta, location, general_status, delivery_timing.\n\n"
+            f"{_context_blob(email_context)}"
+        )
+        result = await structured.ainvoke(prompt)
+        if result.confidence < heuristics.confidence:
+            return heuristics
+        return result
+    except Exception:
+        return heuristics
+
+
+async def extract_carrier_status_update(email_context: dict) -> CarrierStatusUpdateExtractionResult:
+    """Extract a structured shipment update from a carrier email."""
+    heuristics = _extract_carrier_status_update_with_heuristics(email_context)
+    llm = _choose_llm()
+    if llm is None:
+        return heuristics
+
+    try:
+        structured = llm.with_structured_output(CarrierStatusUpdateExtractionResult)
+        prompt = (
+            "Extract a structured carrier status update. "
+            "Use intent carrier_status_update. Populate status_text, eta_text, location_text, notes, ambiguity_reasons and confidence. "
+            "If the update is vague, lower confidence.\n\n"
+            f"{_context_blob(email_context)}"
+        )
+        result = await structured.ainvoke(prompt)
+        return _merge_status_update_results(result, heuristics)
+    except Exception:
+        return heuristics
+
+
 def _classify_with_heuristics(email_context: dict) -> IntentResult:
     text = f"{email_context.get('subject', '')}\n{email_context.get('body_preview', '')}".lower()
     sender_role = email_context.get("sender_role")
     shipment_status = email_context.get("shipment_status") or ""
 
+    if sender_role == "carrier" and any(token in text for token in CARRIER_STATUS_HINTS):
+        return IntentResult(intent="carrier_status_update", confidence=0.72)
     if sender_role == "carrier" and any(token in text for token in BID_HINTS):
         amount = _extract_bid_amount(text)
         return IntentResult(intent="carrier_bid_reply", confidence=0.85 if amount is not None else 0.68)
     if any(token in text for token in CONFIRM_HINTS):
         return IntentResult(intent="customer_quote_confirmation", confidence=0.85)
+    if sender_role == "client" and shipment_status in {"booked", "booking_in_progress"} and any(token in text for token in STATUS_REQUEST_HINTS):
+        return IntentResult(intent="customer_status_request", confidence=0.8)
+    if sender_role == "client" and any(token in text for token in STATUS_REQUEST_HINTS):
+        return IntentResult(intent="customer_status_request", confidence=0.68)
     if sender_role == "client" and any(pattern.search(text) for pattern in CLARIFICATION_PATTERNS):
         return IntentResult(intent="customer_clarification", confidence=0.78)
     if sender_role == "client" and shipment_status == "waiting_customer_details":
@@ -286,6 +344,77 @@ def _merge_bid_results(
     primary.ambiguity_reasons = list(
         dict.fromkeys(primary.ambiguity_reasons + fallback.ambiguity_reasons)
     )
+    primary.confidence = max(primary.confidence, fallback.confidence)
+    return primary
+
+
+def _extract_status_request_with_heuristics(email_context: dict) -> StatusRequestExtractionResult:
+    text = f"{email_context.get('subject', '')}\n{email_context.get('body_preview', '')}".lower()
+    requested_fields: list[str] = []
+    if "eta" in text or "arrive" in text:
+        requested_fields.append("eta")
+    if "where is" in text or "where's" in text or "location" in text:
+        requested_fields.append("location")
+    if "status" in text and "general_status" not in requested_fields:
+        requested_fields.append("general_status")
+    if not requested_fields:
+        requested_fields.append("general_status")
+    request_type = requested_fields[0]
+    confidence = 0.7 if requested_fields else 0.5
+    return StatusRequestExtractionResult(
+        request_type=request_type,
+        requested_fields=requested_fields,
+        notes=email_context.get("body_preview", ""),
+        confidence=confidence,
+    )
+
+
+def _extract_carrier_status_update_with_heuristics(email_context: dict) -> CarrierStatusUpdateExtractionResult:
+    text = f"{email_context.get('subject', '')}\n{email_context.get('body_preview', '')}"
+    lower = text.lower()
+    status_text = None
+    for token in ("arrived", "loaded", "empty", "unloaded", "detained", "running late"):
+        if token in lower:
+            status_text = token
+            break
+    eta_match = ETA_PATTERN.search(text)
+    location_text = None
+    location_match = re.search(r"(?:currently in|at|near)\s+([A-Za-z][A-Za-z .-]{2,40})", text, re.IGNORECASE)
+    if location_match:
+        location_text = location_match.group(1).strip(" .,-")
+    ambiguity_reasons: list[str] = []
+    confidence = 0.45
+    if status_text:
+        confidence += 0.2
+    if eta_match:
+        confidence += 0.15
+    if location_text:
+        confidence += 0.15
+    if status_text is None and eta_match is None and location_text is None:
+        ambiguity_reasons.append("status_update_not_specific")
+    return CarrierStatusUpdateExtractionResult(
+        status_text=status_text,
+        eta_text=eta_match.group(1).strip(" .") if eta_match else None,
+        location_text=location_text,
+        notes=email_context.get("body_preview", ""),
+        ambiguity_reasons=ambiguity_reasons,
+        confidence=min(confidence, 0.88),
+    )
+
+
+def _merge_status_update_results(
+    primary: CarrierStatusUpdateExtractionResult,
+    fallback: CarrierStatusUpdateExtractionResult,
+) -> CarrierStatusUpdateExtractionResult:
+    if primary.status_text is None:
+        primary.status_text = fallback.status_text
+    if primary.eta_text is None:
+        primary.eta_text = fallback.eta_text
+    if primary.location_text is None:
+        primary.location_text = fallback.location_text
+    if not primary.notes:
+        primary.notes = fallback.notes
+    primary.ambiguity_reasons = list(dict.fromkeys(primary.ambiguity_reasons + fallback.ambiguity_reasons))
     primary.confidence = max(primary.confidence, fallback.confidence)
     return primary
 

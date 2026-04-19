@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+from io import BytesIO
+import re
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -15,10 +19,13 @@ from app.schemas import (
     BidIntakeResponse,
     BidRecord,
     BookingConfirmationResponse,
+    CarrierStatusUpdateResponse,
     ClientAcknowledgementResponse,
+    CustomerStatusReplyResponse,
     CustomerQuoteResponse,
     ShipmentEvaluationResponse,
     ShipmentStage,
+    TmsStatusResponse,
     TmsHandoffResponse,
     WorkflowEventType,
 )
@@ -28,12 +35,91 @@ from app.services.tms_connector import TmsConnector
 
 
 DOCUMENT_TYPE_RULES = (
-    ("rate_confirmation", ("rate confirmation", "rateconf", "rate-con")),
-    ("bill_of_lading", ("bol", "bill of lading")),
+    ("rate_confirmation", ("rate confirmation", "rateconf", "rate-con", "rate con", "ratecons")),
+    ("bill_of_lading", ("bol", "bill of lading", "b/l")),
     ("proof_of_delivery", ("pod", "proof of delivery")),
-    ("pickup_number", ("pickup number", "pu number", "pickup#")),
-    ("quote_sheet", ("quote", "pricing", "rate request")),
+    ("pickup_number", ("pickup number", "pu number", "pickup#", "pickup no", "pick up number", "pick up no")),
+    ("quote_sheet", ("quote", "pricing", "rate request", "quote request")),
 )
+
+BOOKING_DOCUMENT_REQUIREMENTS = (
+    ("pricing_backup", {"rate_confirmation", "quote_sheet"}),
+)
+GENERIC_AMOUNT_PATTERN = re.compile(r"(?:\$|usd\s*)(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE)
+RATE_AMOUNT_PATTERNS = (
+    re.compile(r"(?:all[- ]?in|total|rate(?:\s+confirmation)?|confirmed\s+rate|carrier\s+rate)\s*[:#-]?\s*\$?\s*(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE),
+    re.compile(r"(?:linehaul|line\s*haul)\s*[:#-]?\s*\$?\s*(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE),
+    re.compile(r"(?:amount\s+due|total\s+charges)\s*[:#-]?\s*\$?\s*(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE),
+)
+PICKUP_NUMBER_PATTERNS = (
+    re.compile(r"(?:pickup(?:\s+number|\s+no\.?)?|pick\s*up(?:\s+number|\s+no\.?)?|pu#?|p\/u#?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})", re.IGNORECASE),
+    re.compile(r"(?:confirmation\s*#|conf\s*#)\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})", re.IGNORECASE),
+)
+BOL_NUMBER_PATTERNS = (
+    re.compile(r"(?:b\/l|bol|bill of lading)(?:\s+number|\s+no\.?)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})", re.IGNORECASE),
+)
+REFERENCE_NUMBER_PATTERNS = (
+    re.compile(r"(?:reference|ref|load)(?:\s+number|\s+no\.?|\s*#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})", re.IGNORECASE),
+)
+DATE_PATTERNS = (
+    re.compile(r"(?:pickup\s+date|pu\s+date|ship\s+date)\s*[:#-]?\s*([A-Za-z]{3,10}\s+\d{1,2}(?:,\s*\d{4})?)", re.IGNORECASE),
+    re.compile(r"(?:delivery\s+date|del\s+date)\s*[:#-]?\s*([A-Za-z]{3,10}\s+\d{1,2}(?:,\s*\d{4})?)", re.IGNORECASE),
+)
+
+
+def _normalize_identifier(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().upper().strip(" .,:;")
+    return normalized or None
+
+
+def _humanize_status_value(value: str | None, default: str = "Unknown") -> str:
+    if not value:
+        return default
+    return value.replace("_", " ").strip().title()
+
+
+def _build_status_audit_payload(
+    *,
+    kind: str,
+    status: str | None = None,
+    eta: str | None = None,
+    location: str | None = None,
+    milestone: str | None = None,
+    source: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    payload = {
+        "status_audit_kind": kind,
+        "status_label": _humanize_status_value(status),
+        "eta_label": eta or "Not available",
+        "location_label": location or "Not available",
+        "milestone_label": _humanize_status_value(milestone, default="Not available"),
+        "status_source": source,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _extract_labeled_value(patterns: tuple[re.Pattern[str], ...], text: str) -> str | None:
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _extract_rate_amount(text: str) -> float | None:
+    for pattern in RATE_AMOUNT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return float(match.group(1).replace(",", ""))
+    generic_matches = [float(match.group(1).replace(",", "")) for match in GENERIC_AMOUNT_PATTERN.finditer(text)]
+    if not generic_matches:
+        return None
+    return max(generic_matches)
 
 
 def classify_document_type(name: str | None, content_type: str | None) -> str:
@@ -44,6 +130,92 @@ def classify_document_type(name: str | None, content_type: str | None) -> str:
     if (content_type or "").lower() in {"application/pdf", "image/png", "image/jpeg"}:
         return "supporting_document"
     return "unknown"
+
+
+def _extract_attachment_text(item: dict) -> str | None:
+    for key in ("contentText", "content_text", "text", "body"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:4000]
+
+    raw_bytes = item.get("contentBytes") or item.get("content_bytes")
+    content_type = str(item.get("contentType") or item.get("@odata.mediaContentType") or "").lower()
+    if not isinstance(raw_bytes, str) or not raw_bytes.strip():
+        return None
+
+    try:
+        decoded = base64.b64decode(raw_bytes, validate=False)
+        if any(token in content_type for token in ("text/", "json", "xml", "csv")):
+            return decoded.decode("utf-8", errors="ignore").strip()[:4000] or None
+        if "application/pdf" in content_type:
+            return _extract_pdf_text(decoded)
+        return None
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _extract_pdf_text(content_bytes: bytes) -> str | None:
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return None
+
+    try:
+        reader = PdfReader(BytesIO(content_bytes))
+        text_parts: list[str] = []
+        for page in reader.pages[:3]:
+            extracted = page.extract_text() or ""
+            if extracted.strip():
+                text_parts.append(extracted.strip())
+        combined = "\n".join(text_parts).strip()
+        return combined[:4000] if combined else None
+    except Exception:
+        return None
+
+
+def _attachment_extraction_details(item: dict, extracted_text: str | None) -> tuple[str | None, str | None]:
+    content_type = str(item.get("contentType") or item.get("@odata.mediaContentType") or "").lower()
+    if extracted_text:
+        if "application/pdf" in content_type:
+            return "pdf_text", "complete"
+        if any(token in content_type for token in ("text/", "json", "xml", "csv")):
+            return "inline_text", "not_needed"
+    if any(token in content_type for token in ("image/png", "image/jpeg", "image/jpg", "image/webp")):
+        return "image_binary", "pending"
+    if "application/pdf" in content_type:
+        return "pdf_binary", "unavailable"
+    return None, None
+
+
+def _parse_document_fields(document_type: str, name: str | None, text: str | None) -> dict:
+    haystack = f"{name or ''}\n{text or ''}"
+    fields: dict[str, str | float] = {}
+
+    rate_amount = _extract_rate_amount(haystack)
+    if document_type in {"rate_confirmation", "quote_sheet"} and rate_amount is not None:
+        fields["rate_amount"] = rate_amount
+
+    pickup_number = _normalize_identifier(_extract_labeled_value(PICKUP_NUMBER_PATTERNS, haystack))
+    if pickup_number:
+        fields["pickup_number"] = pickup_number
+
+    bol_number = _normalize_identifier(_extract_labeled_value(BOL_NUMBER_PATTERNS, haystack))
+    if bol_number:
+        fields["bol_number"] = bol_number
+
+    reference_number = _normalize_identifier(_extract_labeled_value(REFERENCE_NUMBER_PATTERNS, haystack))
+    if reference_number:
+        fields["reference_number"] = reference_number
+
+    pickup_date = _extract_labeled_value((DATE_PATTERNS[0],), haystack)
+    if pickup_date:
+        fields["pickup_date_text"] = pickup_date.strip()
+
+    delivery_date = _extract_labeled_value((DATE_PATTERNS[1],), haystack)
+    if delivery_date:
+        fields["delivery_date_text"] = delivery_date.strip()
+
+    return fields
 
 
 def _extract_message_attachments(email_message: EmailMessage) -> list[dict]:
@@ -59,13 +231,20 @@ def _extract_message_attachments(email_message: EmailMessage) -> list[dict]:
         attachment_id = item.get("id")
         if not name and not attachment_id:
             continue
+        extracted_text = _extract_attachment_text(item)
+        document_type = classify_document_type(name, content_type)
+        extraction_method, ocr_status = _attachment_extraction_details(item, extracted_text)
         attachments.append(
             {
                 "id": attachment_id,
                 "name": name,
-                "document_type": classify_document_type(name, content_type),
+                "document_type": document_type,
                 "content_type": content_type,
                 "size": size,
+                "extracted_text_preview": extracted_text[:280] if extracted_text else None,
+                "extracted_fields": _parse_document_fields(document_type, name, extracted_text),
+                "extraction_method": extraction_method,
+                "ocr_status": ocr_status,
                 "source_email_id": str(email_message.id),
             }
         )
@@ -93,6 +272,83 @@ async def collect_shipment_attachments(
             seen.add(key)
             attachments.append(attachment)
     return attachments
+
+
+def summarize_booking_documents(attachments: list[dict]) -> dict:
+    summary: dict[str, int] = {}
+    for attachment in attachments:
+        document_type = str(attachment.get("document_type", "unknown"))
+        summary[document_type] = summary.get(document_type, 0) + 1
+
+    missing_document_types: list[str] = []
+    for requirement_name, accepted_types in BOOKING_DOCUMENT_REQUIREMENTS:
+        if not any(summary.get(document_type, 0) > 0 for document_type in accepted_types):
+            missing_document_types.append(requirement_name)
+
+    pricing_docs = summary.get("rate_confirmation", 0) + summary.get("quote_sheet", 0)
+    warning = None
+    if "pricing_backup" in missing_document_types:
+        warning = "No rate confirmation or quote sheet found in the email thread."
+
+    return {
+        "attachment_count": len(attachments),
+        "document_summary": summary,
+        "pricing_document_count": pricing_docs,
+        "missing_document_types": missing_document_types,
+        "booking_review_warning": warning,
+        "booking_review_required": bool(missing_document_types),
+    }
+
+
+def build_document_context(attachments: list[dict]) -> dict:
+    rate_amounts: list[float] = []
+    pickup_numbers: list[str] = []
+    bol_numbers: list[str] = []
+    reference_numbers: list[str] = []
+    pickup_dates: list[str] = []
+    delivery_dates: list[str] = []
+    ocr_pending_documents: list[str] = []
+    extracted_documents: list[dict] = []
+
+    for attachment in attachments:
+        extracted_fields = dict(attachment.get("extracted_fields", {}) or {})
+        if not extracted_fields:
+            continue
+        if "rate_amount" in extracted_fields:
+            rate_amounts.append(float(extracted_fields["rate_amount"]))
+        if "pickup_number" in extracted_fields:
+            pickup_numbers.append(str(extracted_fields["pickup_number"]))
+        if "bol_number" in extracted_fields:
+            bol_numbers.append(str(extracted_fields["bol_number"]))
+        if "reference_number" in extracted_fields:
+            reference_numbers.append(str(extracted_fields["reference_number"]))
+        if "pickup_date_text" in extracted_fields:
+            pickup_dates.append(str(extracted_fields["pickup_date_text"]))
+        if "delivery_date_text" in extracted_fields:
+            delivery_dates.append(str(extracted_fields["delivery_date_text"]))
+        if attachment.get("ocr_status") == "pending":
+            ocr_pending_documents.append(str(attachment.get("name") or attachment.get("id") or "attachment"))
+        extracted_documents.append(
+            {
+                "id": attachment.get("id"),
+                "name": attachment.get("name"),
+                "document_type": attachment.get("document_type"),
+                "extracted_fields": extracted_fields,
+                "extraction_method": attachment.get("extraction_method"),
+                "ocr_status": attachment.get("ocr_status"),
+            }
+        )
+
+    return {
+        "document_extracts": extracted_documents,
+        "pricing_rate_amounts": rate_amounts,
+        "pickup_numbers": sorted(set(pickup_numbers)),
+        "bol_numbers": sorted(set(bol_numbers)),
+        "reference_numbers": sorted(set(reference_numbers)),
+        "pickup_dates": sorted(set(pickup_dates)),
+        "delivery_dates": sorted(set(delivery_dates)),
+        "ocr_pending_documents": sorted(set(ocr_pending_documents)),
+    }
 
 
 def _display_name_from_email(email: str) -> str:
@@ -569,6 +825,8 @@ async def handoff_to_tms(
     bid, carrier = await _get_selected_bid(session, shipment, bid_id)
     client = await session.get(Client, shipment.client_id) if shipment.client_id else None
     attachments = await collect_shipment_attachments(session, shipment)
+    document_status = summarize_booking_documents(attachments)
+    document_context = build_document_context(attachments)
     payload = {
         "shipment_id": str(shipment.id),
         "quote_token": shipment.quote_token,
@@ -597,6 +855,8 @@ async def handoff_to_tms(
             "eta_text": bid.eta_text,
         },
         "documents": attachments,
+        "document_status": document_status,
+        "document_context": document_context,
     }
 
     connector = TmsConnector()
@@ -636,6 +896,28 @@ async def handoff_to_tms(
         shipment.status = ShipmentStage.AWAITING_CONFIRMATION.value
 
     shipment.updated_at = datetime.now(timezone.utc)
+    if document_status["booking_review_required"]:
+        latest_review = await _latest_workflow_event(
+            session,
+            shipment.id,
+            WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+        )
+        latest_review_payload = dict((latest_review.payload_json or {}) if latest_review else {})
+        if latest_review_payload.get("reason") != "booking_documents_missing":
+            session.add(
+                WorkflowEvent(
+                    shipment_id=shipment.id,
+                    event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+                    stage=shipment.status,
+                    payload_json={
+                        "reason": "booking_documents_missing",
+                        "next_action": "review_documents",
+                        "missing_document_types": document_status["missing_document_types"],
+                        "booking_review_warning": document_status["booking_review_warning"],
+                        "manual_review_required": True,
+                    },
+                )
+            )
     session.add(
         WorkflowEvent(
             shipment_id=shipment.id,
@@ -649,6 +931,11 @@ async def handoff_to_tms(
                 "response": response_payload,
                 "status": status,
                 "attachment_count": len(attachments),
+                "document_summary": document_status["document_summary"],
+                "missing_document_types": document_status["missing_document_types"],
+                "booking_review_warning": document_status["booking_review_warning"],
+                "booking_review_required": document_status["booking_review_required"],
+                "document_context": document_context,
             },
         )
     )
@@ -749,6 +1036,281 @@ async def send_booking_confirmation(
         subject=subject,
         body=body,
         dry_run=dry_run,
+    )
+
+
+async def fetch_tms_shipment_status(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+) -> TmsStatusResponse:
+    """Fetch current shipment status from the TMS and log the lookup."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise RuntimeError("Shipment not found")
+
+    shipment_key = shipment.quote_token or str(shipment.id)
+    connector = TmsConnector()
+    payload = await connector.fetch_shipment_status(shipment_key)
+    audit_payload = _build_status_audit_payload(
+        kind="lookup",
+        status=payload.get("status"),
+        eta=payload.get("eta"),
+        location=payload.get("location"),
+        milestone=payload.get("milestone"),
+        source=payload.get("source") or "tms",
+        extra=payload,
+    )
+    session.add(
+        WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.TMS_STATUS_LOOKUP.value,
+            stage=shipment.status,
+            payload_json=audit_payload,
+        )
+    )
+    await session.commit()
+    return TmsStatusResponse(
+        shipment_id=str(shipment.id),
+        status=str(payload.get("status", "unknown")),
+        payload=payload,
+    )
+
+
+async def send_customer_status_reply(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    status_payload: dict,
+    dry_run: bool,
+    custom_message: str | None = None,
+) -> CustomerStatusReplyResponse:
+    """Send a shipment status update back to the customer."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise RuntimeError("Shipment not found")
+    if shipment.client_id is None:
+        raise RuntimeError("Shipment has no linked client")
+
+    client = await session.get(Client, shipment.client_id)
+    if client is None:
+        raise RuntimeError("Client not found for shipment")
+
+    if not dry_run and shipment.email_thread_id:
+        result = await session.execute(
+            select(EmailMessage)
+            .where(
+                EmailMessage.thread_id == shipment.email_thread_id,
+                EmailMessage.direction == "outbound",
+            )
+            .order_by(EmailMessage.received_at.desc())
+        )
+        latest_status = {
+            "status": status_payload.get("status"),
+            "eta": status_payload.get("eta"),
+            "location": status_payload.get("location"),
+            "milestone": status_payload.get("milestone"),
+        }
+        for existing_reply in result.scalars().all():
+            payload = dict(existing_reply.raw_payload_json or {})
+            if payload.get("type") != "customer_status_reply":
+                continue
+            existing_status = dict(payload.get("status_payload", {}) or {})
+            comparable = {
+                "status": existing_status.get("status"),
+                "eta": existing_status.get("eta"),
+                "location": existing_status.get("location"),
+                "milestone": existing_status.get("milestone"),
+            }
+            if comparable == latest_status:
+                return CustomerStatusReplyResponse(
+                    shipment_id=str(shipment.id),
+                    client_email=client.email,
+                    subject=existing_reply.subject,
+                    body=existing_reply.body_preview,
+                    dry_run=False,
+                )
+
+    subject = attach_quote_token(
+        f"Status update {shipment.origin or 'Origin'} to {shipment.destination or 'Destination'}",
+        shipment.quote_token or "Q-UNKNOWN",
+    )
+    status = status_payload.get("status") or "unknown"
+    eta = status_payload.get("eta") or "Not available"
+    location = status_payload.get("location") or "Not available"
+    milestone = status_payload.get("milestone") or "Not available"
+    body = "\n".join(
+        [
+            f"Hi {client.name},",
+            "",
+            "Here is the latest shipment update from our system.",
+            f"Status: {status}",
+            f"ETA: {eta}",
+            f"Location: {location}",
+            f"Milestone: {milestone}",
+        ]
+    )
+    if custom_message:
+        body = "\n".join([body, "", custom_message.strip()])
+
+    if not dry_run:
+        outlook = OutlookGraphClient()
+        await outlook.send_mail(subject=subject, body=body, recipients=[client.email])
+
+    if shipment.email_thread_id:
+        session.add(
+            EmailMessage(
+                thread_id=shipment.email_thread_id,
+                sender=settings.microsoft_mailbox or "unknown",
+                recipients_json=[client.email],
+                direction="outbound",
+                subject=subject,
+                body_preview=body[:1000],
+                raw_payload_json={"type": "customer_status_reply", "dry_run": dry_run, "status_payload": status_payload},
+                received_at=datetime.now(timezone.utc),
+            )
+        )
+
+    session.add(
+        WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+            stage=shipment.status,
+            payload_json=_build_status_audit_payload(
+                kind="reply_drafted" if dry_run else "reply_sent",
+                status=status_payload.get("status"),
+                eta=status_payload.get("eta"),
+                location=status_payload.get("location"),
+                milestone=status_payload.get("milestone"),
+                source="customer_reply",
+                extra={"dry_run": dry_run, **status_payload},
+            ),
+        )
+    )
+    await session.commit()
+    return CustomerStatusReplyResponse(
+        shipment_id=str(shipment.id),
+        client_email=client.email,
+        subject=subject,
+        body=body,
+        dry_run=dry_run,
+    )
+
+
+async def push_carrier_status_to_tms(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    status_text: str | None,
+    eta_text: str | None,
+    location_text: str | None,
+    notes: str | None,
+) -> TmsStatusResponse:
+    """Push a carrier status update into the TMS and persist the event."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise RuntimeError("Shipment not found")
+    shipment_key = shipment.quote_token or str(shipment.id)
+    connector = TmsConnector()
+    payload = await connector.push_shipment_update(
+        shipment_key,
+        status_text=status_text,
+        eta_text=eta_text,
+        location_text=location_text,
+        notes=notes,
+    )
+    session.add(
+        WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
+            stage=shipment.status,
+            payload_json=_build_status_audit_payload(
+                kind="carrier_update_pushed",
+                status=status_text or payload.get("payload", {}).get("status_text"),
+                eta=eta_text or payload.get("payload", {}).get("eta_text"),
+                location=location_text or payload.get("payload", {}).get("location_text"),
+                source="carrier_update",
+                extra=payload,
+            ),
+        )
+    )
+    await session.commit()
+    return TmsStatusResponse(
+        shipment_id=str(shipment.id),
+        status=str(payload.get("status", "unknown")),
+        payload=payload,
+    )
+
+
+async def preview_or_push_carrier_status_update(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    status_text: str | None,
+    eta_text: str | None,
+    location_text: str | None,
+    notes: str | None,
+    dry_run: bool,
+) -> CarrierStatusUpdateResponse:
+    """Preview or send a structured carrier status update to the TMS."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise RuntimeError("Shipment not found")
+
+    shipment_key = shipment.quote_token or str(shipment.id)
+    payload = {
+        "shipment_key": shipment_key,
+        "status_text": status_text,
+        "eta_text": eta_text,
+        "location_text": location_text,
+        "notes": notes,
+    }
+
+    if dry_run:
+        session.add(
+            WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
+                stage=shipment.status,
+                payload_json=_build_status_audit_payload(
+                    kind="carrier_update_parsed",
+                    status=status_text,
+                    eta=eta_text,
+                    location=location_text,
+                    source="carrier_preview",
+                    extra=payload,
+                ),
+            )
+        )
+        await session.commit()
+        return CarrierStatusUpdateResponse(
+            shipment_id=str(shipment.id),
+            status="preview",
+            dry_run=True,
+            status_text=status_text,
+            eta_text=eta_text,
+            location_text=location_text,
+            notes=notes,
+            payload=payload,
+        )
+
+    response = await push_carrier_status_to_tms(
+        session,
+        shipment_id=shipment.id,
+        status_text=status_text,
+        eta_text=eta_text,
+        location_text=location_text,
+        notes=notes,
+    )
+    return CarrierStatusUpdateResponse(
+        shipment_id=str(shipment.id),
+        status=response.status,
+        dry_run=False,
+        status_text=status_text,
+        eta_text=eta_text,
+        location_text=location_text,
+        notes=notes,
+        payload=response.payload,
     )
 
 

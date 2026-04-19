@@ -1,5 +1,6 @@
 """Freight workflow foundation endpoints."""
 
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +27,8 @@ from app.schemas import (
     CarrierOutreachRequest,
     CarrierOutreachResponse,
     CarrierRecord,
+    CarrierStatusUpdateRequest,
+    CarrierStatusUpdateResponse,
     CarrierUpsertRequest,
     ClientAcknowledgementRequest,
     ClientAcknowledgementResponse,
@@ -33,12 +36,16 @@ from app.schemas import (
     ClientUpsertRequest,
     CustomerQuoteRequest,
     CustomerQuoteResponse,
+    CustomerStatusReplyRequest,
+    CustomerStatusReplyResponse,
     FreightFoundationResponse,
     OutlookIngestRequest,
     OutlookSyncRequest,
     OutlookSyncResponse,
     OperatorAction,
     FreightOverviewCounts,
+    FreightStatusMetrics,
+    FreightSlaSummary,
     FreightOverviewResponse,
     MarginPolicy,
     ShipmentEvaluationResponse,
@@ -59,10 +66,15 @@ from app.services.freight_execution import (
     collect_shipment_attachments,
     confirm_booking_and_handoff,
     evaluate_shipment_bids,
+    fetch_tms_shipment_status,
     handoff_to_tms,
     intake_bid,
+    preview_or_push_carrier_status_update,
+    push_carrier_status_to_tms,
     send_client_acknowledgement,
+    send_customer_status_reply,
     send_customer_quote,
+    summarize_booking_documents,
 )
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
 from app.services.freight_inbox_agent import (
@@ -70,11 +82,19 @@ from app.services.freight_inbox_agent import (
     evaluate_expired_quote_windows,
     run_freight_inbox_orchestrator,
 )
+from app.services.freight_ai import extract_carrier_status_update
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
 
 router = APIRouter()
+
+
+STATUS_ACTIVE_SHIPMENT_STATES = {
+    ShipmentStage.BOOKED.value,
+    ShipmentStage.BOOKING_IN_PROGRESS.value,
+    ShipmentStage.AWAITING_CONFIRMATION.value,
+}
 
 
 def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
@@ -98,6 +118,9 @@ def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
     result.booking_triggered = decision.booking_triggered
     result.booking_confirmation_sent = decision.booking_confirmation_sent
     result.tms_handoff_status = decision.tms_handoff_status
+    result.status_lookup_triggered = decision.status_lookup_triggered
+    result.status_reply_sent = decision.status_reply_sent
+    result.tms_status_updated = decision.tms_status_updated
 
 
 def _build_automation_policy(
@@ -142,6 +165,27 @@ async def _latest_inbound_message_for_shipment(
     )
     for message in result.scalars().all():
         if sender is None or message.sender == sender:
+            return message
+    return None
+
+
+async def _latest_carrier_message_for_shipment(
+    session: AsyncSession,
+    shipment: Shipment,
+) -> EmailMessage | None:
+    if shipment.email_thread_id is None:
+        return None
+    result = await session.execute(
+        select(EmailMessage)
+        .where(
+            EmailMessage.thread_id == shipment.email_thread_id,
+            EmailMessage.direction == "inbound",
+        )
+        .order_by(EmailMessage.received_at.desc())
+    )
+    for message in result.scalars().all():
+        carrier = await session.scalar(select(Carrier).where(Carrier.email == message.sender))
+        if carrier is not None:
             return message
     return None
 
@@ -199,6 +243,18 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         booking_error=ai_payload.get("booking_error"),
         tms_handoff_status=ai_payload.get("tms_handoff_status"),
         attachment_count=int(ai_payload.get("attachment_count", 0) or 0),
+        document_summary=dict(ai_payload.get("document_summary", {}) or {}),
+        missing_document_types=list(ai_payload.get("missing_document_types", []) or []),
+        booking_review_warning=ai_payload.get("booking_review_warning"),
+        booking_review_required=bool(ai_payload.get("booking_review_required", False)),
+        last_known_status=ai_payload.get("last_known_status"),
+        last_known_eta=ai_payload.get("last_known_eta"),
+        last_known_location=ai_payload.get("last_known_location"),
+        last_status_source=ai_payload.get("last_status_source"),
+        last_status_event_at=ai_payload.get("last_status_event_at"),
+        status_review_required=bool(ai_payload.get("status_review_required", False)),
+        status_stale=bool(ai_payload.get("status_stale", False)),
+        status_sla_hours=ai_payload.get("status_sla_hours"),
         manual_review_required=bool(ai_payload.get("manual_review_required", False)),
         created_at=shipment.created_at,
         updated_at=shipment.updated_at,
@@ -222,10 +278,13 @@ def _serialize_review_queue_item(event: WorkflowEvent) -> ReviewQueueItem:
         shipment_id=str(event.shipment_id),
         stage=event.stage,
         event_type=event.event_type,
+        review_type=(event.payload_json or {}).get("review_type"),
         reason=str((event.payload_json or {}).get("reason", "")),
         next_action=(event.payload_json or {}).get("next_action"),
         missing_fields=list((event.payload_json or {}).get("missing_fields", []) or []),
         ambiguity_reasons=list((event.payload_json or {}).get("ambiguity_reasons", []) or []),
+        missing_document_types=list((event.payload_json or {}).get("missing_document_types", []) or []),
+        booking_review_warning=(event.payload_json or {}).get("booking_review_warning"),
         created_at=event.created_at,
     )
 
@@ -253,6 +312,10 @@ def _serialize_document_record(document: dict) -> ShipmentDocumentRecord:
         document_type=str(document.get("document_type", "unknown")),
         content_type=document.get("content_type"),
         size=document.get("size"),
+        extracted_text_preview=document.get("extracted_text_preview"),
+        extracted_fields=dict(document.get("extracted_fields", {}) or {}),
+        extraction_method=document.get("extraction_method"),
+        ocr_status=document.get("ocr_status"),
         source_email_id=str(document.get("source_email_id", "")),
     )
 
@@ -310,6 +373,10 @@ async def _latest_booking_payloads(
                 "tms_handoff_status": payload.get("status"),
                 "booking_error": None,
                 "attachment_count": payload.get("attachment_count", 0),
+                "document_summary": dict(payload.get("document_summary", {}) or {}),
+                "missing_document_types": list(payload.get("missing_document_types", []) or []),
+                "booking_review_warning": payload.get("booking_review_warning"),
+                "booking_review_required": bool(payload.get("booking_review_required", False)),
             }
         elif event.event_type == WorkflowEventType.EXCEPTION_RAISED.value and payload.get("reason") == "tms_handoff_failed":
             payloads[event.shipment_id] = {
@@ -317,6 +384,10 @@ async def _latest_booking_payloads(
                 "tms_handoff_status": "failed",
                 "booking_error": payload.get("message"),
                 "attachment_count": 0,
+                "document_summary": {},
+                "missing_document_types": [],
+                "booking_review_warning": None,
+                "booking_review_required": False,
             }
         elif event.event_type == WorkflowEventType.CUSTOMER_CONFIRMED.value:
             payloads[event.shipment_id] = {
@@ -324,8 +395,144 @@ async def _latest_booking_payloads(
                 "tms_handoff_status": None,
                 "booking_error": None,
                 "attachment_count": 0,
+                "document_summary": {},
+                "missing_document_types": [],
+                "booking_review_warning": None,
+                "booking_review_required": False,
             }
     return payloads
+
+
+async def _latest_status_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.shipment_id.in_(shipment_ids))
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        if event.shipment_id in payloads:
+            continue
+        payload = dict(event.payload_json or {})
+        if event.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value:
+            update_payload = dict(payload.get("payload", {}) or {})
+            payloads[event.shipment_id] = {
+                "last_known_status": update_payload.get("status_text") or payload.get("status"),
+                "last_known_eta": update_payload.get("eta_text"),
+                "last_known_location": update_payload.get("location_text"),
+                "last_status_source": "carrier_update",
+                "last_status_event_at": event.created_at,
+            }
+        elif event.event_type in {
+            WorkflowEventType.TMS_STATUS_LOOKUP.value,
+            WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+        }:
+            payloads[event.shipment_id] = {
+                "last_known_status": payload.get("status"),
+                "last_known_eta": payload.get("eta"),
+                "last_known_location": payload.get("location"),
+                "last_status_source": "tms_lookup",
+                "last_status_event_at": event.created_at,
+            }
+    return payloads
+
+
+async def _latest_status_review_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id.in_(shipment_ids),
+            WorkflowEvent.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        if event.shipment_id in payloads:
+            continue
+        payload = dict(event.payload_json or {})
+        review_type = str(payload.get("review_type") or "")
+        if "status" not in review_type:
+            continue
+        payloads[event.shipment_id] = {
+            "status_review_required": True,
+            "manual_review_required": True,
+        }
+    return payloads
+
+
+def _status_event_cutoff(*, now: datetime) -> datetime:
+    return now - timedelta(hours=settings.status_sla_hours_default)
+
+
+def _is_status_stale(
+    *,
+    shipment_status: str,
+    last_status_event_at: datetime | None,
+    now: datetime,
+) -> bool:
+    if shipment_status not in STATUS_ACTIVE_SHIPMENT_STATES:
+        return False
+    if last_status_event_at is None:
+        return True
+    return last_status_event_at < _status_event_cutoff(now=now)
+
+
+async def _status_metrics_summary(session: AsyncSession) -> FreightStatusMetrics:
+    result = await session.execute(
+        select(WorkflowEvent.event_type, WorkflowEvent.payload_json, WorkflowEvent.created_at, Shipment.id, Shipment.status)
+        .join(Shipment, Shipment.id == WorkflowEvent.shipment_id)
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    metrics = FreightStatusMetrics()
+    latest_status_event_at: dict[UUID, datetime] = {}
+    now = datetime.now(timezone.utc)
+
+    for event_type, payload_json, created_at, shipment_id, shipment_status in result.all():
+        payload = dict(payload_json or {})
+        audit_kind = str(payload.get("status_audit_kind") or "")
+        if event_type == WorkflowEventType.TMS_STATUS_LOOKUP.value:
+            metrics.lookups += 1
+        elif event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value:
+            if payload.get("dry_run"):
+                metrics.replies_drafted += 1
+            else:
+                metrics.replies_sent += 1
+        elif event_type == WorkflowEventType.TMS_STATUS_UPDATED.value:
+            if audit_kind == "carrier_update_parsed":
+                metrics.carrier_updates_parsed += 1
+            else:
+                metrics.carrier_updates_pushed += 1
+        elif event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value and "status" in str(payload.get("review_type") or ""):
+            metrics.review_required += 1
+
+        if shipment_id not in latest_status_event_at and event_type in {
+            WorkflowEventType.TMS_STATUS_LOOKUP.value,
+            WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+            WorkflowEventType.TMS_STATUS_UPDATED.value,
+        }:
+            latest_status_event_at[shipment_id] = created_at
+
+    shipment_result = await session.execute(select(Shipment.id, Shipment.status))
+    for shipment_id, shipment_status in shipment_result.all():
+        if _is_status_stale(
+            shipment_status=shipment_status,
+            last_status_event_at=latest_status_event_at.get(shipment_id),
+            now=now,
+        ):
+            metrics.stale_shipments += 1
+
+    return metrics
 
 
 async def _attachment_counts(
@@ -354,6 +561,17 @@ async def _attachment_counts(
                 count += 1
         counts[shipment.id] = count
     return counts
+
+
+async def _document_booking_summaries(
+    session: AsyncSession,
+    shipments: list[Shipment],
+) -> dict[UUID, dict]:
+    summaries: dict[UUID, dict] = {}
+    for shipment in shipments:
+        attachments = await collect_shipment_attachments(session, shipment)
+        summaries[shipment.id] = summarize_booking_documents(attachments)
+    return summaries
 
 
 @router.get("/freight/foundation", response_model=FreightFoundationResponse)
@@ -517,14 +735,30 @@ async def list_shipments(session: AsyncSession = Depends(get_session)) -> list[S
     shipments = list(result.scalars().all())
     ai_payloads = await _latest_ai_payloads(session, [shipment.id for shipment in shipments])
     booking_payloads = await _latest_booking_payloads(session, [shipment.id for shipment in shipments])
+    status_payloads = await _latest_status_payloads(session, [shipment.id for shipment in shipments])
+    status_review_payloads = await _latest_status_review_payloads(session, [shipment.id for shipment in shipments])
     attachment_counts = await _attachment_counts(session, shipments)
+    document_summaries = await _document_booking_summaries(session, shipments)
+    now = datetime.now(timezone.utc)
     return [
         _serialize_shipment(
             shipment,
             {
                 **(ai_payloads.get(shipment.id) or {}),
                 **(booking_payloads.get(shipment.id) or {}),
+                **(status_payloads.get(shipment.id) or {}),
+                **(status_review_payloads.get(shipment.id) or {}),
                 "attachment_count": attachment_counts.get(shipment.id, 0),
+                "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
+                "missing_document_types": document_summaries.get(shipment.id, {}).get("missing_document_types", []),
+                "booking_review_warning": document_summaries.get(shipment.id, {}).get("booking_review_warning"),
+                "booking_review_required": document_summaries.get(shipment.id, {}).get("booking_review_required", False),
+                "status_stale": _is_status_stale(
+                    shipment_status=shipment.status,
+                    last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
+                    now=now,
+                ),
+                "status_sla_hours": settings.status_sla_hours_default,
             },
         )
         for shipment in shipments
@@ -573,13 +807,29 @@ async def get_shipment(
         raise HTTPException(status_code=404, detail="Shipment not found.")
     ai_payloads = await _latest_ai_payloads(session, [shipment.id])
     booking_payloads = await _latest_booking_payloads(session, [shipment.id])
+    status_payloads = await _latest_status_payloads(session, [shipment.id])
+    status_review_payloads = await _latest_status_review_payloads(session, [shipment.id])
     attachment_counts = await _attachment_counts(session, [shipment])
+    document_summaries = await _document_booking_summaries(session, [shipment])
+    now = datetime.now(timezone.utc)
     return _serialize_shipment(
         shipment,
         {
             **(ai_payloads.get(shipment.id) or {}),
             **(booking_payloads.get(shipment.id) or {}),
+            **(status_payloads.get(shipment.id) or {}),
+            **(status_review_payloads.get(shipment.id) or {}),
             "attachment_count": attachment_counts.get(shipment.id, 0),
+            "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
+            "missing_document_types": document_summaries.get(shipment.id, {}).get("missing_document_types", []),
+            "booking_review_warning": document_summaries.get(shipment.id, {}).get("booking_review_warning"),
+            "booking_review_required": document_summaries.get(shipment.id, {}).get("booking_review_required", False),
+            "status_stale": _is_status_stale(
+                shipment_status=shipment.status,
+                last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
+                now=now,
+            ),
+            "status_sla_hours": settings.status_sla_hours_default,
         },
     )
 
@@ -749,6 +999,91 @@ async def freight_operator_action(
                 evaluation_triggered=True,
                 quote_sent=True,
             )
+
+        if request.action == OperatorAction.RERUN_STATUS_LOOKUP:
+            status_response = await fetch_tms_shipment_status(session, shipment_id=shipment.id)
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message=(
+                    f"Status refreshed from TMS: {status_response.status.replace('_', ' ')}"
+                    if status_response.status
+                    else "Status refreshed from TMS."
+                ),
+                next_action="status_lookup_completed",
+                decision=WorkflowDecisionResult(
+                    email_message_id="",
+                    shipment_id=str(shipment.id),
+                    intent="operator_status_lookup",
+                    confidence=1.0,
+                    next_action="status_lookup_completed",
+                    status_lookup_triggered=True,
+                ),
+            )
+
+        if request.action == OperatorAction.RERUN_TMS_UPDATE:
+            latest_status_update = await session.scalar(
+                select(WorkflowEvent)
+                .where(
+                    WorkflowEvent.shipment_id == shipment.id,
+                    WorkflowEvent.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value,
+                )
+                .order_by(WorkflowEvent.created_at.desc())
+            )
+            if latest_status_update is None:
+                raise RuntimeError("No carrier status update payload is available to replay.")
+            update_payload = dict((latest_status_update.payload_json or {}).get("payload", {}) or {})
+            status_response = await push_carrier_status_to_tms(
+                session,
+                shipment_id=shipment.id,
+                status_text=update_payload.get("status_text"),
+                eta_text=update_payload.get("eta_text"),
+                location_text=update_payload.get("location_text"),
+                notes=update_payload.get("notes"),
+            )
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message="Carrier status update re-sent to TMS.",
+                next_action="tms_status_updated",
+                decision=WorkflowDecisionResult(
+                    email_message_id="",
+                    shipment_id=str(shipment.id),
+                    intent="operator_tms_status_update",
+                    confidence=1.0,
+                    next_action="tms_status_updated",
+                    tms_status_updated=True,
+                    tms_handoff_status=status_response.status,
+                ),
+            )
+
+        if request.action == OperatorAction.APPROVE_STATUS_REPLY:
+            status_response = await fetch_tms_shipment_status(session, shipment_id=shipment.id)
+            reply = await send_customer_status_reply(
+                session,
+                shipment_id=shipment.id,
+                status_payload=status_response.payload,
+                dry_run=False,
+                custom_message=None,
+            )
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message=f"Approved and sent status reply to {reply.client_email}.",
+                next_action="customer_status_sent",
+                decision=WorkflowDecisionResult(
+                    email_message_id="",
+                    shipment_id=str(shipment.id),
+                    intent="operator_status_reply",
+                    confidence=1.0,
+                    next_action="customer_status_sent",
+                    status_lookup_triggered=True,
+                    status_reply_sent=True,
+                ),
+            )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -884,6 +1219,130 @@ async def freight_customer_quote(
 
 
 @router.post(
+    "/freight/shipments/{shipment_id}/status-reply",
+    response_model=CustomerStatusReplyResponse,
+)
+async def freight_customer_status_reply(
+    shipment_id: UUID,
+    request: CustomerStatusReplyRequest,
+    session: AsyncSession = Depends(get_session),
+) -> CustomerStatusReplyResponse:
+    """Build or send a customer-facing shipment status reply from current TMS status."""
+    try:
+        status_response = await fetch_tms_shipment_status(session, shipment_id=shipment_id)
+        return await send_customer_status_reply(
+            session,
+            shipment_id=shipment_id,
+            status_payload=status_response.payload,
+            dry_run=request.dry_run,
+            custom_message=request.custom_message,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/carrier-status-update",
+    response_model=CarrierStatusUpdateResponse,
+)
+async def freight_carrier_status_update(
+    shipment_id: UUID,
+    request: CarrierStatusUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+) -> CarrierStatusUpdateResponse:
+    """Preview or send a structured carrier status update into the TMS."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    try:
+        latest_carrier_message = await _latest_carrier_message_for_shipment(session, shipment)
+        parsed_status_text = request.status_text
+        parsed_eta_text = request.eta_text
+        parsed_location_text = request.location_text
+        parsed_notes = request.notes
+
+        if latest_carrier_message is not None:
+            extraction = await extract_carrier_status_update(
+                {
+                    "sender_email": latest_carrier_message.sender,
+                    "sender_role": "carrier",
+                    "subject": latest_carrier_message.subject,
+                    "body_preview": latest_carrier_message.body_preview,
+                    "thread_subject": latest_carrier_message.subject,
+                    "shipment_status": shipment.status,
+                    "known_client": "",
+                    "known_carrier": latest_carrier_message.sender,
+                }
+            )
+            parsed_status_text = parsed_status_text or extraction.status_text
+            parsed_eta_text = parsed_eta_text or extraction.eta_text
+            parsed_location_text = parsed_location_text or extraction.location_text
+            parsed_notes = parsed_notes or extraction.notes
+
+        return await preview_or_push_carrier_status_update(
+            session,
+            shipment_id=shipment_id,
+            status_text=parsed_status_text,
+            eta_text=parsed_eta_text,
+            location_text=parsed_location_text,
+            notes=parsed_notes,
+            dry_run=request.dry_run,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/carrier-status-update",
+    response_model=CarrierStatusUpdateResponse,
+)
+async def freight_carrier_status_update(
+    shipment_id: UUID,
+    request: CarrierStatusUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+) -> CarrierStatusUpdateResponse:
+    """Preview or send a structured carrier status update into the TMS."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    try:
+        latest_carrier_message = await _latest_carrier_message_for_shipment(session, shipment)
+        parsed_status_text = request.status_text
+        parsed_eta_text = request.eta_text
+        parsed_location_text = request.location_text
+        parsed_notes = request.notes
+        if latest_carrier_message is not None:
+            extraction = await extract_carrier_status_update(
+                {
+                    "sender_email": latest_carrier_message.sender,
+                    "sender_role": "carrier",
+                    "subject": latest_carrier_message.subject,
+                    "body_preview": latest_carrier_message.body_preview,
+                    "thread_subject": latest_carrier_message.subject,
+                    "shipment_status": shipment.status,
+                    "known_client": "",
+                    "known_carrier": latest_carrier_message.sender,
+                }
+            )
+            parsed_status_text = parsed_status_text or extraction.status_text
+            parsed_eta_text = parsed_eta_text or extraction.eta_text
+            parsed_location_text = parsed_location_text or extraction.location_text
+            parsed_notes = parsed_notes or extraction.notes
+
+        return await preview_or_push_carrier_status_update(
+            session,
+            shipment_id=shipment_id,
+            status_text=parsed_status_text,
+            eta_text=parsed_eta_text,
+            location_text=parsed_location_text,
+            notes=parsed_notes,
+            dry_run=request.dry_run,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
     "/freight/shipments/{shipment_id}/tms-handoff",
     response_model=TmsHandoffResponse,
 )
@@ -966,10 +1425,13 @@ async def freight_overview(
         .order_by(Shipment.status)
     )
     active_stages = {str(status): total for status, total in result.all()}
+    status_metrics = await _status_metrics_summary(session)
 
     return FreightOverviewResponse(
         counts=counts,
         active_stages=active_stages,
+        status_metrics=status_metrics,
+        sla=FreightSlaSummary(status_stale_after_hours=settings.status_sla_hours_default),
         integrations={
             "email_provider": "outlook",
             "quote_wait_minutes_default": str(settings.quote_wait_minutes_default),
@@ -1030,6 +1492,8 @@ async def freight_outlook_ingest(
         auto_bids=1 if result.bid_intaken else 0,
         auto_evaluations=len(expired) + (1 if result.evaluation_triggered else 0),
         auto_quotes=len([item for item in expired if item.quote_auto_sent]) + (1 if result.quote_auto_sent else 0),
+        auto_status_replies=1 if result.status_reply_sent else 0,
+        auto_tms_status_updates=1 if result.tms_status_updated else 0,
         manual_reviews=1 if result.manual_review_required else 0,
         results=[result],
     )
@@ -1062,6 +1526,8 @@ async def freight_outlook_sync(
     auto_bids = 0
     auto_evaluations = 0
     auto_quotes = 0
+    auto_status_replies = 0
+    auto_tms_status_updates = 0
     manual_reviews = 0
     results = []
     for message in messages:
@@ -1092,6 +1558,8 @@ async def freight_outlook_sync(
         auto_bids += 1 if result.bid_intaken else 0
         auto_evaluations += 1 if result.evaluation_triggered else 0
         auto_quotes += 1 if result.quote_auto_sent else 0
+        auto_status_replies += 1 if result.status_reply_sent else 0
+        auto_tms_status_updates += 1 if result.tms_status_updated else 0
         manual_reviews += 1 if result.manual_review_required else 0
         results.append(result)
 
@@ -1108,6 +1576,8 @@ async def freight_outlook_sync(
         auto_bids=auto_bids,
         auto_evaluations=auto_evaluations,
         auto_quotes=auto_quotes,
+        auto_status_replies=auto_status_replies,
+        auto_tms_status_updates=auto_tms_status_updates,
         manual_reviews=manual_reviews,
         results=results,
     )

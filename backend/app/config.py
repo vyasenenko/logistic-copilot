@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     quote_wait_minutes_default: int = 20
     profit_margin_percent_default: float = 15.0
     profit_margin_floor_default: float = 0.0
+    status_sla_hours_default: int = 24
 
     @property
     def postgres_url(self) -> str:

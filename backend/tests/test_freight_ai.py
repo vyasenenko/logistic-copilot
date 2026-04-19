@@ -2,6 +2,8 @@
 
 from app.services.freight_ai import (
     _classify_with_heuristics,
+    _extract_carrier_status_update_with_heuristics,
+    _extract_status_request_with_heuristics,
     _extract_bid_with_heuristics,
     _extract_shipment_with_heuristics,
 )
@@ -79,3 +81,39 @@ def test_extract_bid_marks_multiple_amounts_as_ambiguous():
         }
     )
     assert "multiple_bid_amounts_detected" in result.ambiguity_reasons
+
+
+def test_classify_customer_status_request():
+    result = _classify_with_heuristics(
+        {
+            "subject": "Need ETA update",
+            "body_preview": "Can you share the current location and ETA?",
+            "sender_role": "client",
+            "shipment_status": "booked",
+        }
+    )
+    assert result.intent == "customer_status_request"
+    assert result.confidence >= 0.8
+
+
+def test_extract_status_request_fields():
+    result = _extract_status_request_with_heuristics(
+        {
+            "subject": "Status update",
+            "body_preview": "Please send ETA and current location.",
+        }
+    )
+    assert "eta" in result.requested_fields
+    assert "location" in result.requested_fields
+
+
+def test_extract_carrier_status_update():
+    result = _extract_carrier_status_update_with_heuristics(
+        {
+            "subject": "Re: load update",
+            "body_preview": "Driver arrived and is currently in Columbus, ETA tomorrow 10 am.",
+        }
+    )
+    assert result.status_text == "arrived"
+    assert result.location_text == "Columbus"
+    assert result.eta_text is not None
