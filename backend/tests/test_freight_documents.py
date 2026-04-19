@@ -1,6 +1,9 @@
 """Focused tests for freight document extraction heuristics."""
 
-from app.services.freight_execution import _parse_document_fields, build_document_context
+from datetime import datetime, timezone
+
+from app.memory.database import Shipment
+from app.services.freight_execution import _parse_document_fields, build_document_context, build_document_health
 
 
 def test_rate_confirmation_extracts_rate_and_reference_variants():
@@ -68,3 +71,68 @@ def test_document_context_collects_extracted_values():
     assert context["pickup_dates"] == ["April 24, 2026"]
     assert context["delivery_dates"] == ["April 25, 2026"]
     assert len(context["document_extracts"]) == 2
+
+
+def test_document_health_merges_enrichment_and_counts_reviews():
+    shipment = Shipment(status="awaiting_confirmation")
+    health = build_document_health(
+        [
+            {
+                "id": "doc-1",
+                "name": "Rate Confirmation.pdf",
+                "document_type": "rate_confirmation",
+                "ocr_status": "ocr_complete",
+                "review_required": False,
+                "extracted_fields": {
+                    "rate_amount": 1325.0,
+                    "pickup_number": "PU-4455",
+                },
+            },
+            {
+                "id": "doc-2",
+                "name": "BOL.txt",
+                "document_type": "bill_of_lading",
+                "ocr_status": "not_needed",
+                "review_required": False,
+                "extracted_fields": {
+                    "bol_number": "BOL-4455",
+                },
+            },
+        ],
+        shipment,
+        approved_fields={"reference_number": "LOAD-77"},
+    )
+
+    assert health["document_health_status"] == "healthy"
+    assert health["document_enrichment"]["pickup_number"] == "PU-4455"
+    assert health["document_enrichment"]["reference_number"] == "LOAD-77"
+    assert health["ocr_pending_count"] == 0
+    assert health["document_conflict_count"] == 0
+    assert health["review_required"] is False
+
+
+def test_document_health_detects_conflict_against_ready_date():
+    shipment = Shipment(
+        status="awaiting_confirmation",
+        ready_at=datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc),
+    )
+    health = build_document_health(
+        [
+            {
+                "id": "doc-1",
+                "name": "BOL.txt",
+                "document_type": "bill_of_lading",
+                "ocr_status": "not_needed",
+                "review_required": False,
+                "extracted_fields": {
+                    "pickup_date_text": "April 26, 2026",
+                },
+            }
+        ],
+        shipment,
+    )
+
+    assert health["document_health_status"] == "review_required"
+    assert health["document_conflict_count"] == 1
+    assert health["document_conflict_fields"] == ["pickup_date_text"]
+    assert health["review_required"] is True

@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     profit_margin_percent_default: float = 15.0
     profit_margin_floor_default: float = 0.0
     status_sla_hours_default: int = 24
+    document_booking_policy_default: str = "review_required"
+    document_ocr_provider_order: str = "openai,anthropic"
+    document_ocr_timeout_seconds: int = 45
+    document_min_ocr_confidence: float = 0.55
+    document_min_field_confidence: float = 0.6
 
     @property
     def postgres_url(self) -> str:

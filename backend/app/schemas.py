@@ -44,10 +44,15 @@ class WorkflowEventType(str, Enum):
     CLIENT_QUOTE_SENT = "client_quote_sent"
     CUSTOMER_CONFIRMED = "customer_confirmed"
     MANUAL_REVIEW_REQUIRED = "manual_review_required"
+    DOCUMENT_ANALYZED = "document_analyzed"
+    DOCUMENT_VALUES_APPROVED = "document_values_approved"
+    DOCUMENT_WARNING_IGNORED = "document_warning_ignored"
     TMS_HANDOFF_SENT = "tms_handoff_sent"
     TMS_STATUS_LOOKUP = "tms_status_lookup"
     CUSTOMER_STATUS_SENT = "customer_status_sent"
     TMS_STATUS_UPDATED = "tms_status_updated"
+    TMS_STATUS_INGESTED = "tms_status_ingested"
+    STATUS_WORKFLOW_RESOLVED = "status_workflow_resolved"
     EXCEPTION_RAISED = "exception_raised"
 
 
@@ -183,6 +188,10 @@ class ShipmentRecord(BaseModel):
     tms_handoff_status: str | None = None
     attachment_count: int = 0
     document_summary: dict[str, int] = Field(default_factory=dict)
+    document_enrichment: dict = Field(default_factory=dict)
+    document_health_status: str | None = None
+    ocr_pending_count: int = 0
+    document_conflict_count: int = 0
     missing_document_types: list[str] = Field(default_factory=list)
     booking_review_warning: str | None = None
     booking_review_required: bool = False
@@ -191,6 +200,10 @@ class ShipmentRecord(BaseModel):
     last_known_location: str | None = None
     last_status_source: str | None = None
     last_status_event_at: datetime | None = None
+    tms_load_id: str | None = None
+    tms_system: str | None = None
+    status_workflow_state: str | None = None
+    status_sync_health: str | None = None
     status_review_required: bool = False
     status_stale: bool = False
     status_sla_hours: int | None = None
@@ -218,7 +231,91 @@ class ShipmentDocumentRecord(BaseModel):
     extracted_fields: dict = Field(default_factory=dict)
     extraction_method: str | None = None
     ocr_status: str | None = None
+    ocr_confidence: float | None = None
+    field_confidence: float | None = None
+    review_required: bool = False
+    review_reason: str | None = None
     source_email_id: str
+
+
+class DocumentContentResult(BaseModel):
+    raw_text: str = ""
+    raw_text_preview: str | None = None
+    extraction_method: str | None = None
+    ocr_status: str | None = None
+    ocr_confidence: float | None = None
+    review_required: bool = False
+    review_reason: str | None = None
+
+
+class DocumentFieldResult(BaseModel):
+    extracted_fields: dict = Field(default_factory=dict)
+    field_confidence: float | None = None
+    review_required: bool = False
+    review_reason: str | None = None
+
+
+class DocumentExtract(BaseModel):
+    document_type: str
+    raw_text_preview: str | None = None
+    extraction_method: str | None = None
+    ocr_status: str | None = None
+    ocr_confidence: float | None = None
+    field_confidence: float | None = None
+    extracted_fields: dict = Field(default_factory=dict)
+    review_required: bool = False
+    review_reason: str | None = None
+
+
+class DocumentQualityExpectation(BaseModel):
+    expected_document_type: str
+    expected_fields: dict = Field(default_factory=dict)
+    expected_review_required: bool = False
+    expected_enrichment_fields: dict = Field(default_factory=dict)
+    expected_conflict_fields: list[str] = Field(default_factory=list)
+
+
+class DocumentQualitySample(BaseModel):
+    sample_id: str
+    document_family: str
+    source_format: str
+    filename: str
+    content_type: str
+    content_text: str
+    notes: str = ""
+    shipment_ready_at: datetime | None = None
+    expectation: DocumentQualityExpectation
+
+
+class DocumentQualityResult(BaseModel):
+    sample_id: str
+    document_family: str
+    source_format: str
+    passed: bool = False
+    document_type: str
+    extraction_method: str | None = None
+    ocr_status: str | None = None
+    ocr_confidence: float | None = None
+    field_confidence: float | None = None
+    review_required: bool = False
+    expected_review_required: bool = False
+    extracted_fields: dict = Field(default_factory=dict)
+    expected_fields: dict = Field(default_factory=dict)
+    document_enrichment: dict = Field(default_factory=dict)
+    expected_enrichment_fields: dict = Field(default_factory=dict)
+    document_conflict_fields: list[str] = Field(default_factory=list)
+    expected_conflict_fields: list[str] = Field(default_factory=list)
+    document_health_status: str | None = None
+    false_positive_fields: list[str] = Field(default_factory=list)
+    mismatches: list[str] = Field(default_factory=list)
+
+
+class DocumentQualityRunSummary(BaseModel):
+    run_at: datetime
+    sample_count: int = 0
+    metrics: dict = Field(default_factory=dict)
+    results: list[DocumentQualityResult] = Field(default_factory=list)
+    failures: list[str] = Field(default_factory=list)
 
 
 class QuoteReference(BaseModel):
@@ -445,13 +542,101 @@ class ReviewQueueItem(BaseModel):
     stage: str
     event_type: str
     review_type: str | None = None
+    priority: str = "normal"
+    alert_label: str | None = None
     reason: str = ""
     next_action: str | None = None
     missing_fields: list[str] = Field(default_factory=list)
     ambiguity_reasons: list[str] = Field(default_factory=list)
     missing_document_types: list[str] = Field(default_factory=list)
+    document_conflict_fields: list[str] = Field(default_factory=list)
     booking_review_warning: str | None = None
+    status_stale: bool = False
+    status_review_required: bool = False
     created_at: datetime
+
+
+class StatusQueueItem(BaseModel):
+    task_id: str
+    task_type: str
+    task_state: str
+    queue_scope: str = "active"
+    resolution_state: str | None = None
+    resolution_reason: str | None = None
+    resolution_at: datetime | None = None
+    shipment_id: str
+    email_thread_id: str | None = None
+    source_email_id: str | None = None
+    priority: str = "normal"
+    alert_label: str | None = None
+    reason: str = ""
+    recommended_next_action: str | None = None
+    review_type: str | None = None
+    ambiguity_reasons: list[str] = Field(default_factory=list)
+    latest_status_snapshot: dict = Field(default_factory=dict)
+    draft_subject: str | None = None
+    draft_body: str | None = None
+    structured_payload: dict = Field(default_factory=dict)
+    last_failure: str | None = None
+    tms_load_id: str | None = None
+    tms_system: str | None = None
+    status_sync_health: str | None = None
+    created_at: datetime
+
+
+class StatusQueueAction(str, Enum):
+    PREVIEW = "preview"
+    APPROVE_AND_SEND = "approve_and_send"
+    APPROVE_AND_PUSH = "approve_and_push"
+    REBUILD_DRAFT = "rebuild_draft"
+    RETRY_PUSH = "retry_push"
+    DISMISS = "dismiss"
+
+
+class StatusQueueActionRequest(BaseModel):
+    action: StatusQueueAction
+    custom_message: str | None = None
+    draft_subject: str | None = None
+    draft_body: str | None = None
+    status_text: str | None = None
+    eta_text: str | None = None
+    location_text: str | None = None
+    notes: str | None = None
+
+
+class StatusQueueActionResponse(BaseModel):
+    task_id: str
+    task_type: str
+    action: StatusQueueAction
+    status: str
+    message: str
+    task_state: str
+    resolution_state: str | None = None
+    resolution_reason: str | None = None
+    shipment_id: str
+    preview: dict = Field(default_factory=dict)
+
+
+class TmsStatusIngestRequest(BaseModel):
+    external_event_id: str | None = None
+    tms_load_id: str | None = None
+    external_load_ref: str | None = None
+    tms_system: str | None = None
+    quote_token: str | None = None
+    shipment_id: str | None = None
+    status: str | None = None
+    eta: str | None = None
+    location: str | None = None
+    milestone: str | None = None
+    source_timestamp: datetime | None = None
+    payload: dict = Field(default_factory=dict)
+
+
+class TmsStatusIngestResponse(BaseModel):
+    shipment_id: str
+    status: str
+    event_type: str
+    tms_load_id: str | None = None
 
 
 class OperatorAction(str, Enum):
@@ -463,6 +648,9 @@ class OperatorAction(str, Enum):
     RERUN_STATUS_LOOKUP = "rerun_status_lookup"
     RERUN_TMS_UPDATE = "rerun_tms_update"
     APPROVE_STATUS_REPLY = "approve_status_reply"
+    RERUN_DOCUMENT_EXTRACTION = "rerun_document_extraction"
+    APPROVE_DOCUMENT_VALUES = "approve_document_values"
+    IGNORE_DOCUMENT_WARNING = "ignore_document_warning"
 
 
 class ShipmentOperatorActionRequest(BaseModel):

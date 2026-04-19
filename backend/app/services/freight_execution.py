@@ -21,6 +21,9 @@ from app.schemas import (
     BookingConfirmationResponse,
     CarrierStatusUpdateResponse,
     ClientAcknowledgementResponse,
+    DocumentContentResult,
+    DocumentExtract,
+    DocumentFieldResult,
     CustomerStatusReplyResponse,
     CustomerQuoteResponse,
     ShipmentEvaluationResponse,
@@ -30,6 +33,7 @@ from app.schemas import (
     WorkflowEventType,
 )
 from app.services.email_correlation import attach_quote_token, extract_quote_token
+from app.services.document_ocr import extract_document_content
 from app.services.outlook import OutlookGraphClient
 from app.services.tms_connector import TmsConnector
 
@@ -45,6 +49,7 @@ DOCUMENT_TYPE_RULES = (
 BOOKING_DOCUMENT_REQUIREMENTS = (
     ("pricing_backup", {"rate_confirmation", "quote_sheet"}),
 )
+ATTACHMENT_CACHE_KEY = "_logistic_copilot_extract"
 GENERIC_AMOUNT_PATTERN = re.compile(r"(?:\$|usd\s*)(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE)
 RATE_AMOUNT_PATTERNS = (
     re.compile(r"(?:all[- ]?in|total|rate(?:\s+confirmation)?|confirmed\s+rate|carrier\s+rate)\s*[:#-]?\s*\$?\s*(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE),
@@ -218,10 +223,192 @@ def _parse_document_fields(document_type: str, name: str | None, text: str | Non
     return fields
 
 
-def _extract_message_attachments(email_message: EmailMessage) -> list[dict]:
+def parse_document_fields(document_type: str, content_result: DocumentContentResult, name: str | None) -> DocumentFieldResult:
+    extracted_fields = _parse_document_fields(document_type, name, content_result.raw_text)
+    field_confidence = None
+    if extracted_fields:
+        field_confidence = 0.82 if len(extracted_fields) >= 2 else 0.68
+        if content_result.ocr_confidence is not None:
+            field_confidence = round((field_confidence + content_result.ocr_confidence) / 2, 2)
+    review_required = content_result.review_required
+    review_reason = content_result.review_reason
+    if not extracted_fields and document_type in {"rate_confirmation", "bill_of_lading", "pickup_number", "quote_sheet"}:
+        review_required = True
+        field_confidence = 0.25
+        review_reason = review_reason or "Expected document fields could not be extracted."
+    elif field_confidence is not None and field_confidence < settings.document_min_field_confidence:
+        review_required = True
+        review_reason = review_reason or "Document field confidence is below threshold."
+    return DocumentFieldResult(
+        extracted_fields=extracted_fields,
+        field_confidence=field_confidence,
+        review_required=review_required,
+        review_reason=review_reason,
+    )
+
+
+def _document_extract_from_cache(item: dict) -> DocumentExtract | None:
+    cached = item.get(ATTACHMENT_CACHE_KEY)
+    if not isinstance(cached, dict):
+        return None
+    try:
+        return DocumentExtract(
+            document_type=str(cached.get("document_type", "unknown")),
+            raw_text_preview=cached.get("raw_text_preview"),
+            extraction_method=cached.get("extraction_method"),
+            ocr_status=cached.get("ocr_status"),
+            ocr_confidence=cached.get("ocr_confidence"),
+            field_confidence=cached.get("field_confidence"),
+            extracted_fields=dict(cached.get("extracted_fields", {}) or {}),
+            review_required=bool(cached.get("review_required", False)),
+            review_reason=cached.get("review_reason"),
+        )
+    except Exception:
+        return None
+
+
+async def build_document_extract(
+    attachment: dict,
+    *,
+    force_reprocess: bool = False,
+) -> tuple[DocumentExtract, bool]:
+    cached = None if force_reprocess else _document_extract_from_cache(attachment)
+    if cached is not None:
+        return cached, False
+
+    name = attachment.get("name") or attachment.get("fileName") or attachment.get("filename")
+    content_type = attachment.get("contentType") or attachment.get("@odata.mediaContentType")
+    document_type = classify_document_type(name, content_type)
+
+    inline_text = None
+    for key in ("contentText", "content_text", "text", "body"):
+        value = attachment.get(key)
+        if isinstance(value, str) and value.strip():
+            inline_text = value.strip()[:8000]
+            break
+
+    content_result = DocumentContentResult(
+        raw_text="",
+        raw_text_preview=None,
+        extraction_method=None,
+        ocr_status=None,
+        ocr_confidence=None,
+        review_required=False,
+        review_reason=None,
+    )
+
+    if inline_text:
+        content_result = DocumentContentResult(
+            raw_text=inline_text,
+            raw_text_preview=inline_text[:280],
+            extraction_method="inline_text",
+            ocr_status="not_needed",
+            ocr_confidence=1.0,
+            review_required=False,
+            review_reason=None,
+        )
+    else:
+        raw_bytes = attachment.get("contentBytes") or attachment.get("content_bytes")
+        content_type_normalized = str(content_type or "").lower()
+        if isinstance(raw_bytes, str) and raw_bytes.strip():
+            try:
+                decoded = base64.b64decode(raw_bytes, validate=False)
+                if any(token in content_type_normalized for token in ("text/", "json", "xml", "csv")):
+                    raw_text = decoded.decode("utf-8", errors="ignore").strip()[:8000]
+                    content_result = DocumentContentResult(
+                        raw_text=raw_text,
+                        raw_text_preview=raw_text[:280] if raw_text else None,
+                        extraction_method="inline_binary_text",
+                        ocr_status="not_needed",
+                        ocr_confidence=1.0 if raw_text else 0.0,
+                        review_required=not bool(raw_text),
+                        review_reason=None if raw_text else "Attachment text could not be decoded.",
+                    )
+                elif "application/pdf" in content_type_normalized:
+                    pdf_text = _extract_pdf_text(decoded)
+                    if pdf_text:
+                        content_result = DocumentContentResult(
+                            raw_text=pdf_text,
+                            raw_text_preview=pdf_text[:280],
+                            extraction_method="pdf_text",
+                            ocr_status="not_needed",
+                            ocr_confidence=0.92,
+                            review_required=False,
+                            review_reason=None,
+                        )
+                    else:
+                        content_result = await extract_document_content(
+                            content_bytes=decoded,
+                            content_type=content_type,
+                            filename=name,
+                        )
+                elif any(token in content_type_normalized for token in ("image/png", "image/jpeg", "image/jpg", "image/webp")):
+                    content_result = await extract_document_content(
+                        content_bytes=decoded,
+                        content_type=content_type,
+                        filename=name,
+                    )
+                else:
+                    content_result = DocumentContentResult(
+                        extraction_method="unsupported_binary",
+                        ocr_status="ocr_review_required",
+                        review_required=True,
+                        review_reason=f"Unsupported binary document type: {content_type or 'unknown'}",
+                    )
+            except (binascii.Error, ValueError):
+                content_result = DocumentContentResult(
+                    extraction_method="binary_decode_failed",
+                    ocr_status="ocr_failed",
+                    review_required=True,
+                    review_reason="Attachment binary content could not be decoded.",
+                )
+        else:
+            content_result = DocumentContentResult(
+                extraction_method="missing_binary",
+                ocr_status="ocr_review_required",
+                review_required=True,
+                review_reason="Attachment content bytes are not available.",
+            )
+
+    field_result = parse_document_fields(document_type, content_result, name)
+    review_required = bool(content_result.review_required or field_result.review_required)
+    review_reason = field_result.review_reason or content_result.review_reason
+    extract = DocumentExtract(
+        document_type=document_type,
+        raw_text_preview=content_result.raw_text_preview,
+        extraction_method=content_result.extraction_method,
+        ocr_status=content_result.ocr_status,
+        ocr_confidence=content_result.ocr_confidence,
+        field_confidence=field_result.field_confidence,
+        extracted_fields=field_result.extracted_fields,
+        review_required=review_required,
+        review_reason=review_reason,
+    )
+    attachment[ATTACHMENT_CACHE_KEY] = {
+        "document_type": extract.document_type,
+        "raw_text_preview": extract.raw_text_preview,
+        "extraction_method": extract.extraction_method,
+        "ocr_status": extract.ocr_status,
+        "ocr_confidence": extract.ocr_confidence,
+        "field_confidence": extract.field_confidence,
+        "extracted_fields": extract.extracted_fields,
+        "review_required": extract.review_required,
+        "review_reason": extract.review_reason,
+    }
+    return extract, True
+
+
+async def _extract_message_attachments(
+    session: AsyncSession,
+    email_message: EmailMessage,
+    *,
+    force_reprocess: bool = False,
+) -> list[dict]:
     payload = dict(email_message.raw_payload_json or {})
     raw_attachments = payload.get("attachments") or payload.get("Attachments") or []
     attachments: list[dict] = []
+    updated_raw_attachments: list[dict] = []
+    changed = False
     for item in raw_attachments:
         if not isinstance(item, dict):
             continue
@@ -231,29 +418,43 @@ def _extract_message_attachments(email_message: EmailMessage) -> list[dict]:
         attachment_id = item.get("id")
         if not name and not attachment_id:
             continue
-        extracted_text = _extract_attachment_text(item)
-        document_type = classify_document_type(name, content_type)
-        extraction_method, ocr_status = _attachment_extraction_details(item, extracted_text)
+        document_extract, item_changed = await build_document_extract(item, force_reprocess=force_reprocess)
+        changed = changed or item_changed
         attachments.append(
             {
                 "id": attachment_id,
                 "name": name,
-                "document_type": document_type,
+                "document_type": document_extract.document_type,
                 "content_type": content_type,
                 "size": size,
-                "extracted_text_preview": extracted_text[:280] if extracted_text else None,
-                "extracted_fields": _parse_document_fields(document_type, name, extracted_text),
-                "extraction_method": extraction_method,
-                "ocr_status": ocr_status,
+                "extracted_text_preview": document_extract.raw_text_preview,
+                "extracted_fields": document_extract.extracted_fields,
+                "extraction_method": document_extract.extraction_method,
+                "ocr_status": document_extract.ocr_status,
+                "ocr_confidence": document_extract.ocr_confidence,
+                "field_confidence": document_extract.field_confidence,
+                "review_required": document_extract.review_required,
+                "review_reason": document_extract.review_reason,
                 "source_email_id": str(email_message.id),
             }
         )
+        updated_raw_attachments.append(item)
+    if changed:
+        if "attachments" in payload:
+            payload["attachments"] = updated_raw_attachments
+        elif "Attachments" in payload:
+            payload["Attachments"] = updated_raw_attachments
+        email_message.raw_payload_json = payload
+        session.add(email_message)
+        await session.flush()
     return attachments
 
 
 async def collect_shipment_attachments(
     session: AsyncSession,
     shipment: Shipment,
+    *,
+    force_reprocess: bool = False,
 ) -> list[dict]:
     if shipment.email_thread_id is None:
         return []
@@ -265,7 +466,11 @@ async def collect_shipment_attachments(
     attachments: list[dict] = []
     seen: set[tuple[str | None, str | None]] = set()
     for email_message in result.scalars().all():
-        for attachment in _extract_message_attachments(email_message):
+        for attachment in await _extract_message_attachments(
+            session,
+            email_message,
+            force_reprocess=force_reprocess,
+        ):
             key = (attachment.get("id"), attachment.get("name"))
             if key in seen:
                 continue
@@ -276,9 +481,15 @@ async def collect_shipment_attachments(
 
 def summarize_booking_documents(attachments: list[dict]) -> dict:
     summary: dict[str, int] = {}
+    ocr_pending_count = 0
+    review_required_count = 0
     for attachment in attachments:
         document_type = str(attachment.get("document_type", "unknown"))
         summary[document_type] = summary.get(document_type, 0) + 1
+        if attachment.get("ocr_status") in {"pending", "ocr_review_required"}:
+            ocr_pending_count += 1
+        if attachment.get("review_required"):
+            review_required_count += 1
 
     missing_document_types: list[str] = []
     for requirement_name, accepted_types in BOOKING_DOCUMENT_REQUIREMENTS:
@@ -294,9 +505,105 @@ def summarize_booking_documents(attachments: list[dict]) -> dict:
         "attachment_count": len(attachments),
         "document_summary": summary,
         "pricing_document_count": pricing_docs,
+        "ocr_pending_count": ocr_pending_count,
+        "review_required_count": review_required_count,
         "missing_document_types": missing_document_types,
         "booking_review_warning": warning,
         "booking_review_required": bool(missing_document_types),
+    }
+
+
+def _extract_document_enrichment(attachments: list[dict]) -> dict:
+    enrichment: dict[str, str | float] = {}
+    candidate_fields = (
+        "pickup_number",
+        "reference_number",
+        "bol_number",
+        "pickup_date_text",
+        "delivery_date_text",
+        "rate_amount",
+    )
+    for field_name in candidate_fields:
+        values = []
+        for attachment in attachments:
+            extracted_fields = dict(attachment.get("extracted_fields", {}) or {})
+            if field_name in extracted_fields:
+                values.append(extracted_fields[field_name])
+        unique_values = list(dict.fromkeys(values))
+        if len(unique_values) == 1:
+            enrichment[field_name] = unique_values[0]
+    return enrichment
+
+
+def _detect_document_conflicts(attachments: list[dict], shipment: Shipment) -> list[str]:
+    conflicts: list[str] = []
+    candidate_fields = (
+        "pickup_number",
+        "reference_number",
+        "bol_number",
+        "pickup_date_text",
+        "delivery_date_text",
+        "rate_amount",
+    )
+    for field_name in candidate_fields:
+        values = []
+        for attachment in attachments:
+            extracted_fields = dict(attachment.get("extracted_fields", {}) or {})
+            if field_name in extracted_fields:
+                values.append(str(extracted_fields[field_name]))
+        if len(set(values)) > 1:
+            conflicts.append(field_name)
+    if shipment.ready_at:
+        for attachment in attachments:
+            extracted_fields = dict(attachment.get("extracted_fields", {}) or {})
+            pickup_date_text = extracted_fields.get("pickup_date_text")
+            if isinstance(pickup_date_text, str):
+                ready_date = shipment.ready_at.astimezone(timezone.utc).date().isoformat()
+                if ready_date not in pickup_date_text:
+                    conflicts.append("pickup_date_text")
+                    break
+    return list(dict.fromkeys(conflicts))
+
+
+def build_document_health(
+    attachments: list[dict],
+    shipment: Shipment,
+    *,
+    approved_fields: dict | None = None,
+    warning_ignored: bool = False,
+) -> dict:
+    booking_summary = summarize_booking_documents(attachments)
+    document_enrichment = _extract_document_enrichment(attachments)
+    if approved_fields:
+        document_enrichment.update(dict(approved_fields))
+    document_conflicts = _detect_document_conflicts(attachments, shipment)
+    review_required = (
+        booking_summary["booking_review_required"]
+        or booking_summary["review_required_count"] > 0
+        or bool(document_conflicts)
+    )
+    if warning_ignored:
+        review_required = False
+    health_status = "healthy"
+    if warning_ignored:
+        health_status = "warning_ignored"
+    elif document_conflicts:
+        health_status = "review_required"
+    elif booking_summary["booking_review_required"] or booking_summary["review_required_count"] > 0:
+        health_status = "review_required"
+    elif booking_summary["ocr_pending_count"] > 0:
+        health_status = "warning"
+
+    policy_mode = settings.document_booking_policy_default.strip().lower()
+    blocking = policy_mode == "block_booking" and review_required
+    return {
+        **booking_summary,
+        "document_enrichment": document_enrichment,
+        "document_conflict_fields": document_conflicts,
+        "document_conflict_count": len(document_conflicts),
+        "document_health_status": "blocking" if blocking else health_status,
+        "review_required": review_required,
+        "warning_ignored": warning_ignored,
     }
 
 
@@ -326,7 +633,7 @@ def build_document_context(attachments: list[dict]) -> dict:
             pickup_dates.append(str(extracted_fields["pickup_date_text"]))
         if "delivery_date_text" in extracted_fields:
             delivery_dates.append(str(extracted_fields["delivery_date_text"]))
-        if attachment.get("ocr_status") == "pending":
+        if attachment.get("ocr_status") in {"pending", "ocr_review_required"}:
             ocr_pending_documents.append(str(attachment.get("name") or attachment.get("id") or "attachment"))
         extracted_documents.append(
             {
@@ -336,6 +643,10 @@ def build_document_context(attachments: list[dict]) -> dict:
                 "extracted_fields": extracted_fields,
                 "extraction_method": attachment.get("extraction_method"),
                 "ocr_status": attachment.get("ocr_status"),
+                "ocr_confidence": attachment.get("ocr_confidence"),
+                "field_confidence": attachment.get("field_confidence"),
+                "review_required": attachment.get("review_required"),
+                "review_reason": attachment.get("review_reason"),
             }
         )
 
@@ -825,7 +1136,7 @@ async def handoff_to_tms(
     bid, carrier = await _get_selected_bid(session, shipment, bid_id)
     client = await session.get(Client, shipment.client_id) if shipment.client_id else None
     attachments = await collect_shipment_attachments(session, shipment)
-    document_status = summarize_booking_documents(attachments)
+    document_status = build_document_health(attachments, shipment)
     document_context = build_document_context(attachments)
     payload = {
         "shipment_id": str(shipment.id),
@@ -862,6 +1173,10 @@ async def handoff_to_tms(
     connector = TmsConnector()
     response_payload: dict = {}
     status = "preview"
+    policy_mode = settings.document_booking_policy_default.strip().lower()
+    if not dry_run and document_status["review_required"] and policy_mode == "block_booking":
+        raise RuntimeError("Booking blocked until document review is resolved.")
+
     if not dry_run:
         shipment.status = ShipmentStage.BOOKING_IN_PROGRESS.value
         shipment.updated_at = datetime.now(timezone.utc)
@@ -896,22 +1211,30 @@ async def handoff_to_tms(
         shipment.status = ShipmentStage.AWAITING_CONFIRMATION.value
 
     shipment.updated_at = datetime.now(timezone.utc)
-    if document_status["booking_review_required"]:
+    if document_status["review_required"]:
         latest_review = await _latest_workflow_event(
             session,
             shipment.id,
             WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
         )
         latest_review_payload = dict((latest_review.payload_json or {}) if latest_review else {})
-        if latest_review_payload.get("reason") != "booking_documents_missing":
+        if latest_review_payload.get("reason") != "booking_documents_review_required":
             session.add(
                 WorkflowEvent(
                     shipment_id=shipment.id,
                     event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
                     stage=shipment.status,
                     payload_json={
-                        "reason": "booking_documents_missing",
+                        "reason": "booking_documents_review_required",
+                        "review_type": (
+                            "document_conflict_review"
+                            if document_status["document_conflict_fields"]
+                            else "ocr_review_required"
+                            if document_status["ocr_pending_count"] > 0
+                            else "document_parse_low_confidence"
+                        ),
                         "next_action": "review_documents",
+                        "document_conflict_fields": document_status["document_conflict_fields"],
                         "missing_document_types": document_status["missing_document_types"],
                         "booking_review_warning": document_status["booking_review_warning"],
                         "manual_review_required": True,
@@ -932,9 +1255,14 @@ async def handoff_to_tms(
                 "status": status,
                 "attachment_count": len(attachments),
                 "document_summary": document_status["document_summary"],
+                "document_enrichment": document_status["document_enrichment"],
+                "document_health_status": document_status["document_health_status"],
+                "ocr_pending_count": document_status["ocr_pending_count"],
+                "document_conflict_count": document_status["document_conflict_count"],
+                "document_conflict_fields": document_status["document_conflict_fields"],
                 "missing_document_types": document_status["missing_document_types"],
                 "booking_review_warning": document_status["booking_review_warning"],
-                "booking_review_required": document_status["booking_review_required"],
+                "booking_review_required": document_status["review_required"],
                 "document_context": document_context,
             },
         )
@@ -1084,6 +1412,8 @@ async def send_customer_status_reply(
     status_payload: dict,
     dry_run: bool,
     custom_message: str | None = None,
+    subject_override: str | None = None,
+    body_override: str | None = None,
 ) -> CustomerStatusReplyResponse:
     """Send a shipment status update back to the customer."""
     shipment = await session.get(Shipment, shipment_id)
@@ -1152,6 +1482,10 @@ async def send_customer_status_reply(
     )
     if custom_message:
         body = "\n".join([body, "", custom_message.strip()])
+    if subject_override:
+        subject = subject_override.strip()
+    if body_override:
+        body = body_override.strip()
 
     if not dry_run:
         outlook = OutlookGraphClient()
@@ -1166,7 +1500,14 @@ async def send_customer_status_reply(
                 direction="outbound",
                 subject=subject,
                 body_preview=body[:1000],
-                raw_payload_json={"type": "customer_status_reply", "dry_run": dry_run, "status_payload": status_payload},
+                raw_payload_json={
+                    "type": "customer_status_reply",
+                    "dry_run": dry_run,
+                    "status_payload": status_payload,
+                    "custom_message": custom_message,
+                    "subject": subject,
+                    "body": body,
+                },
                 received_at=datetime.now(timezone.utc),
             )
         )
@@ -1183,7 +1524,13 @@ async def send_customer_status_reply(
                 location=status_payload.get("location"),
                 milestone=status_payload.get("milestone"),
                 source="customer_reply",
-                extra={"dry_run": dry_run, **status_payload},
+                extra={
+                    "dry_run": dry_run,
+                    "subject": subject,
+                    "body": body,
+                    "custom_message": custom_message,
+                    **status_payload,
+                },
             ),
         )
     )

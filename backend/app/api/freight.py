@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,16 +53,24 @@ from app.schemas import (
     ShipmentUpsertRequest,
     ShipmentStage,
     ReviewQueueItem,
+    StatusQueueAction,
+    StatusQueueActionRequest,
+    StatusQueueActionResponse,
+    StatusQueueItem,
     ShipmentOperatorActionRequest,
     ShipmentOperatorActionResponse,
     ShipmentDocumentRecord,
     TmsHandoffRequest,
     TmsHandoffResponse,
+    TmsStatusIngestRequest,
+    TmsStatusIngestResponse,
     WorkflowEventRecord,
     WorkflowDecisionResult,
     WorkflowEventType,
 )
 from app.services.freight_execution import (
+    build_document_health,
+    build_document_context,
     collect_shipment_attachments,
     confirm_booking_and_handoff,
     evaluate_shipment_bids,
@@ -244,6 +252,10 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         tms_handoff_status=ai_payload.get("tms_handoff_status"),
         attachment_count=int(ai_payload.get("attachment_count", 0) or 0),
         document_summary=dict(ai_payload.get("document_summary", {}) or {}),
+        document_enrichment=dict(ai_payload.get("document_enrichment", {}) or {}),
+        document_health_status=ai_payload.get("document_health_status"),
+        ocr_pending_count=int(ai_payload.get("ocr_pending_count", 0) or 0),
+        document_conflict_count=int(ai_payload.get("document_conflict_count", 0) or 0),
         missing_document_types=list(ai_payload.get("missing_document_types", []) or []),
         booking_review_warning=ai_payload.get("booking_review_warning"),
         booking_review_required=bool(ai_payload.get("booking_review_required", False)),
@@ -252,6 +264,10 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         last_known_location=ai_payload.get("last_known_location"),
         last_status_source=ai_payload.get("last_status_source"),
         last_status_event_at=ai_payload.get("last_status_event_at"),
+        tms_load_id=ai_payload.get("tms_load_id"),
+        tms_system=ai_payload.get("tms_system"),
+        status_workflow_state=ai_payload.get("status_workflow_state"),
+        status_sync_health=ai_payload.get("status_sync_health"),
         status_review_required=bool(ai_payload.get("status_review_required", False)),
         status_stale=bool(ai_payload.get("status_stale", False)),
         status_sla_hours=ai_payload.get("status_sla_hours"),
@@ -272,21 +288,87 @@ def _serialize_workflow_event(event: WorkflowEvent) -> WorkflowEventRecord:
     )
 
 
-def _serialize_review_queue_item(event: WorkflowEvent) -> ReviewQueueItem:
+def _review_priority_score(item: ReviewQueueItem) -> tuple[int, datetime]:
+    priority_rank = {
+        "critical": 0,
+        "high": 1,
+        "normal": 2,
+    }.get(item.priority, 2)
+    return (priority_rank, -item.created_at.timestamp())
+
+
+def _status_queue_priority(item: StatusQueueItem) -> tuple[int, float]:
+    priority_rank = {
+        "critical": 0,
+        "high": 1,
+        "normal": 2,
+    }.get(item.priority, 2)
+    return (priority_rank, -item.created_at.timestamp())
+
+
+def _serialize_review_queue_item(
+    event: WorkflowEvent,
+    *,
+    shipment: Shipment | None = None,
+    status_payload: dict | None = None,
+) -> ReviewQueueItem:
+    payload = dict(event.payload_json or {})
+    review_type = payload.get("review_type")
+    status_payload = status_payload or {}
+    now = datetime.now(timezone.utc)
+    status_stale = False
+    if shipment is not None:
+        status_stale = _is_status_stale(
+            shipment_status=shipment.status,
+            last_status_event_at=status_payload.get("last_status_event_at"),
+            now=now,
+        )
+    status_review_required = isinstance(review_type, str) and "status" in review_type
+    priority = "normal"
+    alert_label = None
+    if status_stale:
+        priority = "critical"
+        alert_label = "Status overdue"
+    elif status_review_required:
+        priority = "high"
+        alert_label = "Status review"
+    elif review_type == "document_conflict_review":
+        priority = "high"
+        alert_label = "Document conflict"
+    elif review_type in {"ocr_review_required", "document_parse_low_confidence"}:
+        priority = "high"
+        alert_label = "Document review"
+    elif payload.get("booking_review_warning"):
+        priority = "high"
+        alert_label = "Booking warning"
+
     return ReviewQueueItem(
         workflow_event_id=str(event.id),
         shipment_id=str(event.shipment_id),
         stage=event.stage,
         event_type=event.event_type,
-        review_type=(event.payload_json or {}).get("review_type"),
-        reason=str((event.payload_json or {}).get("reason", "")),
-        next_action=(event.payload_json or {}).get("next_action"),
-        missing_fields=list((event.payload_json or {}).get("missing_fields", []) or []),
-        ambiguity_reasons=list((event.payload_json or {}).get("ambiguity_reasons", []) or []),
-        missing_document_types=list((event.payload_json or {}).get("missing_document_types", []) or []),
-        booking_review_warning=(event.payload_json or {}).get("booking_review_warning"),
+        review_type=review_type,
+        priority=priority,
+        alert_label=alert_label,
+        reason=str(payload.get("reason", "")),
+        next_action=payload.get("next_action"),
+        missing_fields=list(payload.get("missing_fields", []) or []),
+        ambiguity_reasons=list(payload.get("ambiguity_reasons", []) or []),
+        missing_document_types=list(payload.get("missing_document_types", []) or []),
+        document_conflict_fields=list(payload.get("document_conflict_fields", []) or []),
+        booking_review_warning=payload.get("booking_review_warning"),
+        status_stale=status_stale,
+        status_review_required=status_review_required,
         created_at=event.created_at,
     )
+
+
+def _status_queue_task_type(review_type: str | None) -> str | None:
+    if review_type == "customer_status_request_review":
+        return "status_reply"
+    if review_type == "carrier_status_update_review":
+        return "carrier_update"
+    return None
 
 
 def _serialize_bid_record(bid: CarrierBid, carrier: Carrier) -> BidRecord:
@@ -316,6 +398,10 @@ def _serialize_document_record(document: dict) -> ShipmentDocumentRecord:
         extracted_fields=dict(document.get("extracted_fields", {}) or {}),
         extraction_method=document.get("extraction_method"),
         ocr_status=document.get("ocr_status"),
+        ocr_confidence=document.get("ocr_confidence"),
+        field_confidence=document.get("field_confidence"),
+        review_required=bool(document.get("review_required", False)),
+        review_reason=document.get("review_reason"),
         source_email_id=str(document.get("source_email_id", "")),
     )
 
@@ -374,6 +460,10 @@ async def _latest_booking_payloads(
                 "booking_error": None,
                 "attachment_count": payload.get("attachment_count", 0),
                 "document_summary": dict(payload.get("document_summary", {}) or {}),
+                "document_enrichment": dict(payload.get("document_enrichment", {}) or {}),
+                "document_health_status": payload.get("document_health_status"),
+                "ocr_pending_count": payload.get("ocr_pending_count", 0),
+                "document_conflict_count": payload.get("document_conflict_count", 0),
                 "missing_document_types": list(payload.get("missing_document_types", []) or []),
                 "booking_review_warning": payload.get("booking_review_warning"),
                 "booking_review_required": bool(payload.get("booking_review_required", False)),
@@ -385,6 +475,10 @@ async def _latest_booking_payloads(
                 "booking_error": payload.get("message"),
                 "attachment_count": 0,
                 "document_summary": {},
+                "document_enrichment": {},
+                "document_health_status": None,
+                "ocr_pending_count": 0,
+                "document_conflict_count": 0,
                 "missing_document_types": [],
                 "booking_review_warning": None,
                 "booking_review_required": False,
@@ -396,6 +490,10 @@ async def _latest_booking_payloads(
                 "booking_error": None,
                 "attachment_count": 0,
                 "document_summary": {},
+                "document_enrichment": {},
+                "document_health_status": None,
+                "ocr_pending_count": 0,
+                "document_conflict_count": 0,
                 "missing_document_types": [],
                 "booking_review_warning": None,
                 "booking_review_required": False,
@@ -431,12 +529,13 @@ async def _latest_status_payloads(
         elif event.event_type in {
             WorkflowEventType.TMS_STATUS_LOOKUP.value,
             WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+            WorkflowEventType.TMS_STATUS_INGESTED.value,
         }:
             payloads[event.shipment_id] = {
                 "last_known_status": payload.get("status"),
                 "last_known_eta": payload.get("eta"),
                 "last_known_location": payload.get("location"),
-                "last_status_source": "tms_lookup",
+                "last_status_source": "tms_inbound_sync" if event.event_type == WorkflowEventType.TMS_STATUS_INGESTED.value else "tms_lookup",
                 "last_status_event_at": event.created_at,
             }
     return payloads
@@ -471,6 +570,92 @@ async def _latest_status_review_payloads(
     return payloads
 
 
+async def _latest_tms_identity_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id.in_(shipment_ids),
+            WorkflowEvent.event_type.in_(
+                [
+                    WorkflowEventType.TMS_HANDOFF_SENT.value,
+                    WorkflowEventType.TMS_STATUS_INGESTED.value,
+                ]
+            ),
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        current = payloads.setdefault(event.shipment_id, {})
+        payload = dict(event.payload_json or {})
+        response_payload = dict(payload.get("response", {}) or {})
+        request_payload = dict(payload.get("payload", {}) or {})
+        if "tms_load_id" not in current:
+            tms_load_id = (
+                payload.get("tms_load_id")
+                or response_payload.get("tms_load_id")
+                or response_payload.get("load_id")
+                or response_payload.get("id")
+                or payload.get("external_load_ref")
+            )
+            if tms_load_id:
+                current["tms_load_id"] = str(tms_load_id)
+        if "tms_system" not in current:
+            tms_system = payload.get("tms_system") or response_payload.get("tms_system") or request_payload.get("tms_system")
+            if tms_system:
+                current["tms_system"] = str(tms_system)
+    return payloads
+
+
+async def _status_workflow_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.shipment_id.in_(shipment_ids))
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        if event.shipment_id in payloads:
+            continue
+        payload = dict(event.payload_json or {})
+        state = None
+        if event.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value:
+            state = payload.get("resolution_state") or "resolved"
+        elif event.event_type == WorkflowEventType.EXCEPTION_RAISED.value and payload.get("reason") in {
+            "lookup_failed",
+            "reply_send_failed",
+            "tms_push_failed",
+            "identity_resolution_failed",
+        }:
+            state = "failed"
+        elif event.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value:
+            state = "status_reply_drafted" if payload.get("dry_run") else "status_reply_sent"
+        elif event.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value:
+            audit_kind = str(payload.get("status_audit_kind") or "")
+            if audit_kind == "carrier_update_parsed":
+                state = "carrier_update_parsed"
+            elif audit_kind == "carrier_update_pushed":
+                state = "carrier_update_pushed"
+        elif event.event_type == WorkflowEventType.TMS_STATUS_INGESTED.value:
+            state = "tms_inbound_sync"
+        elif event.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value and "status" in str(payload.get("review_type") or ""):
+            state = "awaiting_status_review"
+        if state is None:
+            continue
+        payloads[event.shipment_id] = {"status_workflow_state": state}
+    return payloads
+
+
 def _status_event_cutoff(*, now: datetime) -> datetime:
     return now - timedelta(hours=settings.status_sla_hours_default)
 
@@ -486,6 +671,23 @@ def _is_status_stale(
     if last_status_event_at is None:
         return True
     return last_status_event_at < _status_event_cutoff(now=now)
+
+
+def _status_sync_health(
+    *,
+    status_stale: bool,
+    status_review_required: bool,
+    status_workflow_state: str | None,
+) -> str:
+    if status_stale:
+        return "stale"
+    if status_workflow_state == "failed":
+        return "failed"
+    if status_review_required:
+        return "review_required"
+    if status_workflow_state in {"status_reply_drafted", "carrier_update_parsed", "awaiting_status_review"}:
+        return "attention_needed"
+    return "healthy"
 
 
 async def _status_metrics_summary(session: AsyncSession) -> FreightStatusMetrics:
@@ -535,6 +737,413 @@ async def _status_metrics_summary(session: AsyncSession) -> FreightStatusMetrics
     return metrics
 
 
+def _latest_status_snapshot(status_payload: dict | None) -> dict:
+    status_payload = status_payload or {}
+    return {
+        "status": status_payload.get("last_known_status"),
+        "eta": status_payload.get("last_known_eta"),
+        "location": status_payload.get("last_known_location"),
+        "source": status_payload.get("last_status_source"),
+        "event_at": status_payload.get("last_status_event_at").isoformat() if status_payload.get("last_status_event_at") else None,
+    }
+
+
+def _status_task_state_from_resolution(*, task_type: str, resolution_state: str | None) -> str:
+    if resolution_state == "sent":
+        return "sent"
+    if resolution_state == "pushed":
+        return "pushed"
+    if resolution_state == "dismissed":
+        return "dismissed"
+    if resolution_state == "resolved_no_send":
+        return "resolved_no_send"
+    if resolution_state == "resolved_no_push":
+        return "resolved_no_push"
+    if resolution_state == "failed":
+        return "failed"
+    return "resolved" if task_type == "status_reply" else "pushed"
+
+
+def _resolution_reason_label(reason: str | None) -> str | None:
+    if not reason:
+        return None
+    return str(reason)
+
+
+async def _record_status_task_resolution(
+    session: AsyncSession,
+    *,
+    shipment: Shipment,
+    task_type: str,
+    resolution_state: str,
+    resolution_reason: str,
+    source_task_id: str | None = None,
+    source: str | None = None,
+) -> None:
+    session.add(
+        WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
+            stage=shipment.status,
+            payload_json={
+                "task_type": task_type,
+                "resolution_state": resolution_state,
+                "resolution_reason": resolution_reason,
+                "source_task_id": source_task_id,
+                "source": source,
+            },
+        )
+    )
+
+
+def _build_status_queue_item(
+    *,
+    event: WorkflowEvent,
+    shipment: Shipment,
+    status_payload: dict | None,
+    tms_identity_payload: dict | None,
+    workflow_payload: dict | None,
+) -> StatusQueueItem | None:
+    payload = dict(event.payload_json or {})
+    status_payload = status_payload or {}
+    tms_identity_payload = tms_identity_payload or {}
+    workflow_payload = workflow_payload or {}
+    task_type: str | None = None
+    task_state: str | None = None
+    reason = str(payload.get("reason", ""))
+    structured_payload: dict = {}
+    draft_subject: str | None = None
+    draft_body: str | None = None
+    last_failure: str | None = None
+    alert_label: str | None = None
+    recommended_next_action = payload.get("next_action")
+    review_type = payload.get("review_type")
+    ambiguity_reasons = list(payload.get("ambiguity_reasons", []) or [])
+    source_email_id = payload.get("source_email_id")
+
+    if event.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value and payload.get("dry_run"):
+        task_type = "status_reply"
+        task_state = "draft_ready"
+        draft_subject = payload.get("subject")
+        draft_body = payload.get("body")
+        structured_payload = {"custom_message": payload.get("custom_message")}
+        alert_label = "Reply draft ready"
+        recommended_next_action = "approve_and_send"
+    elif event.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value and payload.get("status_audit_kind") == "carrier_update_parsed":
+        task_type = "carrier_update"
+        task_state = "awaiting_review"
+        structured_payload = dict(payload.get("payload", {}) or {})
+        alert_label = "Carrier update review"
+        recommended_next_action = "approve_and_push"
+    elif event.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value and "status" in str(review_type or ""):
+        task_type = _status_queue_task_type(str(review_type))
+        task_state = "awaiting_approval" if task_type == "status_reply" else "awaiting_review"
+        structured_payload = dict(payload.get("structured_payload", {}) or {})
+        draft_subject = structured_payload.get("draft_subject") if task_type == "status_reply" else None
+        draft_body = structured_payload.get("draft_body") if task_type == "status_reply" else None
+        alert_label = "Status review required"
+    elif event.event_type == WorkflowEventType.EXCEPTION_RAISED.value and payload.get("reason") in {
+        "lookup_failed",
+        "reply_send_failed",
+        "tms_push_failed",
+        "identity_resolution_failed",
+    }:
+        task_type = "status_reply" if payload.get("reason") in {"lookup_failed", "reply_send_failed"} else "carrier_update"
+        task_state = "failed"
+        last_failure = str(payload.get("message") or payload.get("reason"))
+        structured_payload = dict(payload.get("payload", {}) or {})
+        alert_label = "Status sync failed"
+        recommended_next_action = "retry_push" if task_type == "carrier_update" else "rebuild_draft"
+    if task_type is None or task_state is None:
+        return None
+
+    priority = "critical" if _is_status_stale(
+        shipment_status=shipment.status,
+        last_status_event_at=status_payload.get("last_status_event_at"),
+        now=datetime.now(timezone.utc),
+    ) else "high" if task_state in {"failed", "awaiting_review", "awaiting_approval"} else "normal"
+
+    return StatusQueueItem(
+        task_id=str(event.id),
+        task_type=task_type,
+        task_state=task_state,
+        queue_scope="active",
+        resolution_state=None,
+        resolution_reason=None,
+        resolution_at=None,
+        shipment_id=str(shipment.id),
+        email_thread_id=str(shipment.email_thread_id) if shipment.email_thread_id else None,
+        source_email_id=str(source_email_id) if source_email_id else None,
+        priority=priority,
+        alert_label=alert_label,
+        reason=reason,
+        recommended_next_action=str(recommended_next_action) if recommended_next_action else None,
+        review_type=str(review_type) if review_type else None,
+        ambiguity_reasons=ambiguity_reasons,
+        latest_status_snapshot=_latest_status_snapshot(status_payload),
+        draft_subject=draft_subject,
+        draft_body=draft_body,
+        structured_payload=structured_payload,
+        last_failure=last_failure,
+        tms_load_id=tms_identity_payload.get("tms_load_id"),
+        tms_system=tms_identity_payload.get("tms_system"),
+        status_sync_health=_status_sync_health(
+            status_stale=_is_status_stale(
+                shipment_status=shipment.status,
+                last_status_event_at=status_payload.get("last_status_event_at"),
+                now=datetime.now(timezone.utc),
+            ),
+            status_review_required="status" in str(review_type or ""),
+            status_workflow_state=workflow_payload.get("status_workflow_state"),
+        ),
+        created_at=event.created_at,
+    )
+
+
+def _build_resolved_status_queue_item(
+    *,
+    resolution_event: WorkflowEvent,
+    shipment: Shipment,
+    source_event: WorkflowEvent | None,
+    status_payload: dict | None,
+    tms_identity_payload: dict | None,
+) -> StatusQueueItem | None:
+    resolution_payload = dict(resolution_event.payload_json or {})
+    task_type = str(resolution_payload.get("task_type") or "")
+    if not task_type:
+        return None
+
+    if source_event is not None:
+        source_item = _build_status_queue_item(
+            event=source_event,
+            shipment=shipment,
+            status_payload=status_payload,
+            tms_identity_payload=tms_identity_payload,
+            workflow_payload={},
+        )
+        if source_item is not None:
+            return source_item.model_copy(
+                update={
+                    "task_state": _status_task_state_from_resolution(
+                        task_type=task_type,
+                        resolution_state=resolution_payload.get("resolution_state"),
+                    ),
+                    "queue_scope": "resolved",
+                    "resolution_state": resolution_payload.get("resolution_state"),
+                    "resolution_reason": _resolution_reason_label(resolution_payload.get("resolution_reason")),
+                    "resolution_at": resolution_event.created_at,
+                }
+            )
+
+    return StatusQueueItem(
+        task_id=str(resolution_event.id),
+        task_type=task_type,
+        task_state=_status_task_state_from_resolution(
+            task_type=task_type,
+            resolution_state=resolution_payload.get("resolution_state"),
+        ),
+        queue_scope="resolved",
+        resolution_state=resolution_payload.get("resolution_state"),
+        resolution_reason=_resolution_reason_label(resolution_payload.get("resolution_reason")),
+        resolution_at=resolution_event.created_at,
+        shipment_id=str(shipment.id),
+        email_thread_id=str(shipment.email_thread_id) if shipment.email_thread_id else None,
+        source_email_id=str(resolution_payload.get("source_email_id")) if resolution_payload.get("source_email_id") else None,
+        priority="normal",
+        alert_label="Resolved status task",
+        reason="Resolved status task",
+        recommended_next_action=None,
+        review_type=None,
+        ambiguity_reasons=[],
+        latest_status_snapshot=_latest_status_snapshot(status_payload),
+        draft_subject=None,
+        draft_body=None,
+        structured_payload={},
+        last_failure=None,
+        tms_load_id=(tms_identity_payload or {}).get("tms_load_id"),
+        tms_system=(tms_identity_payload or {}).get("tms_system"),
+        status_sync_health=_status_sync_health(
+            status_stale=_is_status_stale(
+                shipment_status=shipment.status,
+                last_status_event_at=(status_payload or {}).get("last_status_event_at"),
+                now=datetime.now(timezone.utc),
+            ),
+            status_review_required=False,
+            status_workflow_state=resolution_payload.get("resolution_state"),
+        ),
+        created_at=source_event.created_at if source_event is not None else resolution_event.created_at,
+    )
+
+
+async def _active_status_queue_items(session: AsyncSession) -> list[StatusQueueItem]:
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.event_type.in_(
+                [
+                    WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+                    WorkflowEventType.TMS_STATUS_UPDATED.value,
+                    WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+                    WorkflowEventType.EXCEPTION_RAISED.value,
+                    WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
+                ]
+            )
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    events = list(result.scalars().all())
+    shipment_ids = list({event.shipment_id for event in events})
+    shipments_by_id: dict[UUID, Shipment] = {}
+    if shipment_ids:
+        shipment_result = await session.execute(select(Shipment).where(Shipment.id.in_(shipment_ids)))
+        shipments_by_id = {shipment.id: shipment for shipment in shipment_result.scalars().all()}
+    status_payloads = await _latest_status_payloads(session, shipment_ids)
+    tms_identity_payloads = await _latest_tms_identity_payloads(session, shipment_ids)
+    workflow_payloads = await _status_workflow_payloads(session, shipment_ids)
+    resolved: set[tuple[UUID, str]] = set()
+    items: list[StatusQueueItem] = []
+    seen: set[tuple[UUID, str]] = set()
+
+    for event in events:
+        payload = dict(event.payload_json or {})
+        if event.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value:
+            task_type = str(payload.get("task_type") or "")
+            if task_type:
+                resolved.add((event.shipment_id, task_type))
+            continue
+        if event.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value and not payload.get("dry_run"):
+            resolved.add((event.shipment_id, "status_reply"))
+            continue
+        if event.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value and payload.get("status_audit_kind") == "carrier_update_pushed":
+            resolved.add((event.shipment_id, "carrier_update"))
+            continue
+
+        shipment = shipments_by_id.get(event.shipment_id)
+        if shipment is None:
+            continue
+        item = _build_status_queue_item(
+            event=event,
+            shipment=shipment,
+            status_payload=status_payloads.get(event.shipment_id),
+            tms_identity_payload=tms_identity_payloads.get(event.shipment_id),
+            workflow_payload=workflow_payloads.get(event.shipment_id),
+        )
+        if item is None:
+            continue
+        key = (event.shipment_id, item.task_type)
+        if key in resolved or key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+
+    return sorted(items, key=_status_queue_priority)
+
+
+async def _resolved_status_queue_items(session: AsyncSession, *, limit: int = 25) -> list[StatusQueueItem]:
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value)
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    resolution_events = list(result.scalars().all())
+    if not resolution_events:
+        return []
+
+    shipment_ids = list({event.shipment_id for event in resolution_events})
+    shipment_result = await session.execute(select(Shipment).where(Shipment.id.in_(shipment_ids)))
+    shipments_by_id = {shipment.id: shipment for shipment in shipment_result.scalars().all()}
+    status_payloads = await _latest_status_payloads(session, shipment_ids)
+    tms_identity_payloads = await _latest_tms_identity_payloads(session, shipment_ids)
+
+    source_task_ids = {
+        UUID(source_task_id)
+        for event in resolution_events
+        for source_task_id in [dict(event.payload_json or {}).get("source_task_id")]
+        if isinstance(source_task_id, str)
+    }
+    source_events_by_id: dict[UUID, WorkflowEvent] = {}
+    if source_task_ids:
+        source_result = await session.execute(select(WorkflowEvent).where(WorkflowEvent.id.in_(source_task_ids)))
+        source_events_by_id = {event.id: event for event in source_result.scalars().all()}
+
+    items: list[StatusQueueItem] = []
+    seen: set[tuple[UUID, str, str | None]] = set()
+    for resolution_event in resolution_events:
+        payload = dict(resolution_event.payload_json or {})
+        shipment = shipments_by_id.get(resolution_event.shipment_id)
+        if shipment is None:
+            continue
+        task_type = str(payload.get("task_type") or "")
+        key = (resolution_event.shipment_id, task_type, str(payload.get("source_task_id") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        source_event = None
+        source_task_id = payload.get("source_task_id")
+        if isinstance(source_task_id, str):
+            try:
+                source_event = source_events_by_id.get(UUID(source_task_id))
+            except ValueError:
+                source_event = None
+        item = _build_resolved_status_queue_item(
+            resolution_event=resolution_event,
+            shipment=shipment,
+            source_event=source_event,
+            status_payload=status_payloads.get(resolution_event.shipment_id),
+            tms_identity_payload=tms_identity_payloads.get(resolution_event.shipment_id),
+        )
+        if item is not None:
+            items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+async def _latest_status_resolution(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    task_type: str,
+) -> WorkflowEvent | None:
+    return await session.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment_id,
+            WorkflowEvent.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
+            WorkflowEvent.payload_json["task_type"].as_string() == task_type,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+
+
+async def _is_task_already_resolved(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    task_type: str,
+    resolution_state: str,
+    source_task_id: str | None = None,
+) -> bool:
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment_id,
+            WorkflowEvent.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    for event in result.scalars().all():
+        payload = dict(event.payload_json or {})
+        if payload.get("task_type") != task_type:
+            continue
+        if payload.get("resolution_state") != resolution_state:
+            continue
+        if source_task_id is not None and payload.get("source_task_id") not in {None, source_task_id}:
+            continue
+        return True
+    return False
+
+
 async def _attachment_counts(
     session: AsyncSession,
     shipments: list[Shipment],
@@ -566,12 +1175,127 @@ async def _attachment_counts(
 async def _document_booking_summaries(
     session: AsyncSession,
     shipments: list[Shipment],
+    action_payloads: dict[UUID, dict] | None = None,
 ) -> dict[UUID, dict]:
     summaries: dict[UUID, dict] = {}
     for shipment in shipments:
         attachments = await collect_shipment_attachments(session, shipment)
-        summaries[shipment.id] = summarize_booking_documents(attachments)
+        action_payload = (action_payloads or {}).get(shipment.id) or {}
+        summaries[shipment.id] = build_document_health(
+            attachments,
+            shipment,
+            approved_fields=dict(action_payload.get("approved_fields", {}) or {}),
+            warning_ignored=bool(action_payload.get("warning_ignored", False)),
+        )
     return summaries
+
+
+async def _latest_document_action_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id.in_(shipment_ids),
+            WorkflowEvent.event_type.in_(
+                [
+                    WorkflowEventType.DOCUMENT_VALUES_APPROVED.value,
+                    WorkflowEventType.DOCUMENT_WARNING_IGNORED.value,
+                ]
+            ),
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        current = payloads.setdefault(event.shipment_id, {})
+        payload = dict(event.payload_json or {})
+        if event.event_type == WorkflowEventType.DOCUMENT_VALUES_APPROVED.value and "approved_fields" not in current:
+            current["approved_fields"] = dict(payload.get("approved_fields", {}) or {})
+        if event.event_type == WorkflowEventType.DOCUMENT_WARNING_IGNORED.value and "warning_ignored" not in current:
+            current["warning_ignored"] = True
+    return payloads
+
+
+async def _collect_document_state(
+    session: AsyncSession,
+    shipment: Shipment,
+    *,
+    force_reprocess: bool = False,
+) -> tuple[list[dict], dict, dict]:
+    attachments = await collect_shipment_attachments(
+        session,
+        shipment,
+        force_reprocess=force_reprocess,
+    )
+    action_payload = (await _latest_document_action_payloads(session, [shipment.id])).get(shipment.id) or {}
+    document_health = build_document_health(
+        attachments,
+        shipment,
+        approved_fields=dict(action_payload.get("approved_fields", {}) or {}),
+        warning_ignored=bool(action_payload.get("warning_ignored", False)),
+    )
+    document_context = build_document_context(attachments)
+    return attachments, document_health, document_context
+
+
+def _document_review_type(document_health: dict) -> str:
+    if document_health.get("document_conflict_count", 0):
+        return "document_conflict_review"
+    if document_health.get("ocr_pending_count", 0):
+        return "ocr_review_required"
+    return "document_parse_low_confidence"
+
+
+async def _persist_document_analysis_events(
+    session: AsyncSession,
+    shipment: Shipment,
+    *,
+    document_health: dict,
+    document_context: dict,
+    event_type: WorkflowEventType = WorkflowEventType.DOCUMENT_ANALYZED,
+) -> None:
+    session.add(
+        WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=event_type.value,
+            stage=shipment.status,
+            payload_json={
+                "attachment_count": document_health.get("attachment_count", 0),
+                "document_summary": dict(document_health.get("document_summary", {}) or {}),
+                "document_enrichment": dict(document_health.get("document_enrichment", {}) or {}),
+                "document_health_status": document_health.get("document_health_status"),
+                "ocr_pending_count": document_health.get("ocr_pending_count", 0),
+                "document_conflict_count": document_health.get("document_conflict_count", 0),
+                "document_conflict_fields": list(document_health.get("document_conflict_fields", []) or []),
+                "missing_document_types": list(document_health.get("missing_document_types", []) or []),
+                "booking_review_warning": document_health.get("booking_review_warning"),
+                "booking_review_required": bool(document_health.get("booking_review_required", False)),
+                "review_required": bool(document_health.get("review_required", False)),
+                "document_extracts": list(document_context.get("document_extracts", []) or []),
+            },
+        )
+    )
+    if document_health.get("review_required"):
+        session.add(
+            WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+                stage=shipment.status,
+                payload_json={
+                    "review_type": _document_review_type(document_health),
+                    "reason": document_health.get("booking_review_warning")
+                    or "Document extraction requires operator review.",
+                    "next_action": "review_documents",
+                    "missing_document_types": list(document_health.get("missing_document_types", []) or []),
+                    "document_conflict_fields": list(document_health.get("document_conflict_fields", []) or []),
+                    "booking_review_warning": document_health.get("booking_review_warning"),
+                },
+            )
+        )
 
 
 @router.get("/freight/foundation", response_model=FreightFoundationResponse)
@@ -737,8 +1461,11 @@ async def list_shipments(session: AsyncSession = Depends(get_session)) -> list[S
     booking_payloads = await _latest_booking_payloads(session, [shipment.id for shipment in shipments])
     status_payloads = await _latest_status_payloads(session, [shipment.id for shipment in shipments])
     status_review_payloads = await _latest_status_review_payloads(session, [shipment.id for shipment in shipments])
+    tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id for shipment in shipments])
+    status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id for shipment in shipments])
+    document_action_payloads = await _latest_document_action_payloads(session, [shipment.id for shipment in shipments])
     attachment_counts = await _attachment_counts(session, shipments)
-    document_summaries = await _document_booking_summaries(session, shipments)
+    document_summaries = await _document_booking_summaries(session, shipments, document_action_payloads)
     now = datetime.now(timezone.utc)
     return [
         _serialize_shipment(
@@ -748,15 +1475,30 @@ async def list_shipments(session: AsyncSession = Depends(get_session)) -> list[S
                 **(booking_payloads.get(shipment.id) or {}),
                 **(status_payloads.get(shipment.id) or {}),
                 **(status_review_payloads.get(shipment.id) or {}),
+                **(tms_identity_payloads.get(shipment.id) or {}),
+                **(status_workflow_payloads.get(shipment.id) or {}),
                 "attachment_count": attachment_counts.get(shipment.id, 0),
                 "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
+                "document_enrichment": document_summaries.get(shipment.id, {}).get("document_enrichment", {}),
+                "document_health_status": document_summaries.get(shipment.id, {}).get("document_health_status"),
+                "ocr_pending_count": document_summaries.get(shipment.id, {}).get("ocr_pending_count", 0),
+                "document_conflict_count": document_summaries.get(shipment.id, {}).get("document_conflict_count", 0),
                 "missing_document_types": document_summaries.get(shipment.id, {}).get("missing_document_types", []),
                 "booking_review_warning": document_summaries.get(shipment.id, {}).get("booking_review_warning"),
-                "booking_review_required": document_summaries.get(shipment.id, {}).get("booking_review_required", False),
+                "booking_review_required": document_summaries.get(shipment.id, {}).get("review_required", False),
                 "status_stale": _is_status_stale(
                     shipment_status=shipment.status,
                     last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
                     now=now,
+                ),
+                "status_sync_health": _status_sync_health(
+                    status_stale=_is_status_stale(
+                        shipment_status=shipment.status,
+                        last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
+                        now=now,
+                    ),
+                    status_review_required=bool((status_review_payloads.get(shipment.id) or {}).get("status_review_required", False)),
+                    status_workflow_state=(status_workflow_payloads.get(shipment.id) or {}).get("status_workflow_state"),
                 ),
                 "status_sla_hours": settings.status_sla_hours_default,
             },
@@ -809,8 +1551,11 @@ async def get_shipment(
     booking_payloads = await _latest_booking_payloads(session, [shipment.id])
     status_payloads = await _latest_status_payloads(session, [shipment.id])
     status_review_payloads = await _latest_status_review_payloads(session, [shipment.id])
+    tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id])
+    status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id])
+    document_action_payloads = await _latest_document_action_payloads(session, [shipment.id])
     attachment_counts = await _attachment_counts(session, [shipment])
-    document_summaries = await _document_booking_summaries(session, [shipment])
+    document_summaries = await _document_booking_summaries(session, [shipment], document_action_payloads)
     now = datetime.now(timezone.utc)
     return _serialize_shipment(
         shipment,
@@ -819,15 +1564,30 @@ async def get_shipment(
             **(booking_payloads.get(shipment.id) or {}),
             **(status_payloads.get(shipment.id) or {}),
             **(status_review_payloads.get(shipment.id) or {}),
+            **(tms_identity_payloads.get(shipment.id) or {}),
+            **(status_workflow_payloads.get(shipment.id) or {}),
             "attachment_count": attachment_counts.get(shipment.id, 0),
             "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
+            "document_enrichment": document_summaries.get(shipment.id, {}).get("document_enrichment", {}),
+            "document_health_status": document_summaries.get(shipment.id, {}).get("document_health_status"),
+            "ocr_pending_count": document_summaries.get(shipment.id, {}).get("ocr_pending_count", 0),
+            "document_conflict_count": document_summaries.get(shipment.id, {}).get("document_conflict_count", 0),
             "missing_document_types": document_summaries.get(shipment.id, {}).get("missing_document_types", []),
             "booking_review_warning": document_summaries.get(shipment.id, {}).get("booking_review_warning"),
-            "booking_review_required": document_summaries.get(shipment.id, {}).get("booking_review_required", False),
+            "booking_review_required": document_summaries.get(shipment.id, {}).get("review_required", False),
             "status_stale": _is_status_stale(
                 shipment_status=shipment.status,
                 last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
                 now=now,
+            ),
+            "status_sync_health": _status_sync_health(
+                status_stale=_is_status_stale(
+                    shipment_status=shipment.status,
+                    last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
+                    now=now,
+                ),
+                status_review_required=bool((status_review_payloads.get(shipment.id) or {}).get("status_review_required", False)),
+                status_workflow_state=(status_workflow_payloads.get(shipment.id) or {}).get("status_workflow_state"),
             ),
             "status_sla_hours": settings.status_sla_hours_default,
         },
@@ -896,7 +1656,367 @@ async def freight_review_queue(
         .order_by(WorkflowEvent.created_at.desc())
         .limit(50)
     )
-    return [_serialize_review_queue_item(event) for event in result.scalars().all()]
+    review_events = list(result.scalars().all())
+    shipment_ids = [event.shipment_id for event in review_events]
+    shipments_by_id: dict[UUID, Shipment] = {}
+    if shipment_ids:
+        shipment_result = await session.execute(select(Shipment).where(Shipment.id.in_(shipment_ids)))
+        shipments_by_id = {shipment.id: shipment for shipment in shipment_result.scalars().all()}
+    status_payloads = await _latest_status_payloads(session, shipment_ids)
+    items = [
+        _serialize_review_queue_item(
+            event,
+            shipment=shipments_by_id.get(event.shipment_id),
+            status_payload=status_payloads.get(event.shipment_id),
+        )
+        for event in review_events
+    ]
+    return sorted(items, key=_review_priority_score)
+
+
+@router.get("/freight/status-queue", response_model=list[StatusQueueItem])
+async def freight_status_queue(
+    include_resolved: bool = Query(default=False),
+    resolved_limit: int = Query(default=25, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> list[StatusQueueItem]:
+    """Return active operator tasks for Phase 3 status workflows."""
+    active_items = await _active_status_queue_items(session)
+    if not include_resolved:
+        return active_items
+    resolved_items = await _resolved_status_queue_items(session, limit=resolved_limit)
+    return [*active_items, *resolved_items]
+
+
+@router.post("/freight/status-queue/{task_id}/action", response_model=StatusQueueActionResponse)
+async def freight_status_queue_action(
+    task_id: UUID,
+    request: StatusQueueActionRequest,
+    session: AsyncSession = Depends(get_session),
+) -> StatusQueueActionResponse:
+    """Run an operator action on a status queue task."""
+    task_event = await session.get(WorkflowEvent, task_id)
+    if task_event is None:
+        raise HTTPException(status_code=404, detail="Status queue task not found.")
+    shipment = await session.get(Shipment, task_event.shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+
+    payload = dict(task_event.payload_json or {})
+    task_type = "status_reply" if task_event.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value else "carrier_update"
+    if task_event.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value:
+        task_type = _status_queue_task_type(str(payload.get("review_type"))) or task_type
+    if task_event.event_type == WorkflowEventType.EXCEPTION_RAISED.value and payload.get("reason") in {"lookup_failed", "reply_send_failed"}:
+        task_type = "status_reply"
+
+    try:
+        if request.action == StatusQueueAction.PREVIEW:
+            preview = payload if task_event.event_type != WorkflowEventType.MANUAL_REVIEW_REQUIRED.value else dict(payload.get("structured_payload", {}) or {})
+            return StatusQueueActionResponse(
+                task_id=str(task_id),
+                task_type=task_type,
+                action=request.action,
+                status="completed",
+                message="Task preview ready.",
+                task_state="preview",
+                resolution_reason=None,
+                shipment_id=str(shipment.id),
+                preview=preview,
+            )
+
+        if request.action == StatusQueueAction.DISMISS:
+            if await _is_task_already_resolved(
+                session,
+                shipment_id=shipment.id,
+                task_type=task_type,
+                resolution_state="dismissed",
+                source_task_id=str(task_id),
+            ):
+                return StatusQueueActionResponse(
+                    task_id=str(task_id),
+                    task_type=task_type,
+                    action=request.action,
+                    status="already_completed",
+                    message="Status task was already dismissed.",
+                    task_state="dismissed",
+                    resolution_state="dismissed",
+                    resolution_reason="dismissed_by_operator",
+                    shipment_id=str(shipment.id),
+                )
+            await _record_status_task_resolution(
+                session,
+                shipment=shipment,
+                task_type=task_type,
+                resolution_state="dismissed",
+                resolution_reason="dismissed_by_operator",
+                source_task_id=str(task_id),
+            )
+            await session.commit()
+            return StatusQueueActionResponse(
+                task_id=str(task_id),
+                task_type=task_type,
+                action=request.action,
+                status="completed",
+                message="Status task dismissed.",
+                task_state="dismissed",
+                resolution_state="dismissed",
+                resolution_reason="dismissed_by_operator",
+                shipment_id=str(shipment.id),
+            )
+
+        if task_type == "status_reply":
+            status_response = await fetch_tms_shipment_status(session, shipment_id=shipment.id)
+            if request.action == StatusQueueAction.REBUILD_DRAFT:
+                draft = await send_customer_status_reply(
+                    session,
+                    shipment_id=shipment.id,
+                    status_payload=status_response.payload,
+                    dry_run=True,
+                    custom_message=request.custom_message,
+                    subject_override=request.draft_subject,
+                    body_override=request.draft_body,
+                )
+                return StatusQueueActionResponse(
+                    task_id=str(task_id),
+                    task_type=task_type,
+                    action=request.action,
+                    status="completed",
+                    message="Status reply draft rebuilt.",
+                    task_state="draft_ready",
+                    resolution_reason=None,
+                    shipment_id=str(shipment.id),
+                    preview=draft.model_dump(),
+                )
+            if request.action == StatusQueueAction.APPROVE_AND_SEND:
+                if await _is_task_already_resolved(
+                    session,
+                    shipment_id=shipment.id,
+                    task_type=task_type,
+                    resolution_state="sent",
+                    source_task_id=str(task_id),
+                ):
+                    return StatusQueueActionResponse(
+                        task_id=str(task_id),
+                        task_type=task_type,
+                        action=request.action,
+                        status="already_completed",
+                        message="Status reply was already sent for this task.",
+                        task_state="sent",
+                        resolution_state="sent",
+                        resolution_reason="sent_to_customer",
+                        shipment_id=str(shipment.id),
+                    )
+                reply = await send_customer_status_reply(
+                    session,
+                    shipment_id=shipment.id,
+                    status_payload=status_response.payload,
+                    dry_run=False,
+                    custom_message=request.custom_message,
+                    subject_override=request.draft_subject,
+                    body_override=request.draft_body,
+                )
+                await _record_status_task_resolution(
+                    session,
+                    shipment=shipment,
+                    task_type=task_type,
+                    resolution_state="sent",
+                    resolution_reason="sent_to_customer",
+                    source_task_id=str(task_id),
+                )
+                await session.commit()
+                return StatusQueueActionResponse(
+                    task_id=str(task_id),
+                    task_type=task_type,
+                    action=request.action,
+                    status="completed",
+                    message=f"Status reply sent to {reply.client_email}.",
+                    task_state="sent",
+                    resolution_state="sent",
+                    resolution_reason="sent_to_customer",
+                    shipment_id=str(shipment.id),
+                    preview=reply.model_dump(),
+                )
+
+        if task_type == "carrier_update":
+            preview_or_response = await preview_or_push_carrier_status_update(
+                session,
+                shipment_id=shipment.id,
+                status_text=request.status_text or payload.get("status_text") or dict(payload.get("payload", {}) or {}).get("status_text"),
+                eta_text=request.eta_text or payload.get("eta_text") or dict(payload.get("payload", {}) or {}).get("eta_text"),
+                location_text=request.location_text or payload.get("location_text") or dict(payload.get("payload", {}) or {}).get("location_text"),
+                notes=request.notes or payload.get("notes") or dict(payload.get("payload", {}) or {}).get("notes"),
+                dry_run=request.action == StatusQueueAction.PREVIEW,
+            )
+            if request.action == StatusQueueAction.PREVIEW:
+                return StatusQueueActionResponse(
+                    task_id=str(task_id),
+                    task_type=task_type,
+                    action=request.action,
+                    status="completed",
+                    message="Carrier update preview ready.",
+                    task_state="awaiting_review",
+                    resolution_reason=None,
+                    shipment_id=str(shipment.id),
+                    preview=preview_or_response.model_dump(),
+                )
+            if request.action in {StatusQueueAction.APPROVE_AND_PUSH, StatusQueueAction.RETRY_PUSH}:
+                if request.action == StatusQueueAction.APPROVE_AND_PUSH and await _is_task_already_resolved(
+                    session,
+                    shipment_id=shipment.id,
+                    task_type=task_type,
+                    resolution_state="pushed",
+                    source_task_id=str(task_id),
+                ):
+                    return StatusQueueActionResponse(
+                        task_id=str(task_id),
+                        task_type=task_type,
+                        action=request.action,
+                        status="already_completed",
+                        message="Carrier status update was already pushed for this task.",
+                        task_state="pushed",
+                        resolution_state="pushed",
+                        resolution_reason="pushed_to_tms",
+                        shipment_id=str(shipment.id),
+                    )
+                await _record_status_task_resolution(
+                    session,
+                    shipment=shipment,
+                    task_type=task_type,
+                    resolution_state="pushed",
+                    resolution_reason="pushed_to_tms",
+                    source_task_id=str(task_id),
+                )
+                await session.commit()
+                return StatusQueueActionResponse(
+                    task_id=str(task_id),
+                    task_type=task_type,
+                    action=request.action,
+                    status="completed",
+                    message="Carrier status update pushed to TMS.",
+                    task_state="pushed",
+                    resolution_state="pushed",
+                    resolution_reason="pushed_to_tms",
+                    shipment_id=str(shipment.id),
+                    preview=preview_or_response.model_dump(),
+                )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    raise HTTPException(status_code=400, detail="Unsupported status queue action.")
+
+
+@router.post("/freight/tms/status-event", response_model=TmsStatusIngestResponse)
+async def freight_tms_status_event(
+    request: TmsStatusIngestRequest,
+    session: AsyncSession = Depends(get_session),
+) -> TmsStatusIngestResponse:
+    """Ingest an inbound TMS status event and reconcile it to a shipment."""
+    shipment: Shipment | None = None
+    if request.shipment_id:
+        shipment = await session.get(Shipment, UUID(request.shipment_id))
+    if shipment is None and request.quote_token:
+        shipment = await session.scalar(select(Shipment).where(Shipment.quote_token == request.quote_token))
+    if shipment is None and request.external_load_ref:
+        shipment = await session.scalar(select(Shipment).where(Shipment.quote_token == request.external_load_ref))
+    if shipment is None and request.tms_load_id:
+        shipment_result = await session.execute(select(Shipment))
+        for candidate in shipment_result.scalars().all():
+            identity_payload = (await _latest_tms_identity_payloads(session, [candidate.id])).get(candidate.id) or {}
+            if str(identity_payload.get("tms_load_id") or "") == request.tms_load_id:
+                shipment = candidate
+                break
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found for inbound TMS status event.")
+
+    existing_ingest_result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment.id,
+            WorkflowEvent.event_type == WorkflowEventType.TMS_STATUS_INGESTED.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    for existing in existing_ingest_result.scalars().all():
+        existing_payload = dict(existing.payload_json or {})
+        if request.external_event_id and existing_payload.get("external_event_id") == request.external_event_id:
+            return TmsStatusIngestResponse(
+                shipment_id=str(shipment.id),
+                status="already_processed",
+                event_type=WorkflowEventType.TMS_STATUS_INGESTED.value,
+                tms_load_id=request.tms_load_id,
+            )
+        comparable_existing = (
+            existing_payload.get("tms_load_id"),
+            existing_payload.get("status"),
+            existing_payload.get("eta"),
+            existing_payload.get("location"),
+            existing_payload.get("milestone"),
+            existing_payload.get("source_timestamp"),
+        )
+        comparable_incoming = (
+            request.tms_load_id,
+            request.status,
+            request.eta,
+            request.location,
+            request.milestone,
+            request.source_timestamp.isoformat() if request.source_timestamp else None,
+        )
+        if comparable_existing == comparable_incoming and any(comparable_incoming):
+            return TmsStatusIngestResponse(
+                shipment_id=str(shipment.id),
+                status="already_processed",
+                event_type=WorkflowEventType.TMS_STATUS_INGESTED.value,
+                tms_load_id=request.tms_load_id,
+            )
+
+    session.add(
+        WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.TMS_STATUS_INGESTED.value,
+            stage=shipment.status,
+            payload_json={
+                "external_event_id": request.external_event_id,
+                "tms_load_id": request.tms_load_id,
+                "external_load_ref": request.external_load_ref,
+                "tms_system": request.tms_system,
+                "status": request.status,
+                "eta": request.eta,
+                "location": request.location,
+                "milestone": request.milestone,
+                "source_timestamp": request.source_timestamp.isoformat() if request.source_timestamp else None,
+                "status_audit_kind": "tms_inbound_sync",
+                "status_label": request.status or "Unknown",
+                "eta_label": request.eta or "Not available",
+                "location_label": request.location or "Not available",
+                "milestone_label": request.milestone or "Not available",
+                "status_source": "tms_inbound_sync",
+                "payload": request.payload,
+            },
+        )
+    )
+    await _record_status_task_resolution(
+        session,
+        shipment=shipment,
+        task_type="carrier_update",
+        resolution_state="resolved_no_push",
+        resolution_reason="superseded_by_newer_snapshot",
+        source="tms_inbound_sync",
+    )
+    await _record_status_task_resolution(
+        session,
+        shipment=shipment,
+        task_type="status_reply",
+        resolution_state="resolved_no_send",
+        resolution_reason="superseded_by_newer_snapshot",
+        source="tms_inbound_sync",
+    )
+    await session.commit()
+    return TmsStatusIngestResponse(
+        shipment_id=str(shipment.id),
+        status="ingested",
+        event_type=WorkflowEventType.TMS_STATUS_INGESTED.value,
+        tms_load_id=request.tms_load_id,
+    )
 
 
 @router.post(
@@ -1084,6 +2204,104 @@ async def freight_operator_action(
                     status_reply_sent=True,
                 ),
             )
+
+        if request.action == OperatorAction.RERUN_DOCUMENT_EXTRACTION:
+            _attachments, document_health, document_context = await _collect_document_state(
+                session,
+                shipment,
+                force_reprocess=True,
+            )
+            await _persist_document_analysis_events(
+                session,
+                shipment,
+                document_health=document_health,
+                document_context=document_context,
+            )
+            await session.commit()
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message=(
+                    f"Document extraction re-run for {document_health.get('attachment_count', 0)} attachment(s); "
+                    f"health is {str(document_health.get('document_health_status') or 'unknown').replace('_', ' ')}."
+                ),
+                next_action="document_analysis_completed",
+                manual_review_required=bool(document_health.get("review_required", False)),
+            )
+
+        if request.action == OperatorAction.APPROVE_DOCUMENT_VALUES:
+            _attachments, document_health, document_context = await _collect_document_state(session, shipment)
+            approved_fields = dict(document_health.get("document_enrichment", {}) or {})
+            session.add(
+                WorkflowEvent(
+                    shipment_id=shipment.id,
+                    event_type=WorkflowEventType.DOCUMENT_VALUES_APPROVED.value,
+                    stage=shipment.status,
+                    payload_json={
+                        "approved_fields": approved_fields,
+                        "document_health_status": document_health.get("document_health_status"),
+                    },
+                )
+            )
+            await _persist_document_analysis_events(
+                session,
+                shipment,
+                document_health=build_document_health(
+                    _attachments,
+                    shipment,
+                    approved_fields=approved_fields,
+                    warning_ignored=bool(document_health.get("warning_ignored", False)),
+                ),
+                document_context=document_context,
+            )
+            await session.commit()
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message=(
+                    f"Approved {len(approved_fields)} document-derived value(s) for shipment enrichment."
+                    if approved_fields
+                    else "Document review marked approved; no extracted enrichment values were available."
+                ),
+                next_action="document_values_approved",
+                manual_review_required=False,
+            )
+
+        if request.action == OperatorAction.IGNORE_DOCUMENT_WARNING:
+            _attachments, document_health, document_context = await _collect_document_state(session, shipment)
+            session.add(
+                WorkflowEvent(
+                    shipment_id=shipment.id,
+                    event_type=WorkflowEventType.DOCUMENT_WARNING_IGNORED.value,
+                    stage=shipment.status,
+                    payload_json={
+                        "ignored_warning": document_health.get("booking_review_warning"),
+                        "document_health_status": document_health.get("document_health_status"),
+                    },
+                )
+            )
+            await _persist_document_analysis_events(
+                session,
+                shipment,
+                document_health=build_document_health(
+                    _attachments,
+                    shipment,
+                    approved_fields=dict(document_health.get("document_enrichment", {}) or {}),
+                    warning_ignored=True,
+                ),
+                document_context=document_context,
+            )
+            await session.commit()
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message="Document warning ignored for this shipment; workflow can continue with operator override.",
+                next_action="document_warning_ignored",
+                manual_review_required=False,
+            )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1120,6 +2338,60 @@ async def list_shipment_documents(
         raise HTTPException(status_code=404, detail="Shipment not found.")
     documents = await collect_shipment_attachments(session, shipment)
     return [_serialize_document_record(document) for document in documents]
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/documents/reprocess",
+    response_model=ShipmentOperatorActionResponse,
+)
+async def reprocess_shipment_documents(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentOperatorActionResponse:
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    return await freight_operator_action(
+        shipment_id,
+        ShipmentOperatorActionRequest(action=OperatorAction.RERUN_DOCUMENT_EXTRACTION),
+        session,
+    )
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/documents/approve",
+    response_model=ShipmentOperatorActionResponse,
+)
+async def approve_shipment_documents(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentOperatorActionResponse:
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    return await freight_operator_action(
+        shipment_id,
+        ShipmentOperatorActionRequest(action=OperatorAction.APPROVE_DOCUMENT_VALUES),
+        session,
+    )
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/documents/ignore-warning",
+    response_model=ShipmentOperatorActionResponse,
+)
+async def ignore_shipment_document_warning(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentOperatorActionResponse:
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    return await freight_operator_action(
+        shipment_id,
+        ShipmentOperatorActionRequest(action=OperatorAction.IGNORE_DOCUMENT_WARNING),
+        session,
+    )
 
 
 @router.post(
@@ -1261,56 +2533,6 @@ async def freight_carrier_status_update(
         parsed_location_text = request.location_text
         parsed_notes = request.notes
 
-        if latest_carrier_message is not None:
-            extraction = await extract_carrier_status_update(
-                {
-                    "sender_email": latest_carrier_message.sender,
-                    "sender_role": "carrier",
-                    "subject": latest_carrier_message.subject,
-                    "body_preview": latest_carrier_message.body_preview,
-                    "thread_subject": latest_carrier_message.subject,
-                    "shipment_status": shipment.status,
-                    "known_client": "",
-                    "known_carrier": latest_carrier_message.sender,
-                }
-            )
-            parsed_status_text = parsed_status_text or extraction.status_text
-            parsed_eta_text = parsed_eta_text or extraction.eta_text
-            parsed_location_text = parsed_location_text or extraction.location_text
-            parsed_notes = parsed_notes or extraction.notes
-
-        return await preview_or_push_carrier_status_update(
-            session,
-            shipment_id=shipment_id,
-            status_text=parsed_status_text,
-            eta_text=parsed_eta_text,
-            location_text=parsed_location_text,
-            notes=parsed_notes,
-            dry_run=request.dry_run,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post(
-    "/freight/shipments/{shipment_id}/carrier-status-update",
-    response_model=CarrierStatusUpdateResponse,
-)
-async def freight_carrier_status_update(
-    shipment_id: UUID,
-    request: CarrierStatusUpdateRequest,
-    session: AsyncSession = Depends(get_session),
-) -> CarrierStatusUpdateResponse:
-    """Preview or send a structured carrier status update into the TMS."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
-    try:
-        latest_carrier_message = await _latest_carrier_message_for_shipment(session, shipment)
-        parsed_status_text = request.status_text
-        parsed_eta_text = request.eta_text
-        parsed_location_text = request.location_text
-        parsed_notes = request.notes
         if latest_carrier_message is not None:
             extraction = await extract_carrier_status_update(
                 {

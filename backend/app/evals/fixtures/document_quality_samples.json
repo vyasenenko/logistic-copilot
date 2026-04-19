@@ -1,0 +1,215 @@
+{
+  "samples": [
+    {
+      "sample_id": "rate-confirmation-standard",
+      "document_family": "rate_confirmation",
+      "source_format": "text",
+      "filename": "rate-confirmation-standard.txt",
+      "content_type": "text/plain",
+      "content_text": "Rate Confirmation\nConfirmed Rate: $1,450.00\nLoad Number: LD-77881\nPickup Number: PU-99172\nPickup Date: April 22, 2026\n",
+      "notes": "Standard rate confirmation with direct labels.",
+      "expectation": {
+        "expected_document_type": "rate_confirmation",
+        "expected_fields": {
+          "rate_amount": 1450.0,
+          "reference_number": "LD-77881",
+          "pickup_number": "PU-99172",
+          "pickup_date_text": "April 22, 2026"
+        },
+        "expected_review_required": false,
+        "expected_enrichment_fields": {
+          "rate_amount": 1450.0,
+          "reference_number": "LD-77881",
+          "pickup_number": "PU-99172",
+          "pickup_date_text": "April 22, 2026"
+        }
+      }
+    },
+    {
+      "sample_id": "rate-confirmation-linehaul",
+      "document_family": "rate_confirmation",
+      "source_format": "pdf",
+      "filename": "carrier-rate-con.pdf",
+      "content_type": "application/pdf",
+      "content_text": "Carrier Rate Confirmation\nLinehaul: 1250.00\nConfirmation #: PU-4455\nReference Number: REF-8812\n",
+      "notes": "Searchable PDF style content using linehaul wording.",
+      "expectation": {
+        "expected_document_type": "rate_confirmation",
+        "expected_fields": {
+          "rate_amount": 1250.0,
+          "pickup_number": "PU-4455",
+          "reference_number": "REF-8812"
+        },
+        "expected_review_required": false,
+        "expected_enrichment_fields": {
+          "rate_amount": 1250.0,
+          "pickup_number": "PU-4455",
+          "reference_number": "REF-8812"
+        }
+      }
+    },
+    {
+      "sample_id": "rate-confirmation-total-charges",
+      "document_family": "rate_confirmation",
+      "source_format": "image",
+      "filename": "ratecon-scan.png",
+      "content_type": "image/png",
+      "content_text": "RateCon Scan\nTotal Charges $1675.50\nLoad No: LOAD-2209\nPU# PU-2209\n",
+      "notes": "Synthetic image placeholder routed through the unified parser with inline content.",
+      "expectation": {
+        "expected_document_type": "rate_confirmation",
+        "expected_fields": {
+          "rate_amount": 1675.5,
+          "reference_number": "LOAD-2209",
+          "pickup_number": "PU-2209"
+        },
+        "expected_review_required": false
+      }
+    },
+    {
+      "sample_id": "bol-standard",
+      "document_family": "bill_of_lading",
+      "source_format": "text",
+      "filename": "bol-standard.txt",
+      "content_type": "text/plain",
+      "content_text": "Bill of Lading Number: BOL-00077\nPickup Date: April 22, 2026\nDelivery Date: April 23, 2026\nReference #: REF-19A2\n",
+      "notes": "Standard BOL with explicit labels.",
+      "expectation": {
+        "expected_document_type": "bill_of_lading",
+        "expected_fields": {
+          "bol_number": "BOL-00077",
+          "pickup_date_text": "April 22, 2026",
+          "delivery_date_text": "April 23, 2026",
+          "reference_number": "REF-19A2"
+        },
+        "expected_review_required": false,
+        "expected_enrichment_fields": {
+          "bol_number": "BOL-00077",
+          "pickup_date_text": "April 22, 2026",
+          "delivery_date_text": "April 23, 2026",
+          "reference_number": "REF-19A2"
+        }
+      }
+    },
+    {
+      "sample_id": "bol-short-form",
+      "document_family": "bill_of_lading",
+      "source_format": "pdf",
+      "filename": "bol-short.pdf",
+      "content_type": "application/pdf",
+      "content_text": "B/L No BOL-4455\nPickup Date: April 24, 2026\nDelivery Date: April 25, 2026\n",
+      "notes": "Short-form BOL syntax.",
+      "expectation": {
+        "expected_document_type": "bill_of_lading",
+        "expected_fields": {
+          "bol_number": "BOL-4455",
+          "pickup_date_text": "April 24, 2026",
+          "delivery_date_text": "April 25, 2026"
+        },
+        "expected_review_required": false
+      }
+    },
+    {
+      "sample_id": "bol-conflict-ready-date",
+      "document_family": "bill_of_lading",
+      "source_format": "scanned_pdf",
+      "filename": "bol-conflict-scan.pdf",
+      "content_type": "application/pdf",
+      "content_text": "Bill of Lading Number: BOL-9901\nPickup Date: April 26, 2026\nDelivery Date: April 27, 2026\n",
+      "notes": "Shipment ready date intentionally conflicts with document pickup date.",
+      "shipment_ready_at": "2026-04-24T08:00:00Z",
+      "expectation": {
+        "expected_document_type": "bill_of_lading",
+        "expected_fields": {
+          "bol_number": "BOL-9901",
+          "pickup_date_text": "April 26, 2026",
+          "delivery_date_text": "April 27, 2026"
+        },
+        "expected_review_required": true,
+        "expected_conflict_fields": [
+          "pickup_date_text"
+        ]
+      }
+    },
+    {
+      "sample_id": "pickup-confirmation-standard",
+      "document_family": "pickup_doc",
+      "source_format": "text",
+      "filename": "pickup-confirmation.txt",
+      "content_type": "text/plain",
+      "content_text": "Pickup Number: PU-88123\nReference Number: LOAD-4438\nPickup Date: April 21, 2026\n",
+      "notes": "Direct pickup confirmation.",
+      "expectation": {
+        "expected_document_type": "pickup_number",
+        "expected_fields": {
+          "pickup_number": "PU-88123",
+          "reference_number": "LOAD-4438",
+          "pickup_date_text": "April 21, 2026"
+        },
+        "expected_review_required": false
+      }
+    },
+    {
+      "sample_id": "pickup-confirmation-abbrev",
+      "document_family": "pickup_doc",
+      "source_format": "image",
+      "filename": "pickup-abbrev.jpg",
+      "content_type": "image/jpeg",
+      "content_text": "PU Number PU-7722\nConfirmation # CONF-7722\n",
+      "notes": "Abbreviated pickup wording.",
+      "expectation": {
+        "expected_document_type": "pickup_number",
+        "expected_fields": {
+          "pickup_number": "PU-7722"
+        },
+        "expected_review_required": false
+      }
+    },
+    {
+      "sample_id": "pickup-confirmation-with-load-ref",
+      "document_family": "pickup_doc",
+      "source_format": "pdf",
+      "filename": "pickup-load-reference.pdf",
+      "content_type": "application/pdf",
+      "content_text": "Pick Up Number: PU-1930\nLoad Number: LOAD-1930\nShip Date: April 29, 2026\n",
+      "notes": "Pickup document with alternate ship date wording.",
+      "expectation": {
+        "expected_document_type": "pickup_number",
+        "expected_fields": {
+          "pickup_number": "PU-1930",
+          "reference_number": "LOAD-1930",
+          "pickup_date_text": "April 29, 2026"
+        },
+        "expected_review_required": false
+      }
+    },
+    {
+      "sample_id": "negative-ambiguous-note",
+      "document_family": "pod",
+      "source_format": "text",
+      "filename": "driver-note.txt",
+      "content_type": "text/plain",
+      "content_text": "Driver note only. Call dispatcher if appointment changes. No pricing or BOL details listed.",
+      "notes": "Should remain untyped and require review for missing expected document fields.",
+      "expectation": {
+        "expected_document_type": "unknown",
+        "expected_fields": {},
+        "expected_review_required": false
+      }
+    },
+    {
+      "sample_id": "negative-incomplete-rate-con",
+      "document_family": "rate_confirmation",
+      "source_format": "image",
+      "filename": "blurry-ratecon.webp",
+      "content_type": "image/webp",
+      "content_text": "Rate Confirmation\nPlease see attached blurry image.\n",
+      "notes": "Expected to require review because no rate fields are extractable.",
+      "expectation": {
+        "expected_document_type": "rate_confirmation",
+        "expected_fields": {},
+        "expected_review_required": true
+      }
+    }
+  ]
+}

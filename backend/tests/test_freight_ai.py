@@ -117,3 +117,16 @@ def test_extract_carrier_status_update():
     assert result.status_text == "arrived"
     assert result.location_text == "Columbus"
     assert result.eta_text is not None
+
+
+def test_classify_exception_or_issue():
+    result = _classify_with_heuristics(
+        {
+            "subject": "Urgent delay",
+            "body_preview": "The truck broke down and delivery will be delayed.",
+            "sender_role": "carrier",
+            "shipment_status": "booked",
+        }
+    )
+    assert result.intent == "exception_or_issue"
+    assert result.confidence >= 0.7

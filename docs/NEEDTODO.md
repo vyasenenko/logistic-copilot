@@ -30,6 +30,9 @@
 - Добавить parsing для scanned PDF.
 - Добавить mapping extracted fields в shipment enrichment, а не только в TMS payload.
 - Добавить conflict detection между email body и extracted document data.
+- Подключить `real local-only document corpus` для quality benchmark поверх synthetic harness.
+- Добавить `provider benchmark runs` по реальным OCR-heavy файлам и сравнение `openai` vs `anthropic`.
+- Решить, когда вводить `CI threshold gating` для document quality metrics.
 
 ### Document-Aware Booking
 

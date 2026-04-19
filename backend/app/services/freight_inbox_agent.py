@@ -158,6 +158,25 @@ async def run_freight_inbox_orchestrator(
             email_context=email_context,
             policy=policy,
         )
+    if intent_result.intent == "exception_or_issue":
+        await _log_manual_review(
+            session,
+            shipment.id,
+            "Exception or issue email requires operator review",
+            intent_result=intent_result,
+            review_type="customer_status_request_review" if client is not None else "carrier_status_update_review",
+            next_action="manual_review",
+            source_email_id=str(email_message.id),
+            allow_repeat=policy.allow_repeat_manual_review,
+        )
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=intent_result.confidence,
+            next_action="manual_review",
+            manual_review_required=True,
+        )
     if intent_result.intent == "customer_quote_confirmation":
         await _log_event(
             session,
@@ -721,6 +740,110 @@ async def _handle_carrier_bid_reply(
     existing_bid = await session.scalar(
         select(CarrierBid).where(CarrierBid.email_message_id == email_message.id)
     )
+    if existing_bid is not None:
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=extraction.confidence,
+            next_action="bid_already_processed",
+            bid_intaken=True,
+            bid_id=str(existing_bid.id),
+            bid_amount=existing_bid.amount,
+        )
+    if extraction.amount is None or extraction.confidence < AUTO_BID_CONFIDENCE or extraction.ambiguity_reasons:
+        await _log_event(
+            session,
+            shipment.id,
+            WorkflowEventType.BID_PARSE_FAILED.value,
+            shipment.status,
+            {
+                "carrier_id": str(carrier.id),
+                "confidence": extraction.confidence,
+                "notes": extraction.notes,
+                "ambiguity_reasons": extraction.ambiguity_reasons,
+                "source_email_id": str(email_message.id),
+            },
+        )
+        await _log_manual_review(
+            session,
+            shipment.id,
+            (
+                f"Ambiguous carrier bid: {', '.join(extraction.ambiguity_reasons)}"
+                if extraction.ambiguity_reasons
+                else "Carrier bid parsing confidence too low"
+            ),
+            intent_result=intent_result,
+            ambiguity_reasons=extraction.ambiguity_reasons,
+            source_email_id=str(email_message.id),
+            allow_repeat=policy.allow_repeat_manual_review,
+        )
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=extraction.confidence,
+            next_action="manual_review",
+            ambiguity_reasons=extraction.ambiguity_reasons,
+            manual_review_required=True,
+        )
+
+    bid = await intake_bid(
+        session,
+        BidIntakeRequest(
+            shipment_id=str(shipment.id),
+            carrier_id=str(carrier.id),
+            carrier_email=carrier.email,
+            email_message_id=str(email_message.id),
+            subject=email_message.subject,
+            amount=float(extraction.amount),
+            currency=extraction.currency or "USD",
+            eta_text=extraction.eta_text,
+            raw_email=email_message.body_preview,
+            create_carrier_if_missing=False,
+        ),
+    )
+
+    evaluation_triggered = False
+    quote_auto_sent = False
+    outreach_event = await session.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment.id,
+            WorkflowEvent.event_type == WorkflowEventType.CARRIER_OUTREACH_SENT.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    if (
+        outreach_event is not None
+        and outreach_event.created_at + timedelta(minutes=settings.quote_wait_minutes_default)
+        <= datetime.now(timezone.utc)
+        and not await _has_event(session, shipment.id, WorkflowEventType.CLIENT_QUOTE_SENT.value)
+    ):
+        evaluation = await evaluate_shipment_bids(session, shipment.id)
+        evaluation_triggered = True
+        if policy.auto_quote:
+            await send_customer_quote(
+                session,
+                shipment_id=shipment.id,
+                bid_id=evaluation.selected_bid_id,
+                dry_run=policy.quote_dry_run,
+                custom_message=None,
+            )
+            quote_auto_sent = not policy.quote_dry_run
+
+    return WorkflowDecisionResult(
+        email_message_id=str(email_message.id),
+        shipment_id=str(shipment.id),
+        intent=intent_result.intent,
+        confidence=extraction.confidence,
+        next_action="waiting_bids" if not quote_auto_sent else "customer_quote_sent",
+        bid_intaken=True,
+        bid_id=str(bid.bid.id),
+        bid_amount=bid.bid.amount,
+        evaluation_triggered=evaluation_triggered,
+        quote_auto_sent=quote_auto_sent,
+    )
 
 
 async def _handle_customer_status_request(
@@ -751,21 +874,23 @@ async def _handle_customer_status_request(
         )
 
     extraction = await extract_status_request(email_context)
-    if extraction.confidence < AUTO_INTENT_CONFIDENCE:
-        await _log_manual_review(
-            session,
-            shipment.id,
-            "Customer status request confidence too low",
-            intent_result=intent_result,
-            review_type="customer_status_request_review",
-            next_action="rerun_status_lookup",
+    latest_status_reply_event = await session.scalar(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment.id,
+            WorkflowEvent.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value,
         )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    if latest_status_reply_event is not None and (latest_status_reply_event.payload_json or {}).get("dry_run"):
         return WorkflowDecisionResult(
             email_message_id=str(email_message.id),
             shipment_id=str(shipment.id),
             intent=intent_result.intent,
             confidence=extraction.confidence,
-            next_action="manual_review",
+            next_action="status_reply_drafted",
+            status_lookup_triggered=False,
+            status_reply_sent=False,
             manual_review_required=True,
         )
     status_response = await fetch_tms_shipment_status(session, shipment_id=shipment.id)
@@ -773,17 +898,34 @@ async def _handle_customer_status_request(
         session,
         shipment_id=shipment.id,
         status_payload=status_response.payload,
-        dry_run=False,
+        dry_run=True,
         custom_message=None,
+    )
+    await _log_manual_review(
+        session,
+        shipment.id,
+        "Customer status reply requires operator approval",
+        intent_result=intent_result,
+        review_type="customer_status_request_review",
+        next_action="approve_status_reply",
+        structured_payload={
+            "draft_subject": reply.subject,
+            "draft_body": reply.body,
+            "latest_status_snapshot": status_response.payload,
+            "requested_fields": extraction.requested_fields,
+        },
+        source_email_id=str(email_message.id),
+        allow_repeat=True,
     )
     return WorkflowDecisionResult(
         email_message_id=str(email_message.id),
         shipment_id=str(shipment.id),
         intent=intent_result.intent,
         confidence=extraction.confidence,
-        next_action="customer_status_sent",
+        next_action="status_reply_drafted",
         status_lookup_triggered=True,
-        status_reply_sent=not reply.dry_run,
+        status_reply_sent=False,
+        manual_review_required=True,
     )
 
 
@@ -830,6 +972,13 @@ async def _handle_carrier_status_update(
             review_type="carrier_status_update_review",
             next_action="rerun_tms_update",
             ambiguity_reasons=extraction.ambiguity_reasons,
+            structured_payload={
+                "status_text": extraction.status_text,
+                "eta_text": extraction.eta_text,
+                "location_text": extraction.location_text,
+                "notes": extraction.notes,
+            },
+            source_email_id=str(email_message.id),
             allow_repeat=policy.allow_repeat_manual_review,
         )
         return WorkflowDecisionResult(
@@ -858,107 +1007,6 @@ async def _handle_carrier_status_update(
         next_action="tms_status_updated",
         tms_status_updated=True,
         tms_handoff_status=status_update.status,
-    )
-    if existing_bid is not None:
-        return WorkflowDecisionResult(
-            email_message_id=str(email_message.id),
-            shipment_id=str(shipment.id),
-            intent=intent_result.intent,
-            confidence=extraction.confidence,
-            next_action="bid_already_processed",
-            bid_intaken=True,
-            bid_id=str(existing_bid.id),
-            bid_amount=existing_bid.amount,
-        )
-    if extraction.amount is None or extraction.confidence < AUTO_BID_CONFIDENCE or extraction.ambiguity_reasons:
-        await _log_event(
-            session,
-            shipment.id,
-            WorkflowEventType.BID_PARSE_FAILED.value,
-            shipment.status,
-            {
-                "carrier_id": str(carrier.id),
-                "confidence": extraction.confidence,
-                "notes": extraction.notes,
-                "ambiguity_reasons": extraction.ambiguity_reasons,
-            },
-        )
-        await _log_manual_review(
-            session,
-            shipment.id,
-            (
-                f"Ambiguous carrier bid: {', '.join(extraction.ambiguity_reasons)}"
-                if extraction.ambiguity_reasons
-                else "Carrier bid parsing confidence too low"
-            ),
-            intent_result=intent_result,
-            allow_repeat=policy.allow_repeat_manual_review,
-        )
-        return WorkflowDecisionResult(
-            email_message_id=str(email_message.id),
-            shipment_id=str(shipment.id),
-            intent=intent_result.intent,
-            confidence=extraction.confidence,
-            next_action="manual_review",
-            ambiguity_reasons=extraction.ambiguity_reasons,
-            manual_review_required=True,
-        )
-
-    bid = await intake_bid(
-        session,
-        BidIntakeRequest(
-            shipment_id=str(shipment.id),
-            carrier_id=str(carrier.id),
-            carrier_email=carrier.email,
-            email_message_id=str(email_message.id),
-            subject=email_message.subject,
-            amount=float(extraction.amount),
-            currency=extraction.currency or "USD",
-            eta_text=extraction.eta_text,
-            raw_email=email_message.body_preview,
-            create_carrier_if_missing=False,
-        ),
-    )
-
-    evaluation_triggered = False
-    quote_auto_sent = False
-    outreach_event = await session.scalar(
-        select(WorkflowEvent)
-        .where(
-            WorkflowEvent.shipment_id == shipment.id,
-            WorkflowEvent.event_type == WorkflowEventType.CARRIER_OUTREACH_SENT.value,
-        )
-        .order_by(WorkflowEvent.created_at.desc())
-    )
-    if (
-        outreach_event is not None
-        and outreach_event.created_at + timedelta(minutes=settings.quote_wait_minutes_default)
-        <= datetime.now(timezone.utc)
-        and not await _has_event(session, shipment.id, WorkflowEventType.CLIENT_QUOTE_SENT.value)
-    ):
-        await evaluate_shipment_bids(session, shipment.id)
-        evaluation_triggered = True
-        if policy.auto_quote:
-            await send_customer_quote(
-                session,
-                shipment_id=shipment.id,
-                bid_id=None,
-                dry_run=policy.quote_dry_run,
-                custom_message=None,
-            )
-            quote_auto_sent = not policy.quote_dry_run
-
-    return WorkflowDecisionResult(
-        email_message_id=str(email_message.id),
-        shipment_id=str(shipment.id),
-        intent=intent_result.intent,
-        confidence=extraction.confidence,
-        next_action="waiting_bids" if not quote_auto_sent else "customer_quote_sent",
-        bid_intaken=True,
-        bid_id=bid.bid.id,
-        bid_amount=bid.bid.amount,
-        evaluation_triggered=evaluation_triggered,
-        quote_auto_sent=quote_auto_sent,
     )
 
 
@@ -1053,6 +1101,8 @@ async def _log_manual_review(
     review_type: str | None = None,
     next_action: str = "manual_review",
     ambiguity_reasons: list[str] | None = None,
+    structured_payload: dict | None = None,
+    source_email_id: str | None = None,
     allow_repeat: bool = False,
 ) -> None:
     if not allow_repeat and await _has_open_review(session, shipment_id, reason):
@@ -1069,6 +1119,8 @@ async def _log_manual_review(
             "confidence": intent_result.confidence,
             "next_action": next_action,
             "ambiguity_reasons": ambiguity_reasons or [],
+            "structured_payload": structured_payload or {},
+            "source_email_id": source_email_id,
             "status_audit_kind": "status_review_required" if review_type and "status" in review_type else "manual_review_required",
             "manual_review_required": True,
         },

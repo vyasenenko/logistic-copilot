@@ -22,7 +22,7 @@ import {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-type DashboardTab = "shipments" | "clients" | "carriers";
+type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers";
 
 interface OverviewResponse {
   counts: {
@@ -98,6 +98,10 @@ interface ShipmentRecord {
   tms_handoff_status: string | null;
   attachment_count: number;
   document_summary: Record<string, number>;
+  document_enrichment: Record<string, string | number>;
+  document_health_status: string | null;
+  ocr_pending_count: number;
+  document_conflict_count: number;
   missing_document_types: string[];
   booking_review_warning: string | null;
   booking_review_required: boolean;
@@ -106,6 +110,10 @@ interface ShipmentRecord {
   last_known_location: string | null;
   last_status_source: string | null;
   last_status_event_at: string | null;
+  tms_load_id: string | null;
+  tms_system: string | null;
+  status_workflow_state: string | null;
+  status_sync_health: string | null;
   status_review_required: boolean;
   status_stale: boolean;
   status_sla_hours: number | null;
@@ -133,6 +141,10 @@ interface ShipmentDocumentRecord {
   extracted_fields: Record<string, string | number>;
   extraction_method: string | null;
   ocr_status: string | null;
+  ocr_confidence: number | null;
+  field_confidence: number | null;
+  review_required: boolean;
+  review_reason: string | null;
   source_email_id: string;
 }
 
@@ -232,13 +244,67 @@ interface ReviewQueueItem {
   stage: string;
   event_type: string;
   review_type: string | null;
+  priority: string;
+  alert_label: string | null;
   reason: string;
   next_action: string | null;
   missing_fields: string[];
   ambiguity_reasons: string[];
   missing_document_types: string[];
+  document_conflict_fields: string[];
   booking_review_warning: string | null;
+  status_stale: boolean;
+  status_review_required: boolean;
   created_at: string;
+}
+
+type StatusQueueAction =
+  | "preview"
+  | "approve_and_send"
+  | "approve_and_push"
+  | "rebuild_draft"
+  | "retry_push"
+  | "dismiss";
+
+interface StatusQueueItem {
+  task_id: string;
+  task_type: string;
+  task_state: string;
+  queue_scope: string;
+  resolution_state: string | null;
+  resolution_reason: string | null;
+  resolution_at: string | null;
+  shipment_id: string;
+  email_thread_id: string | null;
+  source_email_id: string | null;
+  priority: string;
+  alert_label: string | null;
+  reason: string;
+  recommended_next_action: string | null;
+  review_type: string | null;
+  ambiguity_reasons: string[];
+  latest_status_snapshot: Record<string, unknown>;
+  draft_subject: string | null;
+  draft_body: string | null;
+  structured_payload: Record<string, unknown>;
+  last_failure: string | null;
+  tms_load_id: string | null;
+  tms_system: string | null;
+  status_sync_health: string | null;
+  created_at: string;
+}
+
+interface StatusQueueActionResponse {
+  task_id: string;
+  task_type: string;
+  action: StatusQueueAction;
+  status: string;
+  message: string;
+  task_state: string;
+  resolution_state: string | null;
+  resolution_reason: string | null;
+  shipment_id: string;
+  preview: Record<string, unknown>;
 }
 
 type OperatorAction =
@@ -249,7 +315,10 @@ type OperatorAction =
   | "rerun_evaluation"
   | "rerun_status_lookup"
   | "rerun_tms_update"
-  | "approve_status_reply";
+  | "approve_status_reply"
+  | "rerun_document_extraction"
+  | "approve_document_values"
+  | "ignore_document_warning";
 
 interface ShipmentOperatorActionResponse {
   shipment_id: string;
@@ -429,6 +498,11 @@ function payloadValue(payload: Record<string, unknown>, ...keys: string[]) {
   return "--";
 }
 
+function payloadInputValue(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === "string" ? value : "";
+}
+
 function statusAuditLabel(eventRecord: WorkflowEventRecord) {
   const auditKind = typeof eventRecord.payload.status_audit_kind === "string" ? eventRecord.payload.status_audit_kind : null;
   if (auditKind) {
@@ -439,8 +513,31 @@ function statusAuditLabel(eventRecord: WorkflowEventRecord) {
     return eventRecord.payload.dry_run ? "reply drafted" : "reply sent";
   }
   if (eventRecord.event_type === "tms_status_updated") return "carrier update pushed";
+  if (eventRecord.event_type === "tms_status_ingested") return "tms inbound sync";
+  if (eventRecord.event_type === "status_workflow_resolved") {
+    const resolutionReason = typeof eventRecord.payload.resolution_reason === "string" ? eventRecord.payload.resolution_reason : null;
+    return resolutionReason ? resolutionReason.replaceAll("_", " ") : "status workflow resolved";
+  }
   if (eventRecord.event_type === "manual_review_required") return "status review required";
   return eventRecord.event_type.replaceAll("_", " ");
+}
+
+function reviewPriorityClasses(priority: string) {
+  if (priority === "critical") return "bg-rose-300/10 text-rose-100 border-rose-300/20";
+  if (priority === "high") return "bg-amber-300/10 text-amber-100 border-amber-300/20";
+  return "bg-white/10 text-white border-white/10";
+}
+
+function healthBadgeClasses(value: string | null) {
+  if (value === "blocking") return "bg-rose-300/10 text-rose-100 border-rose-300/20";
+  if (value === "review_required") return "bg-amber-300/10 text-amber-100 border-amber-300/20";
+  if (value === "warning" || value === "warning_ignored") return "bg-cyan-300/10 text-cyan-100 border-cyan-300/20";
+  return "bg-emerald-300/10 text-emerald-100 border-emerald-300/20";
+}
+
+function formatConfidence(value: number | null) {
+  if (value === null || value === undefined) return "--";
+  return `${Math.round(value * 100)}%`;
 }
 
 function ShipmentStatusPill({ status }: { status: string }) {
@@ -464,6 +561,8 @@ export function FreightDashboard() {
   const [events, setEvents] = useState<WorkflowEventRecord[]>([]);
   const [bids, setBids] = useState<BidRecord[]>([]);
   const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
+  const [statusQueue, setStatusQueue] = useState<StatusQueueItem[]>([]);
+  const [statusQueueScope, setStatusQueueScope] = useState<"active" | "resolved">("active");
   const [documents, setDocuments] = useState<ShipmentDocumentRecord[]>([]);
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [ackPreview, setAckPreview] = useState<ClientAcknowledgementResponse | null>(null);
@@ -473,6 +572,7 @@ export function FreightDashboard() {
   const [tmsPreview, setTmsPreview] = useState<TmsHandoffResponse | null>(null);
   const [bookingResult, setBookingResult] = useState<BookingExecutionResponse | null>(null);
   const [selectedShipmentId, setSelectedShipmentId] = useState<string | null>(null);
+  const [selectedStatusTaskId, setSelectedStatusTaskId] = useState<string | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [selectedCarrierId, setSelectedCarrierId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -513,6 +613,8 @@ export function FreightDashboard() {
     raw_email: "Best rate we can do is 1000 all in.",
   });
   const [statusReplyMessage, setStatusReplyMessage] = useState("");
+  const [statusReplyDraftSubject, setStatusReplyDraftSubject] = useState("");
+  const [statusReplyDraftBody, setStatusReplyDraftBody] = useState("");
   const [carrierStatusForm, setCarrierStatusForm] = useState({
     status_text: "",
     eta_text: "",
@@ -537,10 +639,18 @@ export function FreightDashboard() {
     if (!bidId) return null;
     return bids.find((bid) => bid.id === bidId) || evaluation.results.find((bid) => bid.id === bidId) || null;
   }, [bids, evaluation]);
+  const selectedStatusTask = useMemo(
+    () => statusQueue.find((task) => task.task_id === selectedStatusTaskId) || null,
+    [statusQueue, selectedStatusTaskId],
+  );
+  const filteredStatusQueue = useMemo(
+    () => statusQueue.filter((task) => task.queue_scope === statusQueueScope),
+    [statusQueue, statusQueueScope],
+  );
   const statusEvents = useMemo(
     () =>
       events.filter((eventRecord) =>
-        ["tms_status_lookup", "customer_status_sent", "tms_status_updated"].includes(eventRecord.event_type) ||
+        ["tms_status_lookup", "customer_status_sent", "tms_status_updated", "tms_status_ingested", "status_workflow_resolved"].includes(eventRecord.event_type) ||
         (eventRecord.event_type === "manual_review_required" &&
           typeof eventRecord.payload.review_type === "string" &&
           eventRecord.payload.review_type.includes("status")),
@@ -552,12 +662,13 @@ export function FreightDashboard() {
     setLoading(true);
     setError(null);
     try {
-      const [overviewData, clientData, carrierData, shipmentData, reviewData] = await Promise.all([
+      const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData] = await Promise.all([
         fetchJson<OverviewResponse>("/api/freight/overview"),
         fetchJson<ClientRecord[]>("/api/freight/clients"),
         fetchJson<CarrierRecord[]>("/api/freight/carriers"),
         fetchJson<ShipmentRecord[]>("/api/freight/shipments"),
         fetchJson<ReviewQueueItem[]>("/api/freight/reviews"),
+        fetchJson<StatusQueueItem[]>("/api/freight/status-queue?include_resolved=true"),
       ]);
 
       startTransition(() => {
@@ -566,10 +677,16 @@ export function FreightDashboard() {
         setCarriers(carrierData);
         setShipments(shipmentData);
         setReviewQueue(reviewData);
+        setStatusQueue(statusQueueData);
         setSelectedShipmentId((current) =>
           current && shipmentData.some((shipment) => shipment.id === current)
             ? current
             : shipmentData[0]?.id || null,
+        );
+        setSelectedStatusTaskId((current) =>
+          current && statusQueueData.some((task) => task.task_id === current)
+            ? current
+            : statusQueueData[0]?.task_id || null,
         );
         setSelectedClientId((current) =>
           current && clientData.some((client) => client.id === current)
@@ -635,6 +752,34 @@ export function FreightDashboard() {
       setDocuments([]);
     });
   }, [selectedShipmentId]);
+
+  useEffect(() => {
+    if (!selectedStatusTask) {
+      setStatusReplyDraftSubject("");
+      setStatusReplyDraftBody("");
+      return;
+    }
+    setStatusReplyDraftSubject(selectedStatusTask.draft_subject || "");
+    setStatusReplyDraftBody(selectedStatusTask.draft_body || "");
+    if (selectedStatusTask.task_type === "carrier_update") {
+      setCarrierStatusForm({
+        status_text: payloadInputValue(selectedStatusTask.structured_payload, "status_text"),
+        eta_text: payloadInputValue(selectedStatusTask.structured_payload, "eta_text"),
+        location_text: payloadInputValue(selectedStatusTask.structured_payload, "location_text"),
+        notes: payloadInputValue(selectedStatusTask.structured_payload, "notes"),
+      });
+    }
+  }, [selectedStatusTask]);
+
+  useEffect(() => {
+    if (filteredStatusQueue.length === 0) {
+      setSelectedStatusTaskId(null);
+      return;
+    }
+    if (!selectedStatusTaskId || !filteredStatusQueue.some((task) => task.task_id === selectedStatusTaskId)) {
+      setSelectedStatusTaskId(filteredStatusQueue[0]?.task_id || null);
+    }
+  }, [filteredStatusQueue, selectedStatusTaskId]);
 
   async function refreshAll() {
     await loadDashboard();
@@ -1029,6 +1174,36 @@ export function FreightDashboard() {
     }
   }
 
+  async function handleStatusQueueAction(action: StatusQueueAction) {
+    if (!selectedStatusTask) return;
+    setSubmitting(`status-queue-${action}`);
+    setError(null);
+    try {
+      const response = await fetchJson<StatusQueueActionResponse>(`/api/freight/status-queue/${selectedStatusTask.task_id}/action`, {
+        method: "POST",
+        body: JSON.stringify({
+          action,
+          custom_message: statusReplyMessage || null,
+          draft_subject: statusReplyDraftSubject || null,
+          draft_body: statusReplyDraftBody || null,
+          status_text: carrierStatusForm.status_text || null,
+          eta_text: carrierStatusForm.eta_text || null,
+          location_text: carrierStatusForm.location_text || null,
+          notes: carrierStatusForm.notes || null,
+        }),
+      });
+      setNotice(response.message);
+      await refreshAll();
+      if (response.shipment_id) {
+        setSelectedShipmentId(response.shipment_id);
+      }
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to run status queue action.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
   const metrics = [
     {
       label: "Active shipments",
@@ -1061,6 +1236,8 @@ export function FreightDashboard() {
   ];
 
   const stageHighlights = Object.entries(overview.active_stages).slice(0, 4);
+  const criticalReviewCount = reviewQueue.filter((item) => item.priority === "critical").length;
+  const highPriorityReviewCount = reviewQueue.filter((item) => item.priority === "high").length;
 
   return (
     <main className="min-h-screen px-4 py-5 text-[var(--text-main)] sm:px-6 lg:px-8">
@@ -1122,6 +1299,7 @@ export function FreightDashboard() {
             <div className="space-y-2">
               {[
                 { key: "shipments", label: "Shipments", icon: Package2 },
+                { key: "status_ops", label: "Status Ops", icon: RadioTower },
                 { key: "clients", label: "Clients", icon: Users },
                 { key: "carriers", label: "Carriers", icon: Truck },
               ].map(({ key, label, icon: Icon }) => {
@@ -1264,6 +1442,50 @@ export function FreightDashboard() {
                     </div>
                   </div>
                 )}
+
+                {tab === "status_ops" && (
+                  <div className="glass-panel overflow-hidden">
+                    <div className="flex items-center justify-between border-b border-white/10 px-6 py-5">
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Operator queue</p>
+                        <h2 className="mt-1 text-2xl font-semibold text-white">Status tasks</h2>
+                      </div>
+                      <button onClick={() => void refreshAll()} className="action-button bg-white/10 text-sm text-white hover:bg-white/15">Refresh</button>
+                    </div>
+                    <div className="grid gap-3 p-4 lg:grid-cols-2">
+                      <div className="lg:col-span-2 flex gap-2">
+                        <button onClick={() => setStatusQueueScope("active")} className={`action-button ${statusQueueScope === "active" ? "bg-cyan-300/15 text-cyan-100" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10"}`}>Active</button>
+                        <button onClick={() => setStatusQueueScope("resolved")} className={`action-button ${statusQueueScope === "resolved" ? "bg-cyan-300/15 text-cyan-100" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10"}`}>Recent resolved</button>
+                      </div>
+                      {filteredStatusQueue.length === 0 && <div className="rounded-[24px] border border-dashed border-white/10 bg-white/5 p-8 text-sm text-[var(--text-muted)] lg:col-span-2">No {statusQueueScope === "active" ? "active" : "resolved"} status tasks in this view yet.</div>}
+                      {filteredStatusQueue.map((task) => (
+                        <button
+                          key={task.task_id}
+                          onClick={() => {
+                            setSelectedStatusTaskId(task.task_id);
+                            setSelectedShipmentId(task.shipment_id);
+                          }}
+                          className={`rounded-[24px] border p-5 text-left transition ${task.task_id === selectedStatusTaskId ? "border-cyan-300/40 bg-cyan-300/10" : "border-white/10 bg-white/5 hover:bg-white/10"}`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-lg font-medium text-white">{task.task_type.replaceAll("_", " ")}</p>
+                              <p className="mt-1 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">{task.task_state.replaceAll("_", " ")}</p>
+                            </div>
+                            <span className={`rounded-full border px-3 py-1 text-xs ${reviewPriorityClasses(task.priority)}`}>{task.priority}</span>
+                          </div>
+                          {task.alert_label && <p className="mt-3 text-sm text-cyan-100">{task.alert_label}</p>}
+                          <p className="mt-2 text-sm text-[var(--text-muted)]">{task.reason || "Operator attention required."}</p>
+                          {task.resolution_reason && <p className="mt-2 text-xs uppercase tracking-[0.16em] text-emerald-100">{task.resolution_reason.replaceAll("_", " ")}</p>}
+                          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Status</p><p className="mt-1 text-white">{payloadValue(task.latest_status_snapshot, "status")}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">ETA</p><p className="mt-1 text-white">{payloadValue(task.latest_status_snapshot, "eta")}</p></div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </>
             )}
           </section>
@@ -1273,7 +1495,7 @@ export function FreightDashboard() {
               <div className="mb-4 flex items-center justify-between">
                 <div>
                   <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Create</p>
-                  <h3 className="mt-1 text-xl font-semibold text-white">{tab === "shipments" ? "New shipment" : tab === "clients" ? "New client" : "New carrier"}</h3>
+                  <h3 className="mt-1 text-xl font-semibold text-white">{tab === "shipments" ? "New shipment" : tab === "status_ops" ? "Status task detail" : tab === "clients" ? "New client" : "New carrier"}</h3>
                 </div>
                 {submitting && <Loader2 size={16} className="animate-spin text-[var(--text-muted)]" />}
               </div>
@@ -1323,6 +1545,50 @@ export function FreightDashboard() {
                   <button className="action-button w-full bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110" disabled={submitting === "carrier"}>Add carrier</button>
                 </form>
               )}
+
+              {tab === "status_ops" && selectedStatusTask && (
+                <div className="space-y-4">
+                  <div className="rounded-2xl bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-white">{selectedStatusTask.task_type.replaceAll("_", " ")}</p>
+                      <span className={`rounded-full border px-3 py-1 text-xs ${reviewPriorityClasses(selectedStatusTask.priority)}`}>{selectedStatusTask.priority}</span>
+                    </div>
+                    <p className="mt-2">{selectedStatusTask.reason || "Operator task"}</p>
+                    {selectedStatusTask.resolution_reason && <p className="mt-2 text-xs uppercase tracking-[0.16em] text-emerald-100">Resolved: {selectedStatusTask.resolution_reason.replaceAll("_", " ")}</p>}
+                    {selectedStatusTask.recommended_next_action && <p className="mt-2 text-xs uppercase tracking-[0.16em] text-cyan-100">Next: {selectedStatusTask.recommended_next_action.replaceAll("_", " ")}</p>}
+                  </div>
+                  {selectedStatusTask.queue_scope === "resolved" ? (
+                    <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/10 p-4 text-sm text-emerald-50">
+                      This task is already resolved. You can inspect the shipment timeline for the full audit trail.
+                    </div>
+                  ) : selectedStatusTask.task_type === "status_reply" ? (
+                    <div className="space-y-3">
+                      <input className="field-input" placeholder="Reply subject" value={statusReplyDraftSubject} onChange={(event) => setStatusReplyDraftSubject(event.target.value)} />
+                      <textarea className="field-input min-h-[160px] resize-none" placeholder="Reply body" value={statusReplyDraftBody} onChange={(event) => setStatusReplyDraftBody(event.target.value)} />
+                      <textarea className="field-input min-h-[100px] resize-none" placeholder="Optional operator note" value={statusReplyMessage} onChange={(event) => setStatusReplyMessage(event.target.value)} />
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <button onClick={() => void handleStatusQueueAction("rebuild_draft")} disabled={submitting === "status-queue-rebuild_draft"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Rebuild draft</button>
+                        <button onClick={() => void handleStatusQueueAction("approve_and_send")} disabled={submitting === "status-queue-approve_and_send"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">Approve and send</button>
+                        <button onClick={() => void handleStatusQueueAction("preview")} disabled={submitting === "status-queue-preview"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">Preview</button>
+                        <button onClick={() => void handleStatusQueueAction("dismiss")} disabled={submitting === "status-queue-dismiss"} className="action-button w-full bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">Dismiss</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <input className="field-input" placeholder="Status text" value={carrierStatusForm.status_text} onChange={(event) => setCarrierStatusForm((current) => ({ ...current, status_text: event.target.value }))} />
+                      <input className="field-input" placeholder="ETA text" value={carrierStatusForm.eta_text} onChange={(event) => setCarrierStatusForm((current) => ({ ...current, eta_text: event.target.value }))} />
+                      <input className="field-input" placeholder="Location text" value={carrierStatusForm.location_text} onChange={(event) => setCarrierStatusForm((current) => ({ ...current, location_text: event.target.value }))} />
+                      <input className="field-input" placeholder="Notes" value={carrierStatusForm.notes} onChange={(event) => setCarrierStatusForm((current) => ({ ...current, notes: event.target.value }))} />
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <button onClick={() => void handleStatusQueueAction("approve_and_push")} disabled={submitting === "status-queue-approve_and_push"} className="action-button w-full bg-blue-300/15 text-blue-100 hover:bg-blue-300/20 disabled:opacity-50">Approve and push</button>
+                        <button onClick={() => void handleStatusQueueAction("retry_push")} disabled={submitting === "status-queue-retry_push"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">Retry push</button>
+                        <button onClick={() => void handleStatusQueueAction("preview")} disabled={submitting === "status-queue-preview"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Preview</button>
+                        <button onClick={() => void handleStatusQueueAction("dismiss")} disabled={submitting === "status-queue-dismiss"} className="action-button w-full bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">Dismiss</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="glass-panel p-5">
@@ -1368,9 +1634,22 @@ export function FreightDashboard() {
                       <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">TMS handoff</p><p className="mt-2 text-white">{selectedShipment.tms_handoff_status || "Not sent"}</p></div>
                       <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Failure</p><p className="mt-2 text-white">{selectedShipment.booking_error || "None"}</p></div>
                     </div>
+                    <div className="mt-3 grid gap-3 text-sm sm:grid-cols-4">
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Document health</p><p className="mt-2 text-white">{selectedShipment.document_health_status ? selectedShipment.document_health_status.replaceAll("_", " ") : "Unknown"}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">OCR pending</p><p className="mt-2 text-white">{selectedShipment.ocr_pending_count}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Conflicts</p><p className="mt-2 text-white">{selectedShipment.document_conflict_count}</p></div>
+                      <div className="rounded-2xl bg-slate-950/30 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Enriched values</p><p className="mt-2 text-white">{Object.keys(selectedShipment.document_enrichment).length}</p></div>
+                    </div>
                     <div className="mt-3 rounded-2xl bg-slate-950/30 p-4 text-sm">
                       <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Documents in thread</p>
                       <p className="mt-2 text-white">{selectedShipment.attachment_count} attachment(s) available for TMS handoff</p>
+                      {selectedShipment.document_health_status && (
+                        <div className="mt-3">
+                          <span className={`inline-flex rounded-full border px-3 py-1 text-xs ${healthBadgeClasses(selectedShipment.document_health_status)}`}>
+                            {selectedShipment.document_health_status.replaceAll("_", " ")}
+                          </span>
+                        </div>
+                      )}
                       {Object.keys(selectedShipment.document_summary).length > 0 && (
                         <div className="mt-3 flex flex-wrap gap-2">
                           {Object.entries(selectedShipment.document_summary).map(([documentType, count]) => (
@@ -1385,6 +1664,15 @@ export function FreightDashboard() {
                           {selectedShipment.missing_document_types.map((documentType) => (
                             <span key={documentType} className="rounded-full bg-amber-300/10 px-3 py-1 text-xs text-amber-100">
                               Missing {documentType.replaceAll("_", " ")}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {Object.keys(selectedShipment.document_enrichment).length > 0 && (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {Object.entries(selectedShipment.document_enrichment).map(([field, value]) => (
+                            <span key={field} className="rounded-full bg-emerald-300/10 px-3 py-1 text-xs text-emerald-100">
+                              {field.replaceAll("_", " ")}: {String(value)}
                             </span>
                           ))}
                         </div>
@@ -1406,6 +1694,11 @@ export function FreightDashboard() {
 
                   <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
                     <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]"><Mail size={14} />Documents</div>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                      <button onClick={() => void handleOperatorAction("rerun_document_extraction")} disabled={submitting === "rerun_document_extraction"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "rerun_document_extraction" ? "Reprocessing..." : "Re-run document extraction"}</button>
+                      <button onClick={() => void handleOperatorAction("approve_document_values")} disabled={submitting === "approve_document_values"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">{submitting === "approve_document_values" ? "Approving..." : "Approve document values"}</button>
+                      <button onClick={() => void handleOperatorAction("ignore_document_warning")} disabled={submitting === "ignore_document_warning"} className="action-button w-full bg-amber-300/15 text-amber-100 hover:bg-amber-300/20 disabled:opacity-50">{submitting === "ignore_document_warning" ? "Ignoring..." : "Ignore document warning"}</button>
+                    </div>
                     <div className="mt-3 space-y-3">
                       {documents.length === 0 && <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-4 text-sm text-[var(--text-muted)]">No document metadata found in this thread.</div>}
                       {documents.map((document) => (
@@ -1419,6 +1712,26 @@ export function FreightDashboard() {
                             <span>{document.size ? `${document.size} bytes` : "size unknown"}</span>
                             {document.extraction_method && <span>{document.extraction_method.replaceAll("_", " ")}</span>}
                             {document.ocr_status && <span>OCR: {document.ocr_status.replaceAll("_", " ")}</span>}
+                            <span>OCR confidence: {formatConfidence(document.ocr_confidence)}</span>
+                            <span>Field confidence: {formatConfidence(document.field_confidence)}</span>
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {document.review_required && (
+                              <span className="rounded-full bg-amber-300/10 px-3 py-1 text-xs text-amber-100">
+                                Review required
+                              </span>
+                            )}
+                            {document.ocr_status && (
+                              <span className={`rounded-full border px-3 py-1 text-xs ${healthBadgeClasses(
+                                document.ocr_status === "ocr_complete" || document.ocr_status === "not_needed"
+                                  ? "healthy"
+                                  : document.ocr_status === "ocr_failed"
+                                    ? "blocking"
+                                    : "review_required",
+                              )}`}>
+                                {document.ocr_status.replaceAll("_", " ")}
+                              </span>
+                            )}
                           </div>
                           {Object.keys(document.extracted_fields).length > 0 && (
                             <div className="mt-3 flex flex-wrap gap-2">
@@ -1427,6 +1740,11 @@ export function FreightDashboard() {
                                   {field.replaceAll("_", " ")}: {String(value)}
                                 </span>
                               ))}
+                            </div>
+                          )}
+                          {document.review_reason && (
+                            <div className="mt-3 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-3 py-3 text-xs text-amber-50">
+                              {document.review_reason}
                             </div>
                           )}
                           {document.extracted_text_preview && (
@@ -1474,6 +1792,9 @@ export function FreightDashboard() {
                     <button onClick={() => void handleOperatorAction("rerun_status_lookup")} disabled={submitting === "rerun_status_lookup"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "rerun_status_lookup" ? "Refreshing..." : "Re-run status lookup"}</button>
                     <button onClick={() => void handleOperatorAction("rerun_tms_update")} disabled={submitting === "rerun_tms_update"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">{submitting === "rerun_tms_update" ? "Re-sending..." : "Re-run TMS update"}</button>
                     <button onClick={() => void handleOperatorAction("approve_status_reply")} disabled={submitting === "approve_status_reply"} className="action-button w-full bg-teal-300/15 text-teal-100 hover:bg-teal-300/20 disabled:opacity-50">{submitting === "approve_status_reply" ? "Sending..." : "Approve status reply"}</button>
+                    <button onClick={() => void handleOperatorAction("rerun_document_extraction")} disabled={submitting === "rerun_document_extraction"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "rerun_document_extraction" ? "Reprocessing..." : "Re-run document extraction"}</button>
+                    <button onClick={() => void handleOperatorAction("approve_document_values")} disabled={submitting === "approve_document_values"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">{submitting === "approve_document_values" ? "Approving..." : "Approve document values"}</button>
+                    <button onClick={() => void handleOperatorAction("ignore_document_warning")} disabled={submitting === "ignore_document_warning"} className="action-button w-full bg-amber-300/15 text-amber-100 hover:bg-amber-300/20 disabled:opacity-50">{submitting === "ignore_document_warning" ? "Ignoring..." : "Ignore document warning"}</button>
                     <button onClick={() => void handlePreviewStatusReply()} disabled={submitting === "status_preview"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "status_preview" ? "Preparing..." : "Preview status reply"}</button>
                     <button onClick={() => void handleSendStatusReply()} disabled={submitting === "status_send"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">{submitting === "status_send" ? "Sending..." : "Send status reply"}</button>
                     <button onClick={() => void handlePreviewCarrierStatusUpdate()} disabled={submitting === "carrier_status_preview"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">{submitting === "carrier_status_preview" ? "Preparing..." : "Preview carrier update"}</button>
@@ -1602,9 +1923,9 @@ export function FreightDashboard() {
                           </div>
                           <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">{eventRecord.event_type.replaceAll("_", " ")}</p>
                           <div className="mt-3 grid gap-3 text-sm sm:grid-cols-3">
-                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Status</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "status_label", "status", "status_text").replaceAll("_", " ")}</p></div>
-                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">ETA</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "eta_label", "eta", "eta_text")}</p></div>
-                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Location</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "location_label", "location", "location_text")}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Status</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "status_label", "status", "status_text", "resolution_state").replaceAll("_", " ")}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">ETA</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "eta_label", "eta", "eta_text", "resolution_reason")}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Location</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "location_label", "location", "location_text", "source")}</p></div>
                           </div>
                           <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
                             <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Milestone</p><p className="mt-1 text-white">{payloadValue(eventRecord.payload, "milestone_label", "milestone")}</p></div>
@@ -1672,6 +1993,35 @@ export function FreightDashboard() {
               {tab === "clients" && selectedClient && <div className="space-y-4"><div><p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Client detail</p><h3 className="mt-1 text-xl font-semibold text-white">{selectedClient.name}</h3></div><div className="rounded-2xl bg-white/5 p-4 text-sm text-[var(--text-muted)]"><div className="flex items-center gap-3 text-white"><Building2 size={16} /> {selectedClient.email}</div><div className="mt-4 flex items-center justify-between"><span>Margin rule</span><span className="text-white">{selectedClient.default_margin_percent}%</span></div><div className="mt-2 flex items-center justify-between"><span>Floor price</span><span className="text-white">${selectedClient.default_margin_floor}</span></div></div></div>}
 
               {tab === "carriers" && selectedCarrier && <div className="space-y-4"><div><p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Carrier detail</p><h3 className="mt-1 text-xl font-semibold text-white">{selectedCarrier.name}</h3></div><div className="rounded-2xl bg-white/5 p-4 text-sm text-[var(--text-muted)]"><div className="flex items-center gap-3 text-white"><Map size={16} /> {selectedCarrier.email}</div><div className="mt-4 flex items-center justify-between"><span>Rating</span><span className="text-white">{selectedCarrier.rating}</span></div><div className="mt-4 flex flex-wrap gap-2">{selectedCarrier.regions.map((region) => <span key={region} className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">{region}</span>)}</div><div className="mt-3 flex flex-wrap gap-2">{selectedCarrier.equipment.map((equipment) => <span key={equipment} className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">{equipment}</span>)}</div></div></div>}
+
+              {tab === "status_ops" && selectedStatusTask && (
+                <div className="space-y-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Status task</p>
+                    <h3 className="mt-1 text-xl font-semibold text-white">{selectedStatusTask.task_type.replaceAll("_", " ")}</h3>
+                  </div>
+                  <div className="rounded-2xl bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                    <div className="flex items-center justify-between"><span>Task state</span><span className="text-white">{selectedStatusTask.task_state.replaceAll("_", " ")}</span></div>
+                    <div className="mt-3 flex items-center justify-between"><span>Queue scope</span><span className="text-white">{selectedStatusTask.queue_scope.replaceAll("_", " ")}</span></div>
+                    <div className="mt-3 flex items-center justify-between"><span>Resolution state</span><span className="text-white">{selectedStatusTask.resolution_state ? selectedStatusTask.resolution_state.replaceAll("_", " ") : "Open"}</span></div>
+                    <div className="mt-3 flex items-center justify-between"><span>Resolution reason</span><span className="text-white">{selectedStatusTask.resolution_reason ? selectedStatusTask.resolution_reason.replaceAll("_", " ") : "Open"}</span></div>
+                    <div className="mt-3 flex items-center justify-between"><span>Resolved at</span><span className="text-white">{formatDate(selectedStatusTask.resolution_at)}</span></div>
+                    <div className="mt-3 flex items-center justify-between"><span>Status sync health</span><span className="text-white">{selectedStatusTask.status_sync_health || "unknown"}</span></div>
+                    <div className="mt-3 flex items-center justify-between"><span>TMS load</span><span className="text-white">{selectedStatusTask.tms_load_id || "Not linked"}</span></div>
+                    <div className="mt-3 flex items-center justify-between"><span>TMS system</span><span className="text-white">{selectedStatusTask.tms_system || "Generic"}</span></div>
+                  </div>
+                  <div className="rounded-2xl bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                    <p className="text-xs uppercase tracking-[0.16em]">Latest status snapshot</p>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                      <div><p className="text-xs uppercase tracking-[0.16em]">Status</p><p className="mt-1 text-white">{payloadValue(selectedStatusTask.latest_status_snapshot, "status")}</p></div>
+                      <div><p className="text-xs uppercase tracking-[0.16em]">ETA</p><p className="mt-1 text-white">{payloadValue(selectedStatusTask.latest_status_snapshot, "eta")}</p></div>
+                      <div><p className="text-xs uppercase tracking-[0.16em]">Location</p><p className="mt-1 text-white">{payloadValue(selectedStatusTask.latest_status_snapshot, "location")}</p></div>
+                      <div><p className="text-xs uppercase tracking-[0.16em]">Source</p><p className="mt-1 text-white">{payloadValue(selectedStatusTask.latest_status_snapshot, "source")}</p></div>
+                    </div>
+                  </div>
+                  {selectedStatusTask.last_failure && <div className="rounded-2xl border border-rose-300/20 bg-rose-300/10 p-4 text-sm text-rose-50">{selectedStatusTask.last_failure}</div>}
+                </div>
+              )}
             </div>
 
             <div className="glass-panel p-5">
@@ -1713,26 +2063,49 @@ export function FreightDashboard() {
 
               <div className="mt-6">
                 <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Review queue</p>
+                <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
+                  <div className="rounded-2xl border border-rose-300/20 bg-rose-300/10 p-4 text-rose-50">
+                    <p className="text-xs uppercase tracking-[0.16em] text-rose-100">Critical alerts</p>
+                    <p className="mt-2 text-xl font-semibold text-white">{criticalReviewCount}</p>
+                    <p className="mt-1 text-xs text-rose-100">Primarily stale status workflows needing immediate operator follow-up.</p>
+                  </div>
+                  <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 p-4 text-amber-50">
+                    <p className="text-xs uppercase tracking-[0.16em] text-amber-100">High priority reviews</p>
+                    <p className="mt-2 text-xl font-semibold text-white">{highPriorityReviewCount}</p>
+                    <p className="mt-1 text-xs text-amber-100">Status ambiguities and booking warnings that should be resolved next.</p>
+                  </div>
+                </div>
                 <div className="mt-4 space-y-3">
                   {reviewQueue.length === 0 && <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-5 text-sm text-[var(--text-muted)]">No manual review items.</div>}
                   {reviewQueue.slice(0, 5).map((item) => (
-                    <div key={item.workflow_event_id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                    <div key={item.workflow_event_id} className={`rounded-2xl border p-4 ${item.priority === "critical" ? "border-rose-300/20 bg-rose-300/10" : item.priority === "high" ? "border-amber-300/20 bg-amber-300/10" : "border-white/10 bg-white/5"}`}>
                       <button onClick={() => setSelectedShipmentId(item.shipment_id)} className="w-full text-left transition hover:bg-white/0">
                       <div className="flex items-center justify-between gap-3">
                         <p className="text-sm font-medium text-white">{item.event_type.replaceAll("_", " ")}</p>
                         <span className="text-xs text-[var(--text-muted)]">{formatDate(item.created_at)}</span>
                       </div>
-                      {item.review_type && (
-                        <div className="mt-3">
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {item.review_type && (
                           <span className={`rounded-full px-2 py-1 text-[11px] ${item.review_type.includes("status") ? "bg-cyan-300/10 text-cyan-100" : "bg-white/10 text-white"}`}>
                             {item.review_type.replaceAll("_", " ")}
                           </span>
-                        </div>
-                      )}
+                        )}
+                        <span className={`rounded-full border px-2 py-1 text-[11px] ${reviewPriorityClasses(item.priority)}`}>
+                          {item.priority} priority
+                        </span>
+                        {item.alert_label && (
+                          <span className={`rounded-full border px-2 py-1 text-[11px] ${reviewPriorityClasses(item.priority)}`}>
+                            {item.alert_label}
+                          </span>
+                        )}
+                      </div>
                       <p className="mt-2 text-sm text-[var(--text-muted)]">{item.reason || "Operator review requested"}</p>
                       {item.next_action && <p className="mt-2 text-xs uppercase tracking-[0.16em] text-cyan-100">Next: {item.next_action.replaceAll("_", " ")}</p>}
                       {item.missing_fields.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.missing_fields.map((field) => <span key={field} className="rounded-full bg-amber-300/10 px-2 py-1 text-[11px] text-amber-100">{field}</span>)}</div>}
                       {item.ambiguity_reasons.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.ambiguity_reasons.map((reason) => <span key={reason} className="rounded-full bg-rose-300/10 px-2 py-1 text-[11px] text-rose-100">{reason.replaceAll("_", " ")}</span>)}</div>}
+                      {item.status_stale && <div className="mt-3 rounded-2xl border border-rose-300/20 bg-rose-300/10 px-3 py-3 text-xs text-rose-50">This status workflow is beyond the current SLA window and should be handled first.</div>}
+                      {item.status_review_required && !item.status_stale && <div className="mt-3 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 px-3 py-3 text-xs text-cyan-50">This case needs a status-specific operator decision before automation continues.</div>}
+                      {item.document_conflict_fields.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.document_conflict_fields.map((field) => <span key={field} className="rounded-full bg-rose-300/10 px-2 py-1 text-[11px] text-rose-100">Conflict: {field.replaceAll("_", " ")}</span>)}</div>}
                       {item.missing_document_types.length > 0 && <div className="mt-3 flex flex-wrap gap-2">{item.missing_document_types.map((documentType) => <span key={documentType} className="rounded-full bg-amber-300/10 px-2 py-1 text-[11px] text-amber-100">Missing {documentType.replaceAll("_", " ")}</span>)}</div>}
                       {item.booking_review_warning && <div className="mt-3 rounded-2xl border border-amber-300/20 bg-amber-300/10 px-3 py-3 text-xs text-amber-50">{item.booking_review_warning}</div>}
                       </button>
@@ -1746,6 +2119,12 @@ export function FreightDashboard() {
                           <>
                             <button onClick={() => void handleOperatorAction("rerun_tms_update", item.shipment_id)} disabled={submitting === "rerun_tms_update"} className="action-button w-full bg-sky-300/15 text-sky-100 hover:bg-sky-300/20 disabled:opacity-50">Replay update</button>
                             <button onClick={() => void handleOperatorAction("rerun_status_lookup", item.shipment_id)} disabled={submitting === "rerun_status_lookup"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Check TMS status</button>
+                          </>
+                        ) : item.review_type === "document_conflict_review" || item.review_type === "ocr_review_required" || item.review_type === "document_parse_low_confidence" ? (
+                          <>
+                            <button onClick={() => void handleOperatorAction("rerun_document_extraction", item.shipment_id)} disabled={submitting === "rerun_document_extraction"} className="action-button w-full bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Reprocess docs</button>
+                            <button onClick={() => void handleOperatorAction("approve_document_values", item.shipment_id)} disabled={submitting === "approve_document_values"} className="action-button w-full bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">Approve values</button>
+                            <button onClick={() => void handleOperatorAction("ignore_document_warning", item.shipment_id)} disabled={submitting === "ignore_document_warning"} className="action-button w-full bg-amber-300/15 text-amber-100 hover:bg-amber-300/20 disabled:opacity-50 sm:col-span-2">Ignore warning</button>
                           </>
                         ) : (
                           <>

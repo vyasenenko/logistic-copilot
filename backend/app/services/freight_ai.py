@@ -50,6 +50,7 @@ BID_HINTS = ("all in", "can do", "rate", "quote back", "our quote", "best rate",
 CONFIRM_HINTS = ("ok book", "please book", "book it", "go ahead and book", "approved")
 STATUS_REQUEST_HINTS = ("eta", "status", "update", "where is", "where's", "location", "arrive", "delivery status")
 CARRIER_STATUS_HINTS = ("arrived", "loaded", "empty", "unloaded", "detained", "running late", "eta", "currently in", "gps", "location")
+ISSUE_HINTS = ("delay", "delayed", "problem", "issue", "damaged", "missed", "late", "breakdown", "detention")
 EQUIPMENT_ALIASES = {
     "van": "Dry Van",
     "dry van": "Dry Van",
@@ -107,7 +108,7 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
         prompt = (
             "Classify the freight inbox email intent. "
             "Allowed intents: new_quote_request, carrier_bid_reply, "
-            "customer_quote_confirmation, customer_clarification, customer_status_request, carrier_status_update, noise_or_unhandled. "
+            "customer_quote_confirmation, customer_clarification, customer_status_request, carrier_status_update, exception_or_issue, noise_or_unhandled. "
             "Return high confidence only when the intent is clear.\n\n"
             f"{_context_blob(email_context)}"
         )
@@ -215,6 +216,8 @@ def _classify_with_heuristics(email_context: dict) -> IntentResult:
 
     if sender_role == "carrier" and any(token in text for token in CARRIER_STATUS_HINTS):
         return IntentResult(intent="carrier_status_update", confidence=0.72)
+    if any(token in text for token in ISSUE_HINTS):
+        return IntentResult(intent="exception_or_issue", confidence=0.7)
     if sender_role == "carrier" and any(token in text for token in BID_HINTS):
         amount = _extract_bid_amount(text)
         return IntentResult(intent="carrier_bid_reply", confidence=0.85 if amount is not None else 0.68)
