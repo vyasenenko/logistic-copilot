@@ -9,6 +9,7 @@ from app.services.freight_ai import (
     _extract_status_request_with_heuristics,
     _extract_bid_with_heuristics,
     _extract_shipment_with_heuristics,
+    _merge_shipment_results,
 )
 from app.schemas import ShipmentExtractionResult
 
@@ -40,6 +41,49 @@ def test_extract_shipment_converts_kg_to_lb():
     assert result.weight_lb is not None
     assert round(result.weight_lb, 2) == 4409.24
     assert result.equipment_type == "Reefer"
+
+
+def test_merge_shipment_results_keeps_naive_ready_at_wall_time_with_origin_timezone():
+    primary = ShipmentExtractionResult(
+        origin="Dallas, TX",
+        destination="Atlanta, GA",
+        ready_at=None,
+        missing_fields=[],
+        ambiguity_reasons=[],
+        confidence=0.8,
+    )
+    fallback = ShipmentExtractionResult(
+        origin="Dallas, TX",
+        destination="Atlanta, GA",
+        ready_at="2026-04-21T09:30:00",  # naive local pickup time
+        missing_fields=[],
+        ambiguity_reasons=[],
+        confidence=0.7,
+    )
+
+    merged = _merge_shipment_results(primary, fallback)
+
+    assert merged.ready_at is not None
+    assert merged.ready_at.tzinfo is None
+    assert merged.ready_at.hour == 9
+    assert merged.ready_at.minute == 30
+    assert "ready_at_timezone_unresolved" not in merged.ambiguity_reasons
+
+
+def test_merge_shipment_results_flags_unresolved_timezone_for_naive_ready_at():
+    primary = ShipmentExtractionResult(
+        origin="Unknown Origin",
+        destination="Unknown Destination",
+        ready_at="2026-04-21T09:30:00",
+        missing_fields=[],
+        ambiguity_reasons=[],
+        confidence=0.8,
+    )
+    fallback = ShipmentExtractionResult(confidence=0.5)
+
+    merged = _merge_shipment_results(primary, fallback)
+
+    assert "ready_at_timezone_unresolved" in merged.ambiguity_reasons
 
 
 def test_extract_bid_prefers_rate_language():

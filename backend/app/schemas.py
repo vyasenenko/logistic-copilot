@@ -35,6 +35,7 @@ class WorkflowEventType(str, Enum):
     EMAIL_RECEIVED = "email_received"
     PARSING_COMPLETED = "parsing_completed"
     SHIPMENT_PARSED = "shipment_parsed"
+    SHIPMENT_FIELDS_UPDATED = "shipment_fields_updated"
     SHIPMENT_PARSE_FAILED = "shipment_parse_failed"
     CLIENT_ACK_SENT = "client_ack_sent"
     CARRIER_OUTREACH_SENT = "carrier_outreach_sent"
@@ -176,6 +177,8 @@ class ShipmentRecord(BaseModel):
     weight_lb: float | None = None
     equipment_type: str | None = None
     ready_at: datetime | None = None
+    ready_at_timezone: str | None = None
+    ready_at_offset_minutes: int | None = None
     margin_policy: dict = Field(default_factory=dict)
     notes: str = ""
     ai_intent: str | None = None

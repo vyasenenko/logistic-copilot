@@ -1,6 +1,7 @@
 """AI Agent Backend — FastAPI application entry point."""
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import logging
 
 from fastapi import FastAPI
@@ -9,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+_webhook_bootstrap_task: asyncio.Task | None = None
 
 
 async def _ensure_outlook_webhook_subscription_on_startup() -> None:
@@ -44,6 +46,15 @@ async def _ensure_outlook_webhook_subscription_on_startup() -> None:
         logger.exception("Failed to ensure Outlook webhook subscription on startup.")
 
 
+async def _delayed_outlook_webhook_subscription_bootstrap() -> None:
+    """Delay webhook bootstrap until server is ready to serve validation requests."""
+    delay_seconds = max(0, settings.microsoft_webhook_startup_delay_seconds)
+    if delay_seconds:
+        logger.info("Outlook webhook bootstrap will run in %ss.", delay_seconds)
+        await asyncio.sleep(delay_seconds)
+    await _ensure_outlook_webhook_subscription_on_startup()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
@@ -59,11 +70,19 @@ async def lifespan(app: FastAPI):
     await init_vector_store()
     logger.info("Startup step 2/3 complete.")
 
-    logger.info("Startup step 3/3: ensuring Outlook webhook subscription (if configured).")
-    await _ensure_outlook_webhook_subscription_on_startup()
+    logger.info("Startup step 3/3: scheduling Outlook webhook bootstrap task.")
+    global _webhook_bootstrap_task
+    _webhook_bootstrap_task = asyncio.create_task(
+        _delayed_outlook_webhook_subscription_bootstrap(),
+        name="outlook-webhook-bootstrap",
+    )
     logger.info("Startup sequence complete.")
     yield
     # Shutdown: cleanup
+    if _webhook_bootstrap_task and not _webhook_bootstrap_task.done():
+        _webhook_bootstrap_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _webhook_bootstrap_task
 
 
 app = FastAPI(

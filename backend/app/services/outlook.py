@@ -317,12 +317,23 @@ class OutlookGraphClient:
             raise RuntimeError("At least one recipient is required to send email")
 
         url = f"{self.base_url}/users/{settings.microsoft_mailbox}/sendMail"
+        effective_sender = settings.microsoft_mailbox.strip()
         payload = {
             "message": {
                 "subject": subject,
                 "body": {
                     "contentType": "Text",
                     "content": body,
+                },
+                "from": {
+                    "emailAddress": {
+                        "address": effective_sender,
+                    }
+                },
+                "sender": {
+                    "emailAddress": {
+                        "address": effective_sender,
+                    }
                 },
                 "toRecipients": [
                     {"emailAddress": {"address": recipient}}
@@ -341,6 +352,7 @@ class OutlookGraphClient:
             "recipients": recipients,
             "save_to_sent_items": save_to_sent_items,
             "provider": "outlook",
+            "sender_address": effective_sender,
         }
 
     async def list_subscriptions(self) -> list[dict]:

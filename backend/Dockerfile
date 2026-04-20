@@ -8,7 +8,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml .
-RUN pip install --no-cache-dir $(python -c "import tomllib; deps=tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']; print(' '.join(deps))")
+# Install deps via subprocess (not shell-joined): commas in specifiers break `pip install $(...)`
+RUN python <<'PY'
+import subprocess
+import tomllib
+
+with open("pyproject.toml", "rb") as f:
+    deps = tomllib.load(f)["project"]["dependencies"]
+subprocess.check_call(["pip", "install", "--no-cache-dir", *deps])
+PY
 
 COPY app/ app/
 

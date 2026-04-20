@@ -12,6 +12,7 @@ from app.config import settings
 from app.memory.database import Carrier, CarrierBid, EmailMessage, EmailThread, Shipment, WorkflowEvent
 from app.schemas import CarrierOutreachItem, CarrierOutreachResponse, ShipmentStage, WorkflowEventType
 from app.services.email_correlation import attach_quote_token, generate_quote_reference, normalize_subject
+from app.services.location_timezone import format_ready_at_wall_display
 from app.services.outlook import OutlookGraphClient
 
 
@@ -31,7 +32,7 @@ def _build_outreach_body(shipment: Shipment, custom_message: str | None = None) 
         f"Weight (lb): {shipment.weight_lb if shipment.weight_lb is not None else 'TBD'}",
         f"Equipment: {shipment.equipment_type or 'TBD'}",
         (
-            f"Ready at: {shipment.ready_at.astimezone(timezone.utc).isoformat()}"
+            f"Ready at: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
             if shipment.ready_at
             else "Ready at: TBD"
         ),

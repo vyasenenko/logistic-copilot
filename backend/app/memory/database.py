@@ -4,7 +4,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -129,7 +129,10 @@ class Shipment(Base):
     pallets = Column(Integer, nullable=True)
     weight_lb = Column(Float, nullable=True)
     equipment_type = Column(String(100), nullable=True)
-    ready_at = Column(DateTime(timezone=True), nullable=True)
+    # Naive local "wall clock" time; zone is ready_at_timezone (IANA). Not stored as UTC instant.
+    ready_at = Column(DateTime(timezone=False), nullable=True)
+    ready_at_timezone = Column(String(64), nullable=True)
+    ready_at_offset_minutes = Column(Integer, nullable=True)
     margin_policy_json = Column(JSON, default=dict, nullable=False)
     notes = Column(Text, default="", nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -183,6 +186,40 @@ async def init_db() -> None:
     """Create all tables."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight schema patching for existing dev databases (no migration framework yet).
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ready_at_timezone VARCHAR(64)")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ready_at_offset_minutes INTEGER")
+        )
+        await conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'shipments'
+                      AND column_name = 'ready_at'
+                      AND data_type = 'timestamp with time zone'
+                  ) THEN
+                    ALTER TABLE shipments
+                      ALTER COLUMN ready_at TYPE timestamp without time zone
+                      USING (
+                        CASE
+                          WHEN ready_at IS NULL THEN NULL
+                          WHEN ready_at_timezone IS NOT NULL
+                            THEN (ready_at AT TIME ZONE ready_at_timezone)
+                          ELSE (ready_at AT TIME ZONE 'UTC')
+                        END
+                      );
+                  END IF;
+                END$$;
+                """
+            )
+        )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

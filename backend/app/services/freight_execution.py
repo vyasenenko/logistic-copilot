@@ -34,6 +34,7 @@ from app.schemas import (
 )
 from app.services.email_correlation import attach_quote_token, extract_quote_token
 from app.services.document_ocr import extract_document_content
+from app.services.location_timezone import format_ready_at_wall_display, local_date_iso_in_zone
 from app.services.outlook import OutlookGraphClient
 from app.services.tms_connector import TmsConnector
 
@@ -558,7 +559,9 @@ def _detect_document_conflicts(attachments: list[dict], shipment: Shipment) -> l
             extracted_fields = dict(attachment.get("extracted_fields", {}) or {})
             pickup_date_text = extracted_fields.get("pickup_date_text")
             if isinstance(pickup_date_text, str):
-                ready_date = shipment.ready_at.astimezone(timezone.utc).date().isoformat()
+                ready_date = local_date_iso_in_zone(
+                    shipment.ready_at, shipment.ready_at_timezone
+                )
                 if ready_date not in pickup_date_text:
                     conflicts.append("pickup_date_text")
                     break
@@ -868,7 +871,7 @@ async def send_client_acknowledgement(
     ]
     if shipment.ready_at:
         body_lines.append(
-            f"Requested ready time: {shipment.ready_at.astimezone(timezone.utc).isoformat()}"
+            f"Requested ready time: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
         )
     if custom_message:
         body_lines.extend(["", custom_message.strip()])
@@ -1046,7 +1049,9 @@ async def send_customer_quote(
         f"Route: {shipment.origin or 'TBD'} to {shipment.destination or 'TBD'}",
     ]
     if shipment.ready_at:
-        body_lines.append(f"Ready at: {shipment.ready_at.astimezone(timezone.utc).isoformat()}")
+        body_lines.append(
+            f"Ready at: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
+        )
     if custom_message:
         body_lines.extend(["", custom_message.strip()])
     body_lines.extend(["", "Reply OK to confirm booking."])
@@ -1157,7 +1162,11 @@ async def handoff_to_tms(
             "pallets": shipment.pallets,
             "weight_lb": shipment.weight_lb,
             "equipment_type": shipment.equipment_type,
-            "ready_at": shipment.ready_at.astimezone(timezone.utc).isoformat() if shipment.ready_at else None,
+            "ready_at": format_ready_at_wall_display(
+                shipment.ready_at, shipment.ready_at_timezone
+            )
+            if shipment.ready_at
+            else None,
         },
         "bid": {
             "id": str(bid.id),
@@ -1331,7 +1340,7 @@ async def send_booking_confirmation(
     ]
     if shipment.ready_at:
         body_lines.append(
-            f"Scheduled ready time: {shipment.ready_at.astimezone(timezone.utc).isoformat()}"
+            f"Scheduled ready time: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
         )
     if custom_message:
         body_lines.extend(["", custom_message.strip()])

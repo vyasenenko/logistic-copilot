@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     microsoft_webhook_public_base_url: str = ""
     microsoft_webhook_change_type: str = "created"
     microsoft_webhook_resource: str = ""
+    microsoft_webhook_startup_delay_seconds: int = 8
     microsoft_webhook_renewal_buffer_minutes: int = 120
     microsoft_webhook_expiration_minutes: int = 10080
 

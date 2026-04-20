@@ -2,8 +2,10 @@
 
 import { startTransition, useEffect, useMemo, useState } from "react";
 import {
+  AlertTriangle,
   ArrowRight,
   Building2,
+  CheckCircle2,
   CircleDollarSign,
   ClipboardCheck,
   Clock3,
@@ -11,8 +13,11 @@ import {
   Loader2,
   Mail,
   Map,
+  MoreHorizontal,
   Package2,
+  PencilLine,
   RadioTower,
+  RefreshCcw,
   Send,
   ShieldCheck,
   Sparkles,
@@ -552,7 +557,250 @@ function ShipmentStatusPill({ status }: { status: string }) {
   );
 }
 
-export function FreightDashboard() {
+type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
+
+interface ShipmentEditorState {
+  client_id: string;
+  origin: string;
+  destination: string;
+  pallets: string;
+  weight_lb: string;
+  equipment_type: string;
+  ready_at: string;
+  notes: string;
+}
+
+interface ShipmentContextAction {
+  key: string;
+  label: string;
+  tone?: "primary" | "neutral" | "success" | "warning";
+  operatorAction?: OperatorAction;
+  requiresSave?: boolean;
+}
+
+interface ShipmentActionModel {
+  label: string | null;
+  reason: string;
+  blockingReason: string | null;
+  operatorAction: OperatorAction | null;
+  requiresSave: boolean;
+  contextActions: ShipmentContextAction[];
+}
+
+function formatRoute(shipment: ShipmentRecord) {
+  return `${shipment.origin || "Origin TBD"} -> ${shipment.destination || "Destination TBD"}`;
+}
+
+function formatNumber(value: number | null, suffix = "") {
+  if (value === null || value === undefined) return "--";
+  return `${value}${suffix}`;
+}
+
+function toDateTimeLocal(value: string | null) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value.slice(0, 16);
+  }
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function buildShipmentEditor(shipment: ShipmentRecord | null): ShipmentEditorState {
+  if (!shipment) {
+    return {
+      client_id: "",
+      origin: "",
+      destination: "",
+      pallets: "",
+      weight_lb: "",
+      equipment_type: "",
+      ready_at: "",
+      notes: "",
+    };
+  }
+  return {
+    client_id: shipment.client_id || "",
+    origin: shipment.origin || "",
+    destination: shipment.destination || "",
+    pallets: shipment.pallets?.toString() || "",
+    weight_lb: shipment.weight_lb?.toString() || "",
+    equipment_type: shipment.equipment_type || "",
+    ready_at: toDateTimeLocal(shipment.ready_at),
+    notes: shipment.notes || "",
+  };
+}
+
+function shipmentHasMinimumFields(editor: ShipmentEditorState) {
+  return Boolean(
+    editor.origin.trim() &&
+      editor.destination.trim() &&
+      editor.pallets.trim() &&
+      editor.weight_lb.trim() &&
+      editor.equipment_type.trim() &&
+      editor.ready_at.trim(),
+  );
+}
+
+function shipmentNeedsAttention(shipment: ShipmentRecord) {
+  return Boolean(
+    shipment.manual_review_required ||
+      shipment.ai_missing_fields.length > 0 ||
+      shipment.ai_ambiguity_reasons.length > 0 ||
+      shipment.status_review_required ||
+      shipment.booking_review_required,
+  );
+}
+
+function shipmentBlockingBadge(shipment: ShipmentRecord) {
+  if (shipment.ai_missing_fields.length > 0) return "Missing details";
+  if (shipment.ai_ambiguity_reasons.length > 0) return "Ambiguous parse";
+  if (shipment.manual_review_required) return "Needs review";
+  if (shipment.booking_review_required) return "Docs warning";
+  if (shipment.status_review_required) return "Status review";
+  if (shipment.status_stale) return "Status stale";
+  if (shipment.status === "waiting_bids") return "Waiting bids";
+  return "Ready";
+}
+
+function deriveShipmentActionModel(
+  shipment: ShipmentRecord,
+  editor: ShipmentEditorState,
+  activeStatusTasks: StatusQueueItem[],
+  bidCount: number,
+) : ShipmentActionModel {
+  const hasMinimumFields = shipmentHasMinimumFields(editor);
+  const statusReplyTask = activeStatusTasks.find((task) => task.task_type === "status_reply");
+  const carrierUpdateTask = activeStatusTasks.find((task) => task.task_type === "carrier_update");
+
+  const baseActions: ShipmentContextAction[] = [
+    { key: "edit", label: "Edit details" },
+    { key: "rerun_parsing", label: "Re-run parsing", operatorAction: "rerun_parsing" },
+  ];
+
+  if (shipment.status === "waiting_bids" || shipment.status === "outreaching") {
+    baseActions.push({ key: "rerun_outreach", label: "Re-run outreach", operatorAction: "rerun_outreach" });
+  }
+  if (bidCount > 0) {
+    baseActions.push({ key: "rerun_evaluation", label: "Re-run evaluation", operatorAction: "rerun_evaluation" });
+  }
+  if (shipment.status_stale || shipment.status_workflow_state) {
+    baseActions.push({ key: "rerun_status_lookup", label: "Refresh status", operatorAction: "rerun_status_lookup" });
+  }
+  if (carrierUpdateTask) {
+    baseActions.push({ key: "rerun_tms_update", label: "Re-run TMS update", operatorAction: "rerun_tms_update" });
+  }
+  if (statusReplyTask) {
+    baseActions.push({ key: "approve_status_reply", label: "Preview status reply", operatorAction: "approve_status_reply" });
+  }
+
+  if (!hasMinimumFields) {
+    return {
+      label: null,
+      reason: "This shipment is missing critical quote fields. Update the details first so automation knows what to send to carriers.",
+      blockingReason: `Missing: ${["origin", "destination", "pallets", "weight_lb", "equipment_type", "ready_at"]
+        .filter((field) => !editor[field as keyof ShipmentEditorState])
+        .map((field) => field.replaceAll("_", " "))
+        .join(", ")}`,
+      operatorAction: null,
+      requiresSave: false,
+      contextActions: baseActions,
+    };
+  }
+
+  if (shipment.status === "parsing" || shipment.status === "received" || shipment.status === "client_acknowledged") {
+    return {
+      label: "Approve and send outreach",
+      reason: "The parsed shipment looks complete. Approving should save the current values and move the quote flow forward.",
+      blockingReason: null,
+      operatorAction: "approve_and_continue",
+      requiresSave: true,
+      contextActions: [
+        { key: "approve_and_continue", label: "Approve parsed shipment", operatorAction: "approve_and_continue", requiresSave: true, tone: "success" },
+        ...baseActions,
+      ],
+    };
+  }
+
+  if (shipment.status === "waiting_customer_details") {
+    return {
+      label: null,
+      reason: "Automation is waiting for missing customer details. You can either fill them in here or send a clarification manually.",
+      blockingReason: "Customer details still incomplete",
+      operatorAction: null,
+      requiresSave: false,
+      contextActions: baseActions,
+    };
+  }
+
+  if ((shipment.status === "waiting_bids" || shipment.status === "evaluating") && bidCount > 0) {
+    return {
+      label: "Approve and evaluate bids",
+      reason: "Carrier responses are in. Evaluating now will pick the best option and prepare the next quote step.",
+      blockingReason: null,
+      operatorAction: "rerun_evaluation",
+      requiresSave: false,
+      contextActions: [
+        { key: "rerun_evaluation", label: "Approve and evaluate", operatorAction: "rerun_evaluation", tone: "success" },
+        ...baseActions,
+      ],
+    };
+  }
+
+  if (statusReplyTask) {
+    return {
+      label: "Approve and send status reply",
+      reason: "A customer-facing status reply is waiting for operator approval.",
+      blockingReason: null,
+      operatorAction: "approve_status_reply",
+      requiresSave: false,
+      contextActions: [
+        { key: "approve_status_reply", label: "Approve and send reply", operatorAction: "approve_status_reply", tone: "success" },
+        ...baseActions,
+      ],
+    };
+  }
+
+  if (shipment.booking_review_required) {
+    return {
+      label: "Approve document values",
+      reason: "Document extraction found a warning. Approve the extracted values before relying on booking data.",
+      blockingReason: shipment.booking_review_warning,
+      operatorAction: "approve_document_values",
+      requiresSave: false,
+      contextActions: [
+        { key: "approve_document_values", label: "Approve document values", operatorAction: "approve_document_values", tone: "success" },
+        { key: "ignore_document_warning", label: "Ignore warning", operatorAction: "ignore_document_warning", tone: "warning" },
+        ...baseActions,
+      ],
+    };
+  }
+
+  if (shipment.status === "quoted" || shipment.status === "awaiting_confirmation") {
+    return {
+      label: "Continue workflow",
+      reason: "The shipment is already in the customer quote / confirmation stage. Use secondary actions below if you want previews or booking tools.",
+      blockingReason: null,
+      operatorAction: "resume_workflow",
+      requiresSave: false,
+      contextActions: [
+        { key: "resume_workflow", label: "Approve and continue workflow", operatorAction: "resume_workflow", tone: "primary" },
+        ...baseActions,
+      ],
+    };
+  }
+
+  return {
+    label: "Continue workflow",
+    reason: "This shipment has no blocking review. Continuing workflow will ask the backend for the next safe step.",
+    blockingReason: null,
+    operatorAction: "resume_workflow",
+    requiresSave: false,
+    contextActions: [{ key: "resume_workflow", label: "Approve and continue workflow", operatorAction: "resume_workflow", tone: "primary" }, ...baseActions],
+  };
+}
+
+function LegacyFreightDashboard() {
   const [tab, setTab] = useState<DashboardTab>("shipments");
   const [overview, setOverview] = useState<OverviewResponse>(EMPTY_OVERVIEW);
   const [clients, setClients] = useState<ClientRecord[]>([]);
@@ -1206,32 +1454,32 @@ export function FreightDashboard() {
 
   const metrics = [
     {
-      label: "Active shipments",
-      value: overview.counts.shipments,
-      detail: `${overview.counts.workflow_events} workflow events recorded`,
+      label: "Need attention",
+      value: reviewQueue.length + overview.status_metrics.review_required,
+      detail: `${reviewQueue.length} review items total`,
       icon: Package2,
-      accent: "from-cyan-300/30 to-cyan-500/5",
+      accent: "from-rose-300/20 to-rose-500/5",
     },
     {
-      label: "Carrier network",
-      value: overview.counts.carriers,
-      detail: `${overview.counts.bids} bid records across all lanes`,
+      label: "Active shipments",
+      value: overview.counts.shipments,
+      detail: `${overview.counts.workflow_events} workflow events`,
       icon: Truck,
-      accent: "from-amber-300/30 to-amber-500/5",
+      accent: "from-cyan-300/20 to-cyan-500/5",
     },
     {
       label: "Inbox traffic",
       value: overview.counts.email_messages,
-      detail: `${overview.counts.email_threads} normalized threads in Outlook`,
+      detail: `${overview.counts.email_threads} synced threads`,
       icon: Mail,
-      accent: "from-rose-300/30 to-rose-500/5",
+      accent: "from-slate-300/20 to-slate-500/5",
     },
     {
-      label: "Status replies",
-      value: overview.status_metrics.replies_sent,
-      detail: `${overview.status_metrics.lookups} lookups, ${overview.status_metrics.review_required} status reviews`,
+      label: "Status health",
+      value: overview.status_metrics.stale_shipments,
+      detail: `${overview.status_metrics.lookups} lookups, ${overview.status_metrics.replies_sent} replies sent`,
       icon: RadioTower,
-      accent: "from-emerald-300/30 to-emerald-500/5",
+      accent: "from-emerald-300/20 to-emerald-500/5",
     },
   ];
 
@@ -1241,27 +1489,27 @@ export function FreightDashboard() {
 
   return (
     <main className="min-h-screen px-4 py-5 text-[var(--text-main)] sm:px-6 lg:px-8">
-      <div className="mx-auto max-w-[1600px] space-y-6">
-        <section className="glass-panel overflow-hidden px-6 py-6 sm:px-8">
-          <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
+      <div className="mx-auto max-w-[1480px] space-y-6">
+        <section className="glass-panel overflow-hidden px-5 py-5 sm:px-6">
+          <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
             <div className="max-w-3xl space-y-4">
-              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">
-                <LayoutDashboard size={14} /> Freight Control Tower
+              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">
+                <LayoutDashboard size={14} /> Logistic Copilot
               </div>
               <div className="space-y-3">
-                <h1 className="max-w-3xl text-4xl font-semibold tracking-[-0.04em] text-white sm:text-5xl">
-                  Outlook-native quoting workflow for your brokerage desk.
+                <h1 className="max-w-3xl text-3xl font-semibold tracking-[-0.04em] text-white sm:text-4xl">
+                  Simple freight inbox dashboard.
                 </h1>
-                <p className="max-w-2xl text-sm leading-7 text-[var(--text-muted)] sm:text-base">
-                  Manage inbound requests, build carrier competition, evaluate bids, quote the customer, and preview TMS handoff from one operations surface.
+                <p className="max-w-2xl text-sm leading-6 text-[var(--text-muted)] sm:text-base">
+                  Start with what needs attention, open one shipment, and see what the system already did and what should happen next.
                 </p>
               </div>
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-3 lg:min-w-[520px]">
+            <div className="grid gap-3 sm:grid-cols-2 xl:min-w-[520px]">
               {metrics.map(({ label, value, detail, icon: Icon, accent }) => (
-                <div key={label} className={`rounded-[24px] border border-white/10 bg-gradient-to-br ${accent} p-4 shadow-lg`}>
-                  <div className="mb-10 flex items-center justify-between">
+                <div key={label} className={`rounded-[24px] border border-white/10 bg-gradient-to-br ${accent} p-4`}>
+                  <div className="mb-6 flex items-center justify-between">
                     <span className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">{label}</span>
                     <Icon size={18} className="text-white/80" />
                   </div>
@@ -1274,7 +1522,7 @@ export function FreightDashboard() {
             </div>
           </div>
 
-          <div className="mt-6 flex flex-wrap items-center gap-3">
+          <div className="mt-5 flex flex-wrap items-center gap-2">
             {stageHighlights.map(([stage, count]) => (
               <div key={stage} className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs text-[var(--text-muted)]">
                 <span className="mr-2 font-medium text-white">{count}</span>
@@ -1290,13 +1538,13 @@ export function FreightDashboard() {
         {error && <div className="glass-panel-strong border-red-400/20 px-5 py-4 text-sm text-red-100">{error}</div>}
         {notice && <div className="glass-panel-strong border-cyan-400/20 px-5 py-4 text-sm text-cyan-100">{notice}</div>}
 
-        <section className="grid gap-6 xl:grid-cols-[260px,minmax(0,1fr),390px]">
+        <section className="space-y-6">
           <aside className="glass-panel p-4">
             <div className="mb-4 px-2">
-              <p className="text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">Surfaces</p>
-              <p className="mt-2 text-lg font-medium text-white">Operations console</p>
+              <p className="text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">Navigation</p>
+              <p className="mt-2 text-lg font-medium text-white">Choose what to work on</p>
             </div>
-            <div className="space-y-2">
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {[
                 { key: "shipments", label: "Shipments", icon: Package2 },
                 { key: "status_ops", label: "Status Ops", icon: RadioTower },
@@ -1317,16 +1565,23 @@ export function FreightDashboard() {
               })}
             </div>
 
-            <div className="mt-6 rounded-[24px] border border-white/10 bg-slate-950/40 p-4">
-              <p className="text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">Ready state</p>
-              <div className="mt-4 space-y-4 text-sm text-[var(--text-muted)]">
+            <div className="mt-6 grid gap-3 sm:grid-cols-3">
+              <div className="rounded-[24px] border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)]">
                 <div className="flex items-center justify-between"><span>Inbox sync</span><ShieldCheck size={16} className="text-cyan-200" /></div>
+                <p className="mt-2 text-white">Ready</p>
+              </div>
+              <div className="rounded-[24px] border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)]">
                 <div className="flex items-center justify-between"><span>Carrier outreach</span><Send size={16} className="text-amber-200" /></div>
+                <p className="mt-2 text-white">Configured</p>
+              </div>
+              <div className="rounded-[24px] border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)]">
                 <div className="flex items-center justify-between"><span>Bid evaluation</span><Sparkles size={16} className="text-rose-200" /></div>
+                <p className="mt-2 text-white">Available</p>
               </div>
             </div>
           </aside>
 
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr),390px]">
           <section className="space-y-6">
             {loading ? (
               <div className="glass-panel flex min-h-[520px] items-center justify-center p-8">
@@ -1346,7 +1601,7 @@ export function FreightDashboard() {
                         <button onClick={() => void refreshAll()} className="action-button bg-white/10 text-sm text-white hover:bg-white/15">Refresh</button>
                       </div>
                     </div>
-                    <div className="grid gap-3 p-4 lg:grid-cols-2">
+                    <div className="grid gap-3 p-4">
                       {shipments.length === 0 && <div className="rounded-[24px] border border-dashed border-white/10 bg-white/5 p-8 text-sm text-[var(--text-muted)] lg:col-span-2">No shipments yet. Seed one from the form to start the quoting workflow.</div>}
                       {shipments.map((shipment) => (
                         <button
@@ -1452,7 +1707,7 @@ export function FreightDashboard() {
                       </div>
                       <button onClick={() => void refreshAll()} className="action-button bg-white/10 text-sm text-white hover:bg-white/15">Refresh</button>
                     </div>
-                    <div className="grid gap-3 p-4 lg:grid-cols-2">
+                    <div className="grid gap-3 p-4">
                       <div className="lg:col-span-2 flex gap-2">
                         <button onClick={() => setStatusQueueScope("active")} className={`action-button ${statusQueueScope === "active" ? "bg-cyan-300/15 text-cyan-100" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10"}`}>Active</button>
                         <button onClick={() => setStatusQueueScope("resolved")} className={`action-button ${statusQueueScope === "resolved" ? "bg-cyan-300/15 text-cyan-100" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10"}`}>Recent resolved</button>
@@ -2139,8 +2394,11 @@ export function FreightDashboard() {
               </div>
             </div>
           </section>
-        </section>
+        </div>
+      </section>
       </div>
     </main>
   );
 }
+
+export { FreightDashboardWorkspace as FreightDashboard } from "./FreightDashboardWorkspace";

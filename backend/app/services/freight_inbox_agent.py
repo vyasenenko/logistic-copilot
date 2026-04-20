@@ -37,6 +37,7 @@ from app.services.freight_execution import (
     send_customer_status_reply,
     send_customer_quote,
 )
+from app.services.location_timezone import apply_shipment_ready_at_wall_fields
 from app.services.freight_outreach import create_carrier_outreach
 
 CRITICAL_SHIPMENT_FIELDS = {"origin", "destination"}
@@ -581,24 +582,47 @@ async def _handle_new_quote_request(
     ack_subject = None
     outreach_subject = None
     outreach_targeted = 0
-    if policy.auto_acknowledgement and not await _has_event(session, shipment.id, WorkflowEventType.CLIENT_ACK_SENT.value):
-        ack = await send_client_acknowledgement(
+    try:
+        if policy.auto_acknowledgement and not await _has_event(session, shipment.id, WorkflowEventType.CLIENT_ACK_SENT.value):
+            ack = await send_client_acknowledgement(
+                session,
+                shipment_id=shipment.id,
+                dry_run=policy.acknowledgement_dry_run,
+                custom_message=None,
+            )
+            ack_subject = ack.subject
+        if policy.auto_outreach and not await _has_event(session, shipment.id, WorkflowEventType.CARRIER_OUTREACH_SENT.value):
+            outreach = await create_carrier_outreach(
+                session,
+                shipment_id=shipment.id,
+                carrier_ids=[],
+                dry_run=policy.outreach_dry_run,
+                custom_message=None,
+            )
+            outreach_subject = outreach.subject
+            outreach_targeted = outreach.targeted
+    except RuntimeError as exc:
+        await _log_manual_review(
             session,
-            shipment_id=shipment.id,
-            dry_run=policy.acknowledgement_dry_run,
-            custom_message=None,
+            shipment.id,
+            f"Quote intake automation blocked: {exc}",
+            intent_result=intent_result,
+            next_action="manual_review",
+            allow_repeat=policy.allow_repeat_manual_review,
         )
-        ack_subject = ack.subject
-    if policy.auto_outreach and not await _has_event(session, shipment.id, WorkflowEventType.CARRIER_OUTREACH_SENT.value):
-        outreach = await create_carrier_outreach(
-            session,
-            shipment_id=shipment.id,
-            carrier_ids=[],
-            dry_run=policy.outreach_dry_run,
-            custom_message=None,
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id),
+            intent=intent_result.intent,
+            confidence=extraction.confidence,
+            next_action="manual_review",
+            shipment_extracted=True,
+            missing_fields=extraction.missing_fields,
+            ambiguity_reasons=extraction.ambiguity_reasons,
+            acknowledgement_drafted=ack_subject is not None,
+            acknowledgement_subject=ack_subject,
+            manual_review_required=True,
         )
-        outreach_subject = outreach.subject
-        outreach_targeted = outreach.targeted
     next_action = "waiting_bids" if outreach_subject is not None else "awaiting_next_policy_action"
     return WorkflowDecisionResult(
         email_message_id=str(email_message.id),
@@ -656,24 +680,47 @@ async def _handle_customer_clarification(
         ack_subject = None
         outreach_subject = None
         outreach_targeted = 0
-        if policy.auto_acknowledgement and not ack_sent:
-            ack = await send_client_acknowledgement(
+        try:
+            if policy.auto_acknowledgement and not ack_sent:
+                ack = await send_client_acknowledgement(
+                    session,
+                    shipment_id=shipment.id,
+                    dry_run=policy.acknowledgement_dry_run,
+                    custom_message=None,
+                )
+                ack_subject = ack.subject
+            if policy.auto_outreach and not outreach_sent:
+                outreach = await create_carrier_outreach(
+                    session,
+                    shipment_id=shipment.id,
+                    carrier_ids=[],
+                    dry_run=policy.outreach_dry_run,
+                    custom_message=None,
+                )
+                outreach_subject = outreach.subject
+                outreach_targeted = outreach.targeted
+        except RuntimeError as exc:
+            await _log_manual_review(
                 session,
-                shipment_id=shipment.id,
-                dry_run=policy.acknowledgement_dry_run,
-                custom_message=None,
+                shipment.id,
+                f"Clarification automation blocked: {exc}",
+                intent_result=intent_result,
+                next_action="manual_review",
+                allow_repeat=policy.allow_repeat_manual_review,
             )
-            ack_subject = ack.subject
-        if policy.auto_outreach and not outreach_sent:
-            outreach = await create_carrier_outreach(
-                session,
-                shipment_id=shipment.id,
-                carrier_ids=[],
-                dry_run=policy.outreach_dry_run,
-                custom_message=None,
+            return WorkflowDecisionResult(
+                email_message_id=str(email_message.id),
+                shipment_id=str(shipment.id),
+                intent=intent_result.intent,
+                confidence=extraction.confidence,
+                next_action="manual_review",
+                shipment_extracted=True,
+                missing_fields=extraction.missing_fields,
+                ambiguity_reasons=extraction.ambiguity_reasons,
+                acknowledgement_drafted=ack_subject is not None,
+                acknowledgement_subject=ack_subject,
+                manual_review_required=True,
             )
-            outreach_subject = outreach.subject
-            outreach_targeted = outreach.targeted
         return WorkflowDecisionResult(
             email_message_id=str(email_message.id),
             shipment_id=str(shipment.id),
@@ -1019,6 +1066,14 @@ def _apply_shipment_extraction(shipment: Shipment, extraction: ShipmentExtractio
     shipment.weight_lb = extraction.weight_lb if extraction.weight_lb is not None else shipment.weight_lb
     shipment.equipment_type = extraction.equipment_type or shipment.equipment_type
     shipment.ready_at = extraction.ready_at or shipment.ready_at
+    wall, tz, off = apply_shipment_ready_at_wall_fields(
+        ready_at=shipment.ready_at,
+        origin=shipment.origin,
+        destination=shipment.destination,
+    )
+    shipment.ready_at = wall
+    shipment.ready_at_timezone = tz
+    shipment.ready_at_offset_minutes = off
     if extraction.notes:
         shipment.notes = extraction.notes
 

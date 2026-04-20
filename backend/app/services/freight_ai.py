@@ -5,9 +5,11 @@ from __future__ import annotations
 import re
 from json import JSONDecodeError, loads
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import TypeVar
 
 from app.agent.llm import try_get_primary_llm
+from app.services.location_timezone import infer_shipment_timezone
 from app.schemas import (
     CarrierBidExtractionResult,
     CarrierStatusUpdateExtractionResult,
@@ -102,6 +104,18 @@ def _extract_message_text(message) -> str:
     return str(content or "")
 
 
+def _supports_native_structured_output(llm) -> bool:
+    """Best-effort capability check for provider/model structured-output support."""
+    model_name = str(getattr(llm, "model_name", "") or getattr(llm, "model", "")).lower()
+    base_url = str(
+        getattr(llm, "openai_api_base", "") or getattr(llm, "base_url", "")
+    ).lower()
+    # DeepSeek OpenAI-compatible endpoint often rejects response_format/json_schema.
+    if "deepseek" in model_name or "deepseek" in base_url:
+        return False
+    return True
+
+
 def _extract_json_object(raw_text: str) -> dict:
     text = raw_text.strip()
     if not text:
@@ -128,13 +142,21 @@ async def _invoke_structured_with_fallback(
     schema: type[TStructured],
     prompt: str,
 ) -> TStructured:
-    structured = llm.with_structured_output(schema)
-    try:
-        return await structured.ainvoke(prompt)
-    except Exception as exc:
-        error_text = str(exc).lower()
-        if "response_format" not in error_text and "json_schema" not in error_text and "structured output" not in error_text:
-            raise
+    if _supports_native_structured_output(llm):
+        structured = llm.with_structured_output(schema)
+        try:
+            return await structured.ainvoke(prompt)
+        except Exception as exc:
+            error_text = str(exc).lower()
+            unsupported_structured_output = (
+                "response_format" in error_text
+                or "response format" in error_text
+                or "json_schema" in error_text
+                or "structured output" in error_text
+                or "invalid_request_error" in error_text
+            )
+            if not unsupported_structured_output:
+                raise
 
     fallback_prompt = (
         f"{prompt}\n\n"
@@ -148,8 +170,11 @@ async def _invoke_structured_with_fallback(
 
 
 def _context_blob(email_context: dict) -> str:
+    now_utc = datetime.now(timezone.utc)
     return "\n".join(
         [
+            f"current_datetime_utc: {now_utc.isoformat()}",
+            f"current_date_utc: {now_utc.date().isoformat()}",
             f"sender_email: {email_context.get('sender_email', '')}",
             f"sender_role: {email_context.get('sender_role', '')}",
             f"subject: {email_context.get('subject', '')}",
@@ -201,6 +226,8 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
             "Extract structured freight shipment data from the email. "
             "Use intent new_quote_request. Populate origin, destination, pallets, "
             "weight_lb, equipment_type, ready_at, notes, missing_fields, ambiguity_reasons and confidence. "
+            "For ready_at output a local pickup-ready date/time without timezone suffix (naive civil time); "
+            "do not apply UTC offsets or Z in ready_at — timezone is inferred later from origin/destination. "
             "If a field is absent, leave it null and include it in missing_fields when critical. "
             "If the email suggests multiple routes, conflicting details, or attachment-only details, add ambiguity_reasons.\n\n"
             f"{_context_blob(email_context)}"
@@ -404,12 +431,24 @@ def _merge_shipment_results(
         dict.fromkeys(primary.ambiguity_reasons + fallback.ambiguity_reasons)
     )
     primary.confidence = max(primary.confidence, fallback.confidence)
-    if primary.ready_at and primary.ready_at.tzinfo is None:
-        primary.ready_at = primary.ready_at.replace(tzinfo=timezone.utc)
     primary.origin = _normalize_location(primary.origin)
     primary.destination = _normalize_location(primary.destination)
     primary.equipment_type = _normalize_equipment(primary.equipment_type)
     primary.weight_lb = _normalize_weight_lb(primary.weight_lb)
+    inferred_timezone = infer_shipment_timezone(primary.origin, primary.destination)
+    if primary.ready_at:
+        if primary.ready_at.tzinfo is not None:
+            if inferred_timezone:
+                primary.ready_at = primary.ready_at.astimezone(
+                    ZoneInfo(inferred_timezone)
+                ).replace(tzinfo=None)
+            else:
+                primary.ready_at = primary.ready_at.astimezone(timezone.utc).replace(tzinfo=None)
+                if "ready_at_timezone_unresolved" not in primary.ambiguity_reasons:
+                    primary.ambiguity_reasons.append("ready_at_timezone_unresolved")
+        elif inferred_timezone is None:
+            if "ready_at_timezone_unresolved" not in primary.ambiguity_reasons:
+                primary.ambiguity_reasons.append("ready_at_timezone_unresolved")
     return primary
 
 
@@ -562,7 +601,8 @@ def _extract_ready_at(text: str) -> datetime | None:
     match = READY_AT_PATTERN.search(text)
     if not match:
         return None
-    base = datetime.now(timezone.utc)
+    # Keep naive local time; timezone is inferred later from shipment origin/destination.
+    base = datetime.utcnow().replace(tzinfo=None)
     day_token = match.group(1).lower()
     time_token = (match.group(2) or "").strip()
     if not time_token:

@@ -95,6 +95,11 @@ from app.services.freight_inbox_agent import (
     run_freight_inbox_orchestrator,
 )
 from app.services.freight_ai import extract_carrier_status_update
+from app.services.location_timezone import (
+    apply_shipment_ready_at_wall_fields,
+    infer_shipment_timezone,
+    offset_minutes_for_local_naive,
+)
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
@@ -280,6 +285,17 @@ def _serialize_carrier(carrier: Carrier) -> CarrierRecord:
 
 def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> ShipmentRecord:
     ai_payload = ai_payload or {}
+    inferred_timezone = infer_shipment_timezone(shipment.origin, shipment.destination)
+    timezone_name = shipment.ready_at_timezone or inferred_timezone
+    ready_offset = (
+        shipment.ready_at_offset_minutes
+        if shipment.ready_at_offset_minutes is not None
+        else (
+            offset_minutes_for_local_naive(timezone_name, shipment.ready_at)
+            if timezone_name and shipment.ready_at is not None
+            else None
+        )
+    )
     return ShipmentRecord(
         id=str(shipment.id),
         client_id=str(shipment.client_id) if shipment.client_id else None,
@@ -292,6 +308,8 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         weight_lb=shipment.weight_lb,
         equipment_type=shipment.equipment_type,
         ready_at=shipment.ready_at,
+        ready_at_timezone=timezone_name,
+        ready_at_offset_minutes=ready_offset,
         margin_policy=dict(shipment.margin_policy_json or {}),
         notes=shipment.notes,
         ai_intent=ai_payload.get("intent"),
@@ -327,6 +345,18 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         created_at=shipment.created_at,
         updated_at=shipment.updated_at,
     )
+
+
+def _normalize_shipment_ready_at_timezone_fields(shipment: Shipment) -> None:
+    """Persist naive local ready_at plus IANA zone and offset metadata (no shifting wall-clock time)."""
+    wall, tz, off = apply_shipment_ready_at_wall_fields(
+        ready_at=shipment.ready_at,
+        origin=shipment.origin,
+        destination=shipment.destination,
+    )
+    shipment.ready_at = wall
+    shipment.ready_at_timezone = tz
+    shipment.ready_at_offset_minutes = off
 
 
 def _serialize_workflow_event(event: WorkflowEvent) -> WorkflowEventRecord:
@@ -1584,6 +1614,7 @@ async def create_shipment(
         margin_policy_json=(request.margin_policy.model_dump() if request.margin_policy else {}),
         notes=request.notes,
     )
+    _normalize_shipment_ready_at_timezone_fields(shipment)
     session.add(shipment)
     await session.commit()
     await session.refresh(shipment)
@@ -1664,6 +1695,18 @@ async def update_shipment(
         if client is None:
             raise HTTPException(status_code=404, detail="Client not found.")
 
+    previous_values = {
+        "client_id": str(shipment.client_id) if shipment.client_id else None,
+        "status": shipment.status,
+        "origin": shipment.origin,
+        "destination": shipment.destination,
+        "pallets": shipment.pallets,
+        "weight_lb": shipment.weight_lb,
+        "equipment_type": shipment.equipment_type,
+        "ready_at": shipment.ready_at.isoformat() if shipment.ready_at else None,
+        "notes": shipment.notes,
+    }
+
     shipment.client_id = client_id
     shipment.status = request.status.value
     shipment.origin = request.origin
@@ -1674,6 +1717,39 @@ async def update_shipment(
     shipment.ready_at = request.ready_at
     shipment.margin_policy_json = request.margin_policy.model_dump() if request.margin_policy else {}
     shipment.notes = request.notes
+    shipment.updated_at = datetime.now(timezone.utc)
+    _normalize_shipment_ready_at_timezone_fields(shipment)
+
+    current_values = {
+        "client_id": str(shipment.client_id) if shipment.client_id else None,
+        "status": shipment.status,
+        "origin": shipment.origin,
+        "destination": shipment.destination,
+        "pallets": shipment.pallets,
+        "weight_lb": shipment.weight_lb,
+        "equipment_type": shipment.equipment_type,
+        "ready_at": shipment.ready_at.isoformat() if shipment.ready_at else None,
+        "notes": shipment.notes,
+    }
+    changed_fields = [
+        field
+        for field, value in current_values.items()
+        if previous_values.get(field) != value
+    ]
+    if changed_fields:
+        session.add(
+            WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
+                stage=shipment.status,
+                payload_json={
+                    "changed_fields": changed_fields,
+                    "manual_review_required": False,
+                    "edited_by": "operator",
+                },
+            )
+        )
+
     await session.commit()
     await session.refresh(shipment)
     return _serialize_shipment(shipment)

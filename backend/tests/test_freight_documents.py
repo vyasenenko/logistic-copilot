@@ -1,6 +1,6 @@
 """Focused tests for freight document extraction heuristics."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from app.memory.database import Shipment
 from app.services.freight_execution import _parse_document_fields, build_document_context, build_document_health
@@ -114,7 +114,7 @@ def test_document_health_merges_enrichment_and_counts_reviews():
 def test_document_health_detects_conflict_against_ready_date():
     shipment = Shipment(
         status="awaiting_confirmation",
-        ready_at=datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc),
+        ready_at=datetime(2026, 4, 24, 8, 0),
     )
     health = build_document_health(
         [
