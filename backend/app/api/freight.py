@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,7 @@ from app.memory.database import (
     EmailThread,
     Shipment,
     WorkflowEvent,
+    async_session,
     get_session,
 )
 from app.schemas import (
@@ -40,8 +41,11 @@ from app.schemas import (
     CustomerStatusReplyResponse,
     FreightFoundationResponse,
     OutlookIngestRequest,
+    OutlookIngestResult,
     OutlookSyncRequest,
     OutlookSyncResponse,
+    OutlookWebhookRequest,
+    OutlookWebhookResponse,
     OperatorAction,
     FreightOverviewCounts,
     FreightStatusMetrics,
@@ -152,6 +156,54 @@ def _build_automation_policy(
         auto_book=auto_book,
         booking_dry_run=booking_dry_run,
         allow_repeat_manual_review=False,
+    )
+
+
+async def _process_outlook_mailbox_message(
+    session: AsyncSession,
+    *,
+    mailbox_message,
+    policy: AutomationPolicy,
+    create_client_if_missing: bool = True,
+) -> OutlookIngestResult | None:
+    result = await ingest_outlook_message(
+        session,
+        mailbox_message,
+        create_client_if_missing=create_client_if_missing,
+    )
+    if result is None:
+        return None
+
+    if result.created_message:
+        try:
+            decision = await run_freight_inbox_orchestrator(
+                session,
+                email_message_id=result.email_message_id,
+                policy=policy,
+            )
+            _apply_decision(result, decision)
+        except RuntimeError:
+            result.manual_review_required = True
+            result.next_action = "manual_review"
+            result.intent = "orchestrator_error"
+            result.confidence = 0.0
+            result.missing_fields = []
+    else:
+        result.next_action = "already_ingested"
+
+    return result
+
+
+def _default_outlook_event_policy() -> AutomationPolicy:
+    return _build_automation_policy(
+        auto_acknowledgement=True,
+        acknowledgement_dry_run=False,
+        auto_outreach=True,
+        outreach_dry_run=False,
+        auto_quote=True,
+        quote_dry_run=False,
+        auto_book=True,
+        booking_dry_run=False,
     )
 
 
@@ -2679,30 +2731,14 @@ async def freight_outlook_ingest(
     )
     client = OutlookGraphClient()
     mailbox_message = client.normalize_message(request.message)
-    result = await ingest_outlook_message(
+    result = await _process_outlook_mailbox_message(
         session,
-        mailbox_message,
+        mailbox_message=mailbox_message,
+        policy=policy,
         create_client_if_missing=request.create_client_if_missing,
     )
     if result is None:
         return OutlookSyncResponse(imported=0, skipped=1, results=[])
-
-    if result.created_message:
-        try:
-            decision = await run_freight_inbox_orchestrator(
-                session,
-                email_message_id=result.email_message_id,
-                policy=policy,
-            )
-            _apply_decision(result, decision)
-        except RuntimeError:
-            result.manual_review_required = True
-            result.next_action = "manual_review"
-            result.intent = "orchestrator_error"
-            result.confidence = 0.0
-            result.missing_fields = []
-    else:
-        result.next_action = "already_ingested"
     expired = await evaluate_expired_quote_windows(session, policy=policy)
 
     return OutlookSyncResponse(
@@ -2738,7 +2774,10 @@ async def freight_outlook_sync(
         booking_dry_run=request.booking_dry_run,
     )
     outlook = OutlookGraphClient()
-    messages = await outlook.list_messages(limit=request.limit)
+    try:
+        messages = await outlook.list_messages(limit=request.limit)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     imported = 0
     skipped = 0
@@ -2753,26 +2792,14 @@ async def freight_outlook_sync(
     manual_reviews = 0
     results = []
     for message in messages:
-        result = await ingest_outlook_message(session, message)
+        result = await _process_outlook_mailbox_message(
+            session,
+            mailbox_message=message,
+            policy=policy,
+        )
         if result is None:
             skipped += 1
             continue
-
-        if result.created_message:
-            try:
-                decision = await run_freight_inbox_orchestrator(
-                    session,
-                    email_message_id=result.email_message_id,
-                    policy=policy,
-                )
-                _apply_decision(result, decision)
-            except RuntimeError:
-                result.manual_review_required = True
-                result.next_action = "manual_review"
-                result.intent = "orchestrator_error"
-                result.confidence = 0.0
-        else:
-            result.next_action = "already_ingested"
         imported += 1
         parsed_shipments += 1 if result.shipment_extracted else 0
         auto_acknowledgements += 1 if result.acknowledgement_drafted else 0
@@ -2803,3 +2830,78 @@ async def freight_outlook_sync(
         manual_reviews=manual_reviews,
         results=results,
     )
+
+
+@router.post("/freight/outlook/webhook", response_model=OutlookWebhookResponse)
+async def freight_outlook_webhook(
+    http_request: Request,
+    validationToken: str | None = None,
+) -> Response:
+    """Receive Outlook/Graph mailbox events and automatically run inbox orchestration."""
+    validation_token = validationToken or http_request.query_params.get("validationToken")
+    if validation_token:
+        return Response(content=validation_token, media_type="text/plain")
+
+    raw_body = await http_request.body()
+    payload = await http_request.json() if raw_body else {}
+    request = OutlookWebhookRequest.model_validate(payload) if payload else None
+
+    async with async_session() as session:
+        policy = _default_outlook_event_policy()
+        outlook = OutlookGraphClient()
+
+        imported = 0
+        skipped = 0
+        ignored = 0
+        manual_reviews = 0
+        results: list[OutlookIngestResult] = []
+
+        notifications = request.value if request else []
+        for notification in notifications:
+            client_state = settings.microsoft_webhook_client_state
+            if client_state and notification.clientState and notification.clientState != client_state:
+                ignored += 1
+                continue
+            if notification.changeType and "created" not in notification.changeType.lower():
+                ignored += 1
+                continue
+
+            resource_data = notification.resourceData or {}
+            message_id = resource_data.get("id")
+            if not message_id and notification.resource:
+                message_id = str(notification.resource).rstrip("/").split("/")[-1]
+            if not message_id:
+                ignored += 1
+                continue
+
+            try:
+                mailbox_message = await outlook.get_message(str(message_id))
+            except RuntimeError:
+                ignored += 1
+                continue
+
+            result = await _process_outlook_mailbox_message(
+                session,
+                mailbox_message=mailbox_message,
+                policy=policy,
+            )
+            if result is None:
+                skipped += 1
+                continue
+            imported += 1
+            manual_reviews += 1 if result.manual_review_required else 0
+            results.append(result)
+
+        expired = await evaluate_expired_quote_windows(session, policy=policy)
+        for item in expired:
+            if item.manual_review_required:
+                manual_reviews += 1
+
+        return OutlookWebhookResponse(
+            accepted=True,
+            imported=imported,
+            skipped=skipped,
+            ignored=ignored,
+            manual_reviews=manual_reviews,
+            results=results,
+        )

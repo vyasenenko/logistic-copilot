@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     microsoft_client_secret: str = ""
     microsoft_mailbox: str = ""
     microsoft_graph_base_url: str = "https://graph.microsoft.com/v1.0"
+    microsoft_webhook_client_state: str = ""
+    microsoft_webhook_public_base_url: str = ""
+    microsoft_webhook_change_type: str = "created"
+    microsoft_webhook_resource: str = ""
+    microsoft_webhook_renewal_buffer_minutes: int = 120
+    microsoft_webhook_expiration_minutes: int = 10080
 
     # TMS integration
     tms_base_url: str = ""
@@ -115,6 +121,28 @@ class Settings(BaseSettings):
             "https://login.microsoftonline.com/"
             f"{self.microsoft_tenant_id}/oauth2/v2.0/token"
         )
+
+    @property
+    def microsoft_webhook_notification_url(self) -> str:
+        base = self.microsoft_webhook_public_base_url.rstrip("/")
+        if not base:
+            return ""
+        return f"{base}/api/freight/outlook/webhook"
+
+    @property
+    def microsoft_webhook_effective_client_state(self) -> str:
+        return (
+            self.microsoft_webhook_client_state
+            or self.api_secret_key[:64]
+            or "logistic-copilot-outlook-webhook"
+        )
+
+    @property
+    def microsoft_webhook_effective_resource(self) -> str:
+        if self.microsoft_webhook_resource:
+            return self.microsoft_webhook_resource
+        mailbox = self.microsoft_mailbox.strip()
+        return f"users/{mailbox}/mailFolders('Inbox')/messages" if mailbox else ""
 
     @property
     def configured_llm_provider_order(self) -> list[str]:

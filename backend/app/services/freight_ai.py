@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from json import JSONDecodeError, loads
 from datetime import datetime, timedelta, timezone
+from typing import TypeVar
 
 from app.agent.llm import try_get_primary_llm
 from app.schemas import (
@@ -13,6 +15,8 @@ from app.schemas import (
     ShipmentExtractionResult,
     StatusRequestExtractionResult,
 )
+
+TStructured = TypeVar("TStructured", IntentResult, ShipmentExtractionResult, CarrierBidExtractionResult, StatusRequestExtractionResult, CarrierStatusUpdateExtractionResult)
 
 ROUTE_FROM_TO_PATTERN = re.compile(
     r"(?:from\s+(?P<origin>.+?)\s+to\s+(?P<destination>.+?))(?:\s|$|,|\.)",
@@ -81,6 +85,68 @@ def _choose_llm():
     return try_get_primary_llm()
 
 
+def _extract_message_text(message) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content or "")
+
+
+def _extract_json_object(raw_text: str) -> dict:
+    text = raw_text.strip()
+    if not text:
+        raise ValueError("Empty LLM response")
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        text = text[start : end + 1]
+    try:
+        parsed = loads(text)
+    except JSONDecodeError as exc:
+        raise ValueError("LLM response did not contain valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response JSON must be an object")
+    return parsed
+
+
+async def _invoke_structured_with_fallback(
+    *,
+    llm,
+    schema: type[TStructured],
+    prompt: str,
+) -> TStructured:
+    structured = llm.with_structured_output(schema)
+    try:
+        return await structured.ainvoke(prompt)
+    except Exception as exc:
+        error_text = str(exc).lower()
+        if "response_format" not in error_text and "json_schema" not in error_text and "structured output" not in error_text:
+            raise
+
+    fallback_prompt = (
+        f"{prompt}\n\n"
+        "Return a single JSON object only. "
+        "Do not wrap the JSON in markdown. "
+        "Use null for unknown scalar fields, [] for unknown list fields, and preserve the requested schema keys."
+    )
+    message = await llm.ainvoke(fallback_prompt)
+    payload = _extract_json_object(_extract_message_text(message))
+    return schema.model_validate(payload)
+
+
 def _context_blob(email_context: dict) -> str:
     return "\n".join(
         [
@@ -104,7 +170,6 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
         return heuristics
 
     try:
-        structured = llm.with_structured_output(IntentResult)
         prompt = (
             "Classify the freight inbox email intent. "
             "Allowed intents: new_quote_request, carrier_bid_reply, "
@@ -112,7 +177,11 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
             "Return high confidence only when the intent is clear.\n\n"
             f"{_context_blob(email_context)}"
         )
-        result = await structured.ainvoke(prompt)
+        result = await _invoke_structured_with_fallback(
+            llm=llm,
+            schema=IntentResult,
+            prompt=prompt,
+        )
         if result.confidence < heuristics.confidence:
             return heuristics
         return result
@@ -128,7 +197,6 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
         return heuristics
 
     try:
-        structured = llm.with_structured_output(ShipmentExtractionResult)
         prompt = (
             "Extract structured freight shipment data from the email. "
             "Use intent new_quote_request. Populate origin, destination, pallets, "
@@ -137,7 +205,11 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
             "If the email suggests multiple routes, conflicting details, or attachment-only details, add ambiguity_reasons.\n\n"
             f"{_context_blob(email_context)}"
         )
-        result = await structured.ainvoke(prompt)
+        result = await _invoke_structured_with_fallback(
+            llm=llm,
+            schema=ShipmentExtractionResult,
+            prompt=prompt,
+        )
         return _merge_shipment_results(result, heuristics)
     except Exception:
         return heuristics
@@ -151,7 +223,6 @@ async def extract_carrier_bid(email_context: dict) -> CarrierBidExtractionResult
         return heuristics
 
     try:
-        structured = llm.with_structured_output(CarrierBidExtractionResult)
         prompt = (
             "Extract a structured carrier bid from the freight email. "
             "Use intent carrier_bid_reply. Populate amount, currency, eta_text, notes, ambiguity_reasons and confidence. "
@@ -159,7 +230,11 @@ async def extract_carrier_bid(email_context: dict) -> CarrierBidExtractionResult
             "If the email contains multiple possible rates or attachment-only pricing, add ambiguity_reasons.\n\n"
             f"{_context_blob(email_context)}"
         )
-        result = await structured.ainvoke(prompt)
+        result = await _invoke_structured_with_fallback(
+            llm=llm,
+            schema=CarrierBidExtractionResult,
+            prompt=prompt,
+        )
         return _merge_bid_results(result, heuristics)
     except Exception:
         return heuristics
@@ -173,14 +248,17 @@ async def extract_status_request(email_context: dict) -> StatusRequestExtraction
         return heuristics
 
     try:
-        structured = llm.with_structured_output(StatusRequestExtractionResult)
         prompt = (
             "Extract a structured customer shipment status request. "
             "Use intent customer_status_request. Populate request_type, requested_fields, notes and confidence. "
             "Typical fields are eta, location, general_status, delivery_timing.\n\n"
             f"{_context_blob(email_context)}"
         )
-        result = await structured.ainvoke(prompt)
+        result = await _invoke_structured_with_fallback(
+            llm=llm,
+            schema=StatusRequestExtractionResult,
+            prompt=prompt,
+        )
         if result.confidence < heuristics.confidence:
             return heuristics
         return result
@@ -196,14 +274,17 @@ async def extract_carrier_status_update(email_context: dict) -> CarrierStatusUpd
         return heuristics
 
     try:
-        structured = llm.with_structured_output(CarrierStatusUpdateExtractionResult)
         prompt = (
             "Extract a structured carrier status update. "
             "Use intent carrier_status_update. Populate status_text, eta_text, location_text, notes, ambiguity_reasons and confidence. "
             "If the update is vague, lower confidence.\n\n"
             f"{_context_blob(email_context)}"
         )
-        result = await structured.ainvoke(prompt)
+        result = await _invoke_structured_with_fallback(
+            llm=llm,
+            schema=CarrierStatusUpdateExtractionResult,
+            prompt=prompt,
+        )
         return _merge_status_update_results(result, heuristics)
     except Exception:
         return heuristics

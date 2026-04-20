@@ -1,14 +1,18 @@
 from datetime import datetime, timedelta, timezone
+import json
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 from app.api import freight
 from app.memory.database import Shipment, WorkflowEvent
 from app.schemas import (
     CarrierStatusUpdateResponse,
     CustomerStatusReplyResponse,
+    OutlookIngestResult,
+    OutlookWebhookRequest,
     ShipmentStage,
     StatusQueueAction,
     StatusQueueActionRequest,
@@ -97,6 +101,30 @@ class FakeReadSession:
         if model is Shipment and key == self.shipment.id:
             return self.shipment
         return None
+
+
+def _build_request(*, query_string: bytes = b"", payload: dict | None = None) -> Request:
+    body = b""
+    headers: list[tuple[bytes, bytes]] = []
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers.append((b"content-type", b"application/json"))
+        headers.append((b"content-length", str(len(body)).encode("utf-8")))
+
+    async def receive():
+        nonlocal body
+        current = body
+        body = b""
+        return {"type": "http.request", "body": current, "more_body": False}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/freight/outlook/webhook",
+        "query_string": query_string,
+        "headers": headers,
+    }
+    return Request(scope, receive)
 
 
 @pytest.mark.asyncio
@@ -617,3 +645,104 @@ async def test_get_shipment_marks_status_as_stale_when_event_is_outside_sla(monk
 
     assert response.status_stale is True
     assert response.status_sync_health == "stale"
+
+
+@pytest.mark.asyncio
+async def test_outlook_webhook_returns_validation_token():
+    response = await freight.freight_outlook_webhook(
+        http_request=_build_request(query_string=b"validationToken=validate-me"),
+    )
+
+    assert response.body == b"validate-me"
+    assert response.media_type == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_outlook_webhook_fetches_message_and_runs_agent_loop(monkeypatch):
+    shipment = Shipment(id=uuid4(), status=ShipmentStage.RECEIVED.value)
+    session = object()
+    mailbox_message = object()
+
+    class _FakeSessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def _get_message(self, message_id):
+        assert message_id == "msg-123"
+        return mailbox_message
+
+    async def _process_message(_session, *, mailbox_message, policy, create_client_if_missing=True):
+        assert _session is session
+        assert mailbox_message is not None
+        assert policy.auto_acknowledgement is True
+        return OutlookIngestResult(
+            thread_id=str(uuid4()),
+            email_message_id=str(uuid4()),
+            shipment_id=str(shipment.id),
+            created_message=True,
+            shipment_extracted=True,
+            acknowledgement_drafted=True,
+        )
+
+    async def _expired(_session, *, policy):
+        return []
+
+    monkeypatch.setattr(freight.OutlookGraphClient, "get_message", _get_message)
+    monkeypatch.setattr(freight, "_process_outlook_mailbox_message", _process_message)
+    monkeypatch.setattr(freight, "evaluate_expired_quote_windows", _expired)
+    monkeypatch.setattr(freight, "async_session", lambda: _FakeSessionContext())
+
+    response = await freight.freight_outlook_webhook(
+        http_request=_build_request(
+            payload={
+                "value": [
+                    {
+                        "changeType": "created",
+                        "resourceData": {"id": "msg-123"},
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert response.accepted is True
+    assert response.imported == 1
+    assert response.skipped == 0
+    assert response.ignored == 0
+    assert len(response.results) == 1
+
+
+@pytest.mark.asyncio
+async def test_outlook_webhook_ignores_non_created_events(monkeypatch):
+    class _FakeSessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def _expired(_session, *, policy):
+        return []
+
+    monkeypatch.setattr(freight, "evaluate_expired_quote_windows", _expired)
+    monkeypatch.setattr(freight, "async_session", lambda: _FakeSessionContext())
+
+    response = await freight.freight_outlook_webhook(
+        http_request=_build_request(
+            payload={
+                "value": [
+                    {
+                        "changeType": "updated",
+                        "resourceData": {"id": "msg-123"},
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert response.accepted is True
+    assert response.imported == 0
+    assert response.ignored == 1

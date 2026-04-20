@@ -1,12 +1,16 @@
 """Focused tests for freight inbox heuristic extraction."""
 
+from types import SimpleNamespace
+
 from app.services.freight_ai import (
+    _invoke_structured_with_fallback,
     _classify_with_heuristics,
     _extract_carrier_status_update_with_heuristics,
     _extract_status_request_with_heuristics,
     _extract_bid_with_heuristics,
     _extract_shipment_with_heuristics,
 )
+from app.schemas import ShipmentExtractionResult
 
 
 def test_extract_shipment_from_arrow_route_and_k_weight():
@@ -130,3 +134,42 @@ def test_classify_exception_or_issue():
     )
     assert result.intent == "exception_or_issue"
     assert result.confidence >= 0.7
+
+
+class _BrokenStructuredLlm:
+    def with_structured_output(self, _schema):
+        return self
+
+    async def ainvoke(self, _prompt):
+        raise RuntimeError("This response_format type is unavailable now")
+
+
+class _FallbackJsonLlm(_BrokenStructuredLlm):
+    async def ainvoke(self, prompt):
+        if "Return a single JSON object only." in prompt:
+            return SimpleNamespace(
+                content=(
+                    '{"intent":"new_quote_request","origin":"New York, NY","destination":"Chicago, IL",'
+                    '"pallets":10,"weight_lb":2000,"equipment_type":"Dry Van","ready_at":null,'
+                    '"notes":"Please quote.","missing_fields":[],"ambiguity_reasons":[],"confidence":0.91}'
+                )
+            )
+        raise RuntimeError("This response_format type is unavailable now")
+
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_structured_output_falls_back_to_json_prompt_when_response_format_is_unavailable():
+    result = await _invoke_structured_with_fallback(
+        llm=_FallbackJsonLlm(),
+        schema=ShipmentExtractionResult,
+        prompt="Extract shipment JSON.",
+    )
+
+    assert result.origin == "New York, NY"
+    assert result.destination == "Chicago, IL"
+    assert result.pallets == 10
+    assert result.weight_lb == 2000
+    assert result.confidence == 0.91

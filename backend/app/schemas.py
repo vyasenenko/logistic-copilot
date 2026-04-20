@@ -398,6 +398,19 @@ class OutlookIngestRequest(BaseModel):
     booking_dry_run: bool = False
 
 
+class OutlookWebhookNotification(BaseModel):
+    subscriptionId: str | None = None
+    clientState: str | None = None
+    changeType: str | None = None
+    resource: str | None = None
+    tenantId: str | None = None
+    resourceData: dict = Field(default_factory=dict)
+
+
+class OutlookWebhookRequest(BaseModel):
+    value: list[OutlookWebhookNotification] = Field(default_factory=list)
+
+
 class OutlookIngestResult(BaseModel):
     thread_id: str
     email_message_id: str
@@ -444,6 +457,15 @@ class OutlookSyncResponse(BaseModel):
     auto_quotes: int = 0
     auto_status_replies: int = 0
     auto_tms_status_updates: int = 0
+    manual_reviews: int = 0
+    results: list[OutlookIngestResult] = Field(default_factory=list)
+
+
+class OutlookWebhookResponse(BaseModel):
+    accepted: bool = True
+    imported: int = 0
+    skipped: int = 0
+    ignored: int = 0
     manual_reviews: int = 0
     results: list[OutlookIngestResult] = Field(default_factory=list)
 
