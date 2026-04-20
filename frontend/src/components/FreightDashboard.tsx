@@ -1,6 +1,8 @@
 "use client";
 
 import { startTransition, useEffect, useMemo, useState } from "react";
+
+import { useFreightSocket } from "@/hooks/useFreightSocket";
 import {
   AlertTriangle,
   ArrowRight,
@@ -967,6 +969,46 @@ function LegacyFreightDashboard() {
     setBids(bidData);
     setDocuments(documentData);
   }
+
+  const refetchShipmentDetailTypes = useMemo(
+    () =>
+      new Set([
+        "bid_received",
+        "evaluation_completed",
+        "client_quote_sent",
+        "carrier_outreach_sent",
+        "document_analyzed",
+        "document_values_approved",
+        "document_warning_ignored",
+        "manual_review_required",
+        "tms_handoff_sent",
+        "tms_status_ingested",
+      ]),
+    [],
+  );
+
+  useFreightSocket({
+    onOverviewStale: () => {
+      void loadDashboard();
+    },
+    onShipmentUpdated: (shipmentId) => {
+      void loadDashboard();
+      if (shipmentId === selectedShipmentId) {
+        void loadShipmentContext(shipmentId);
+      }
+    },
+    onWorkflowEvent: ({ shipment_id, event }) => {
+      void loadDashboard();
+      if (shipment_id === selectedShipmentId) {
+        setEvents((prev) =>
+          prev.some((e) => e.id === event.id) ? prev : [event as WorkflowEventRecord, ...prev],
+        );
+        if (refetchShipmentDetailTypes.has(event.event_type)) {
+          void loadShipmentContext(shipment_id);
+        }
+      }
+    },
+  });
 
   useEffect(() => {
     void loadDashboard();

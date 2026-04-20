@@ -37,6 +37,7 @@ from app.services.freight_execution import (
     send_customer_status_reply,
     send_customer_quote,
 )
+from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import apply_shipment_ready_at_wall_fields
 from app.services.freight_outreach import create_carrier_outreach
 
@@ -653,6 +654,7 @@ async def _handle_customer_clarification(
     extraction = await extract_shipment_details(email_context)
     _apply_shipment_extraction(shipment, extraction)
     await session.commit()
+    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
     if extraction.ambiguity_reasons:
         await _log_manual_review(
             session,
@@ -1115,6 +1117,7 @@ async def send_customer_clarification(
     shipment.status = ShipmentStage.WAITING_CUSTOMER_DETAILS.value
     shipment.updated_at = datetime.now(timezone.utc)
     await session.commit()
+    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
 
 
 async def _has_event(session: AsyncSession, shipment_id: UUID, event_type: str) -> bool:
@@ -1136,15 +1139,15 @@ async def _log_event(
 ) -> None:
     if shipment_id is None:
         return
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment_id,
-            event_type=event_type,
-            stage=stage,
-            payload_json=payload,
-        )
+    evt = WorkflowEvent(
+        shipment_id=shipment_id,
+        event_type=event_type,
+        stage=stage,
+        payload_json=payload,
     )
+    session.add(evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(evt)
 
 
 async def _log_manual_review(

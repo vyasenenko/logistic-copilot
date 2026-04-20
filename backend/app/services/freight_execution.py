@@ -34,6 +34,7 @@ from app.schemas import (
 )
 from app.services.email_correlation import attach_quote_token, extract_quote_token
 from app.services.document_ocr import extract_document_content
+from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import format_ready_at_wall_display, local_date_iso_in_zone
 from app.services.outlook import OutlookGraphClient
 from app.services.tms_connector import TmsConnector
@@ -788,20 +789,20 @@ async def intake_bid(session: AsyncSession, request: BidIntakeRequest) -> BidInt
 
     shipment.status = ShipmentStage.WAITING_BIDS.value
     shipment.updated_at = now
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.BID_RECEIVED.value,
-            stage=shipment.status,
-            payload_json={
-                "carrier_id": str(carrier.id),
-                "amount": request.amount,
-                "currency": request.currency,
-                "eta_text": request.eta_text,
-            },
-        )
+    bid_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.BID_RECEIVED.value,
+        stage=shipment.status,
+        payload_json={
+            "carrier_id": str(carrier.id),
+            "amount": request.amount,
+            "currency": request.currency,
+            "eta_text": request.eta_text,
+        },
     )
+    session.add(bid_evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(bid_evt)
     await session.refresh(bid)
 
     return BidIntakeResponse(
@@ -898,19 +899,19 @@ async def send_client_acknowledgement(
 
     shipment.status = ShipmentStage.CLIENT_ACKNOWLEDGED.value
     shipment.updated_at = datetime.now(timezone.utc)
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.CLIENT_ACK_SENT.value,
-            stage=shipment.status,
-            payload_json={
-                "client_email": client.email,
-                "dry_run": dry_run,
-                "wait_window_minutes": wait_window,
-            },
-        )
+    ack_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.CLIENT_ACK_SENT.value,
+        stage=shipment.status,
+        payload_json={
+            "client_email": client.email,
+            "dry_run": dry_run,
+            "wait_window_minutes": wait_window,
+        },
     )
+    session.add(ack_evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(ack_evt)
 
     return ClientAcknowledgementResponse(
         shipment_id=str(shipment.id),
@@ -950,20 +951,20 @@ async def evaluate_shipment_bids(session: AsyncSession, shipment_id: UUID) -> Sh
     shipment.updated_at = datetime.now(timezone.utc)
     margin_amount = _margin_amount(winner_bid.amount or 0, dict(shipment.margin_policy_json or {}))
     recommended_quote = round((winner_bid.amount or 0) + margin_amount, 2)
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.EVALUATION_COMPLETED.value,
-            stage=shipment.status,
-            payload_json={
-                "selected_bid_id": str(winner_bid.id),
-                "selected_carrier_id": str(winner_carrier.id),
-                "recommended_quote_amount": recommended_quote,
-                "margin_amount": margin_amount,
-            },
-        )
+    eval_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.EVALUATION_COMPLETED.value,
+        stage=shipment.status,
+        payload_json={
+            "selected_bid_id": str(winner_bid.id),
+            "selected_carrier_id": str(winner_carrier.id),
+            "recommended_quote_amount": recommended_quote,
+            "margin_amount": margin_amount,
+        },
     )
+    session.add(eval_evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(eval_evt)
 
     return ShipmentEvaluationResponse(
         shipment_id=str(shipment.id),
@@ -1079,20 +1080,20 @@ async def send_customer_quote(
         ShipmentStage.AWAITING_CONFIRMATION.value if not dry_run else ShipmentStage.QUOTED.value
     )
     shipment.updated_at = datetime.now(timezone.utc)
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.CLIENT_QUOTE_SENT.value,
-            stage=shipment.status,
-            payload_json={
-                "bid_id": str(bid.id),
-                "client_email": client.email,
-                "final_amount": final_amount,
-                "dry_run": dry_run,
-            },
-        )
+    quote_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.CLIENT_QUOTE_SENT.value,
+        stage=shipment.status,
+        payload_json={
+            "bid_id": str(bid.id),
+            "client_email": client.email,
+            "final_amount": final_amount,
+            "dry_run": dry_run,
+        },
     )
+    session.add(quote_evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(quote_evt)
 
     return CustomerQuoteResponse(
         shipment_id=str(shipment.id),
@@ -1190,6 +1191,10 @@ async def handoff_to_tms(
         shipment.status = ShipmentStage.BOOKING_IN_PROGRESS.value
         shipment.updated_at = datetime.now(timezone.utc)
         await session.commit()
+        await freight_realtime_hub.publish_shipment_updated(
+            shipment_id=str(shipment.id),
+            fields=["status"],
+        )
         try:
             response_payload = await connector.request(
                 "POST",
@@ -1202,24 +1207,25 @@ async def handoff_to_tms(
         except RuntimeError as exc:
             shipment.status = ShipmentStage.BOOKING_FAILED.value
             shipment.updated_at = datetime.now(timezone.utc)
-            session.add(
-                WorkflowEvent(
-                    shipment_id=shipment.id,
-                    event_type=WorkflowEventType.EXCEPTION_RAISED.value,
-                    stage=shipment.status,
-                    payload_json={
-                        "reason": "tms_handoff_failed",
-                        "message": str(exc),
-                        "payload": payload,
-                    },
-                )
+            handoff_exc_evt = WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.EXCEPTION_RAISED.value,
+                stage=shipment.status,
+                payload_json={
+                    "reason": "tms_handoff_failed",
+                    "message": str(exc),
+                    "payload": payload,
+                },
             )
+            session.add(handoff_exc_evt)
             await session.commit()
+            await freight_realtime_hub.notify_workflow_event(handoff_exc_evt)
             raise
     else:
         shipment.status = ShipmentStage.AWAITING_CONFIRMATION.value
 
     shipment.updated_at = datetime.now(timezone.utc)
+    booking_review_evt: WorkflowEvent | None = None
     if document_status["review_required"]:
         latest_review = await _latest_workflow_event(
             session,
@@ -1228,55 +1234,57 @@ async def handoff_to_tms(
         )
         latest_review_payload = dict((latest_review.payload_json or {}) if latest_review else {})
         if latest_review_payload.get("reason") != "booking_documents_review_required":
-            session.add(
-                WorkflowEvent(
-                    shipment_id=shipment.id,
-                    event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
-                    stage=shipment.status,
-                    payload_json={
-                        "reason": "booking_documents_review_required",
-                        "review_type": (
-                            "document_conflict_review"
-                            if document_status["document_conflict_fields"]
-                            else "ocr_review_required"
-                            if document_status["ocr_pending_count"] > 0
-                            else "document_parse_low_confidence"
-                        ),
-                        "next_action": "review_documents",
-                        "document_conflict_fields": document_status["document_conflict_fields"],
-                        "missing_document_types": document_status["missing_document_types"],
-                        "booking_review_warning": document_status["booking_review_warning"],
-                        "manual_review_required": True,
-                    },
-                )
+            booking_review_evt = WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+                stage=shipment.status,
+                payload_json={
+                    "reason": "booking_documents_review_required",
+                    "review_type": (
+                        "document_conflict_review"
+                        if document_status["document_conflict_fields"]
+                        else "ocr_review_required"
+                        if document_status["ocr_pending_count"] > 0
+                        else "document_parse_low_confidence"
+                    ),
+                    "next_action": "review_documents",
+                    "document_conflict_fields": document_status["document_conflict_fields"],
+                    "missing_document_types": document_status["missing_document_types"],
+                    "booking_review_warning": document_status["booking_review_warning"],
+                    "manual_review_required": True,
+                },
             )
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.TMS_HANDOFF_SENT.value,
-            stage=shipment.status,
-            payload_json={
-                "bid_id": str(bid.id),
-                "carrier_id": str(carrier.id),
-                "dry_run": dry_run,
-                "payload": payload,
-                "response": response_payload,
-                "status": status,
-                "attachment_count": len(attachments),
-                "document_summary": document_status["document_summary"],
-                "document_enrichment": document_status["document_enrichment"],
-                "document_health_status": document_status["document_health_status"],
-                "ocr_pending_count": document_status["ocr_pending_count"],
-                "document_conflict_count": document_status["document_conflict_count"],
-                "document_conflict_fields": document_status["document_conflict_fields"],
-                "missing_document_types": document_status["missing_document_types"],
-                "booking_review_warning": document_status["booking_review_warning"],
-                "booking_review_required": document_status["review_required"],
-                "document_context": document_context,
-            },
-        )
+            session.add(booking_review_evt)
+    handoff_sent_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.TMS_HANDOFF_SENT.value,
+        stage=shipment.status,
+        payload_json={
+            "bid_id": str(bid.id),
+            "carrier_id": str(carrier.id),
+            "dry_run": dry_run,
+            "payload": payload,
+            "response": response_payload,
+            "status": status,
+            "attachment_count": len(attachments),
+            "document_summary": document_status["document_summary"],
+            "document_enrichment": document_status["document_enrichment"],
+            "document_health_status": document_status["document_health_status"],
+            "ocr_pending_count": document_status["ocr_pending_count"],
+            "document_conflict_count": document_status["document_conflict_count"],
+            "document_conflict_fields": document_status["document_conflict_fields"],
+            "missing_document_types": document_status["missing_document_types"],
+            "booking_review_warning": document_status["booking_review_warning"],
+            "booking_review_required": document_status["review_required"],
+            "document_context": document_context,
+        },
     )
+    session.add(handoff_sent_evt)
     await session.commit()
+    handoff_broadcast = [handoff_sent_evt]
+    if booking_review_evt is not None:
+        handoff_broadcast.insert(0, booking_review_evt)
+    await freight_realtime_hub.notify_workflow_events(handoff_broadcast)
 
     return TmsHandoffResponse(
         shipment_id=str(shipment.id),
@@ -1366,6 +1374,7 @@ async def send_booking_confirmation(
         )
 
     await session.commit()
+    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
 
     return BookingConfirmationResponse(
         shipment_id=str(shipment.id),
@@ -1398,15 +1407,15 @@ async def fetch_tms_shipment_status(
         source=payload.get("source") or "tms",
         extra=payload,
     )
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.TMS_STATUS_LOOKUP.value,
-            stage=shipment.status,
-            payload_json=audit_payload,
-        )
+    lookup_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.TMS_STATUS_LOOKUP.value,
+        stage=shipment.status,
+        payload_json=audit_payload,
     )
+    session.add(lookup_evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(lookup_evt)
     return TmsStatusResponse(
         shipment_id=str(shipment.id),
         status=str(payload.get("status", "unknown")),
@@ -1521,29 +1530,29 @@ async def send_customer_status_reply(
             )
         )
 
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.CUSTOMER_STATUS_SENT.value,
-            stage=shipment.status,
-            payload_json=_build_status_audit_payload(
-                kind="reply_drafted" if dry_run else "reply_sent",
-                status=status_payload.get("status"),
-                eta=status_payload.get("eta"),
-                location=status_payload.get("location"),
-                milestone=status_payload.get("milestone"),
-                source="customer_reply",
-                extra={
-                    "dry_run": dry_run,
-                    "subject": subject,
-                    "body": body,
-                    "custom_message": custom_message,
-                    **status_payload,
-                },
-            ),
-        )
+    reply_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+        stage=shipment.status,
+        payload_json=_build_status_audit_payload(
+            kind="reply_drafted" if dry_run else "reply_sent",
+            status=status_payload.get("status"),
+            eta=status_payload.get("eta"),
+            location=status_payload.get("location"),
+            milestone=status_payload.get("milestone"),
+            source="customer_reply",
+            extra={
+                "dry_run": dry_run,
+                "subject": subject,
+                "body": body,
+                "custom_message": custom_message,
+                **status_payload,
+            },
+        ),
     )
+    session.add(reply_evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(reply_evt)
     return CustomerStatusReplyResponse(
         shipment_id=str(shipment.id),
         client_email=client.email,
@@ -1575,22 +1584,22 @@ async def push_carrier_status_to_tms(
         location_text=location_text,
         notes=notes,
     )
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
-            stage=shipment.status,
-            payload_json=_build_status_audit_payload(
-                kind="carrier_update_pushed",
-                status=status_text or payload.get("payload", {}).get("status_text"),
-                eta=eta_text or payload.get("payload", {}).get("eta_text"),
-                location=location_text or payload.get("payload", {}).get("location_text"),
-                source="carrier_update",
-                extra=payload,
-            ),
-        )
+    push_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
+        stage=shipment.status,
+        payload_json=_build_status_audit_payload(
+            kind="carrier_update_pushed",
+            status=status_text or payload.get("payload", {}).get("status_text"),
+            eta=eta_text or payload.get("payload", {}).get("eta_text"),
+            location=location_text or payload.get("payload", {}).get("location_text"),
+            source="carrier_update",
+            extra=payload,
+        ),
     )
+    session.add(push_evt)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(push_evt)
     return TmsStatusResponse(
         shipment_id=str(shipment.id),
         status=str(payload.get("status", "unknown")),
@@ -1623,22 +1632,22 @@ async def preview_or_push_carrier_status_update(
     }
 
     if dry_run:
-        session.add(
-            WorkflowEvent(
-                shipment_id=shipment.id,
-                event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
-                stage=shipment.status,
-                payload_json=_build_status_audit_payload(
-                    kind="carrier_update_parsed",
-                    status=status_text,
-                    eta=eta_text,
-                    location=location_text,
-                    source="carrier_preview",
-                    extra=payload,
-                ),
-            )
+        preview_evt = WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
+            stage=shipment.status,
+            payload_json=_build_status_audit_payload(
+                kind="carrier_update_parsed",
+                status=status_text,
+                eta=eta_text,
+                location=location_text,
+                source="carrier_preview",
+                extra=payload,
+            ),
         )
+        session.add(preview_evt)
         await session.commit()
+        await freight_realtime_hub.notify_workflow_event(preview_evt)
         return CarrierStatusUpdateResponse(
             shipment_id=str(shipment.id),
             status="preview",

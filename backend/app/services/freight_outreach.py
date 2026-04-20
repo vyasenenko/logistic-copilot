@@ -12,6 +12,7 @@ from app.config import settings
 from app.memory.database import Carrier, CarrierBid, EmailMessage, EmailThread, Shipment, WorkflowEvent
 from app.schemas import CarrierOutreachItem, CarrierOutreachResponse, ShipmentStage, WorkflowEventType
 from app.services.email_correlation import attach_quote_token, generate_quote_reference, normalize_subject
+from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import format_ready_at_wall_display
 from app.services.outlook import OutlookGraphClient
 
@@ -201,6 +202,7 @@ async def create_carrier_outreach(
     )
     session.add(workflow_event)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(workflow_event)
 
     return CarrierOutreachResponse(
         shipment_id=str(shipment.id),

@@ -95,11 +95,13 @@ from app.services.freight_inbox_agent import (
     run_freight_inbox_orchestrator,
 )
 from app.services.freight_ai import extract_carrier_status_update
+from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import (
     apply_shipment_ready_at_wall_fields,
     infer_shipment_timezone,
     offset_minutes_for_local_naive,
 )
+from app.services.workflow_event_codec import workflow_event_to_record
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
@@ -360,14 +362,7 @@ def _normalize_shipment_ready_at_timezone_fields(shipment: Shipment) -> None:
 
 
 def _serialize_workflow_event(event: WorkflowEvent) -> WorkflowEventRecord:
-    return WorkflowEventRecord(
-        id=str(event.id),
-        shipment_id=str(event.shipment_id),
-        event_type=event.event_type,
-        stage=event.stage,
-        payload=dict(event.payload_json or {}),
-        created_at=event.created_at,
-    )
+    return workflow_event_to_record(event)
 
 
 def _review_priority_score(item: ReviewQueueItem) -> tuple[int, datetime]:
@@ -852,7 +847,7 @@ def _resolution_reason_label(reason: str | None) -> str | None:
     return str(reason)
 
 
-async def _record_status_task_resolution(
+def _record_status_task_resolution(
     session: AsyncSession,
     *,
     shipment: Shipment,
@@ -861,21 +856,21 @@ async def _record_status_task_resolution(
     resolution_reason: str,
     source_task_id: str | None = None,
     source: str | None = None,
-) -> None:
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
-            stage=shipment.status,
-            payload_json={
-                "task_type": task_type,
-                "resolution_state": resolution_state,
-                "resolution_reason": resolution_reason,
-                "source_task_id": source_task_id,
-                "source": source,
-            },
-        )
+) -> WorkflowEvent:
+    evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
+        stage=shipment.status,
+        payload_json={
+            "task_type": task_type,
+            "resolution_state": resolution_state,
+            "resolution_reason": resolution_reason,
+            "source_task_id": source_task_id,
+            "source": source,
+        },
     )
+    session.add(evt)
+    return evt
 
 
 def _build_status_queue_item(
@@ -1332,52 +1327,54 @@ def _document_review_type(document_health: dict) -> str:
     return "document_parse_low_confidence"
 
 
-async def _persist_document_analysis_events(
+def _persist_document_analysis_events(
     session: AsyncSession,
     shipment: Shipment,
     *,
     document_health: dict,
     document_context: dict,
     event_type: WorkflowEventType = WorkflowEventType.DOCUMENT_ANALYZED,
-) -> None:
-    session.add(
-        WorkflowEvent(
+) -> list[WorkflowEvent]:
+    events_out: list[WorkflowEvent] = []
+    analyzed = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=event_type.value,
+        stage=shipment.status,
+        payload_json={
+            "attachment_count": document_health.get("attachment_count", 0),
+            "document_summary": dict(document_health.get("document_summary", {}) or {}),
+            "document_enrichment": dict(document_health.get("document_enrichment", {}) or {}),
+            "document_health_status": document_health.get("document_health_status"),
+            "ocr_pending_count": document_health.get("ocr_pending_count", 0),
+            "document_conflict_count": document_health.get("document_conflict_count", 0),
+            "document_conflict_fields": list(document_health.get("document_conflict_fields", []) or []),
+            "missing_document_types": list(document_health.get("missing_document_types", []) or []),
+            "booking_review_warning": document_health.get("booking_review_warning"),
+            "booking_review_required": bool(document_health.get("booking_review_required", False)),
+            "review_required": bool(document_health.get("review_required", False)),
+            "document_extracts": list(document_context.get("document_extracts", []) or []),
+        },
+    )
+    session.add(analyzed)
+    events_out.append(analyzed)
+    if document_health.get("review_required"):
+        review_evt = WorkflowEvent(
             shipment_id=shipment.id,
-            event_type=event_type.value,
+            event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
             stage=shipment.status,
             payload_json={
-                "attachment_count": document_health.get("attachment_count", 0),
-                "document_summary": dict(document_health.get("document_summary", {}) or {}),
-                "document_enrichment": dict(document_health.get("document_enrichment", {}) or {}),
-                "document_health_status": document_health.get("document_health_status"),
-                "ocr_pending_count": document_health.get("ocr_pending_count", 0),
-                "document_conflict_count": document_health.get("document_conflict_count", 0),
-                "document_conflict_fields": list(document_health.get("document_conflict_fields", []) or []),
+                "review_type": _document_review_type(document_health),
+                "reason": document_health.get("booking_review_warning")
+                or "Document extraction requires operator review.",
+                "next_action": "review_documents",
                 "missing_document_types": list(document_health.get("missing_document_types", []) or []),
+                "document_conflict_fields": list(document_health.get("document_conflict_fields", []) or []),
                 "booking_review_warning": document_health.get("booking_review_warning"),
-                "booking_review_required": bool(document_health.get("booking_review_required", False)),
-                "review_required": bool(document_health.get("review_required", False)),
-                "document_extracts": list(document_context.get("document_extracts", []) or []),
             },
         )
-    )
-    if document_health.get("review_required"):
-        session.add(
-            WorkflowEvent(
-                shipment_id=shipment.id,
-                event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
-                stage=shipment.status,
-                payload_json={
-                    "review_type": _document_review_type(document_health),
-                    "reason": document_health.get("booking_review_warning")
-                    or "Document extraction requires operator review.",
-                    "next_action": "review_documents",
-                    "missing_document_types": list(document_health.get("missing_document_types", []) or []),
-                    "document_conflict_fields": list(document_health.get("document_conflict_fields", []) or []),
-                    "booking_review_warning": document_health.get("booking_review_warning"),
-                },
-            )
-        )
+        session.add(review_evt)
+        events_out.append(review_evt)
+    return events_out
 
 
 @router.get("/freight/foundation", response_model=FreightFoundationResponse)
@@ -1429,6 +1426,7 @@ async def create_client(
     session.add(client)
     await session.commit()
     await session.refresh(client)
+    await freight_realtime_hub.publish_overview_stale_throttled(reason="client_created")
     return _serialize_client(client)
 
 
@@ -1463,6 +1461,7 @@ async def update_client(
     client.default_margin_floor = request.default_margin_floor
     await session.commit()
     await session.refresh(client)
+    await freight_realtime_hub.publish_overview_stale_throttled(reason="client_updated")
     return _serialize_client(client)
 
 
@@ -1495,6 +1494,7 @@ async def create_carrier(
     session.add(carrier)
     await session.commit()
     await session.refresh(carrier)
+    await freight_realtime_hub.publish_overview_stale_throttled(reason="carrier_created")
     return _serialize_carrier(carrier)
 
 
@@ -1531,6 +1531,7 @@ async def update_carrier(
     carrier.metadata_json = request.metadata
     await session.commit()
     await session.refresh(carrier)
+    await freight_realtime_hub.publish_overview_stale_throttled(reason="carrier_updated")
     return _serialize_carrier(carrier)
 
 
@@ -1618,6 +1619,7 @@ async def create_shipment(
     session.add(shipment)
     await session.commit()
     await session.refresh(shipment)
+    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
     return _serialize_shipment(shipment)
 
 
@@ -1736,22 +1738,26 @@ async def update_shipment(
         for field, value in current_values.items()
         if previous_values.get(field) != value
     ]
+    fields_evt: WorkflowEvent | None = None
     if changed_fields:
-        session.add(
-            WorkflowEvent(
-                shipment_id=shipment.id,
-                event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
-                stage=shipment.status,
-                payload_json={
-                    "changed_fields": changed_fields,
-                    "manual_review_required": False,
-                    "edited_by": "operator",
-                },
-            )
+        fields_evt = WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
+            stage=shipment.status,
+            payload_json={
+                "changed_fields": changed_fields,
+                "manual_review_required": False,
+                "edited_by": "operator",
+            },
         )
+        session.add(fields_evt)
 
     await session.commit()
     await session.refresh(shipment)
+    if fields_evt is not None:
+        await freight_realtime_hub.notify_workflow_event(fields_evt)
+    else:
+        await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
     return _serialize_shipment(shipment)
 
 
@@ -1871,7 +1877,7 @@ async def freight_status_queue_action(
                     resolution_reason="dismissed_by_operator",
                     shipment_id=str(shipment.id),
                 )
-            await _record_status_task_resolution(
+            resolution_evt = _record_status_task_resolution(
                 session,
                 shipment=shipment,
                 task_type=task_type,
@@ -1880,6 +1886,7 @@ async def freight_status_queue_action(
                 source_task_id=str(task_id),
             )
             await session.commit()
+            await freight_realtime_hub.notify_workflow_event(resolution_evt)
             return StatusQueueActionResponse(
                 task_id=str(task_id),
                 task_type=task_type,
@@ -1943,7 +1950,7 @@ async def freight_status_queue_action(
                     subject_override=request.draft_subject,
                     body_override=request.draft_body,
                 )
-                await _record_status_task_resolution(
+                resolution_evt = _record_status_task_resolution(
                     session,
                     shipment=shipment,
                     task_type=task_type,
@@ -1952,6 +1959,7 @@ async def freight_status_queue_action(
                     source_task_id=str(task_id),
                 )
                 await session.commit()
+                await freight_realtime_hub.notify_workflow_event(resolution_evt)
                 return StatusQueueActionResponse(
                     task_id=str(task_id),
                     task_type=task_type,
@@ -2006,7 +2014,7 @@ async def freight_status_queue_action(
                         resolution_reason="pushed_to_tms",
                         shipment_id=str(shipment.id),
                     )
-                await _record_status_task_resolution(
+                resolution_evt = _record_status_task_resolution(
                     session,
                     shipment=shipment,
                     task_type=task_type,
@@ -2015,6 +2023,7 @@ async def freight_status_queue_action(
                     source_task_id=str(task_id),
                 )
                 await session.commit()
+                await freight_realtime_hub.notify_workflow_event(resolution_evt)
                 return StatusQueueActionResponse(
                     task_id=str(task_id),
                     task_type=task_type,
@@ -2097,32 +2106,31 @@ async def freight_tms_status_event(
                 tms_load_id=request.tms_load_id,
             )
 
-    session.add(
-        WorkflowEvent(
-            shipment_id=shipment.id,
-            event_type=WorkflowEventType.TMS_STATUS_INGESTED.value,
-            stage=shipment.status,
-            payload_json={
-                "external_event_id": request.external_event_id,
-                "tms_load_id": request.tms_load_id,
-                "external_load_ref": request.external_load_ref,
-                "tms_system": request.tms_system,
-                "status": request.status,
-                "eta": request.eta,
-                "location": request.location,
-                "milestone": request.milestone,
-                "source_timestamp": request.source_timestamp.isoformat() if request.source_timestamp else None,
-                "status_audit_kind": "tms_inbound_sync",
-                "status_label": request.status or "Unknown",
-                "eta_label": request.eta or "Not available",
-                "location_label": request.location or "Not available",
-                "milestone_label": request.milestone or "Not available",
-                "status_source": "tms_inbound_sync",
-                "payload": request.payload,
-            },
-        )
+    ingest_evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.TMS_STATUS_INGESTED.value,
+        stage=shipment.status,
+        payload_json={
+            "external_event_id": request.external_event_id,
+            "tms_load_id": request.tms_load_id,
+            "external_load_ref": request.external_load_ref,
+            "tms_system": request.tms_system,
+            "status": request.status,
+            "eta": request.eta,
+            "location": request.location,
+            "milestone": request.milestone,
+            "source_timestamp": request.source_timestamp.isoformat() if request.source_timestamp else None,
+            "status_audit_kind": "tms_inbound_sync",
+            "status_label": request.status or "Unknown",
+            "eta_label": request.eta or "Not available",
+            "location_label": request.location or "Not available",
+            "milestone_label": request.milestone or "Not available",
+            "status_source": "tms_inbound_sync",
+            "payload": request.payload,
+        },
     )
-    await _record_status_task_resolution(
+    session.add(ingest_evt)
+    res_carrier = _record_status_task_resolution(
         session,
         shipment=shipment,
         task_type="carrier_update",
@@ -2130,7 +2138,7 @@ async def freight_tms_status_event(
         resolution_reason="superseded_by_newer_snapshot",
         source="tms_inbound_sync",
     )
-    await _record_status_task_resolution(
+    res_status = _record_status_task_resolution(
         session,
         shipment=shipment,
         task_type="status_reply",
@@ -2139,6 +2147,7 @@ async def freight_tms_status_event(
         source="tms_inbound_sync",
     )
     await session.commit()
+    await freight_realtime_hub.notify_workflow_events([ingest_evt, res_carrier, res_status])
     return TmsStatusIngestResponse(
         shipment_id=str(shipment.id),
         status="ingested",
@@ -2339,13 +2348,14 @@ async def freight_operator_action(
                 shipment,
                 force_reprocess=True,
             )
-            await _persist_document_analysis_events(
+            doc_events = _persist_document_analysis_events(
                 session,
                 shipment,
                 document_health=document_health,
                 document_context=document_context,
             )
             await session.commit()
+            await freight_realtime_hub.notify_workflow_events(doc_events)
             return ShipmentOperatorActionResponse(
                 shipment_id=str(shipment.id),
                 action=request.action,
@@ -2361,18 +2371,17 @@ async def freight_operator_action(
         if request.action == OperatorAction.APPROVE_DOCUMENT_VALUES:
             _attachments, document_health, document_context = await _collect_document_state(session, shipment)
             approved_fields = dict(document_health.get("document_enrichment", {}) or {})
-            session.add(
-                WorkflowEvent(
-                    shipment_id=shipment.id,
-                    event_type=WorkflowEventType.DOCUMENT_VALUES_APPROVED.value,
-                    stage=shipment.status,
-                    payload_json={
-                        "approved_fields": approved_fields,
-                        "document_health_status": document_health.get("document_health_status"),
-                    },
-                )
+            approve_evt = WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.DOCUMENT_VALUES_APPROVED.value,
+                stage=shipment.status,
+                payload_json={
+                    "approved_fields": approved_fields,
+                    "document_health_status": document_health.get("document_health_status"),
+                },
             )
-            await _persist_document_analysis_events(
+            session.add(approve_evt)
+            doc_events = _persist_document_analysis_events(
                 session,
                 shipment,
                 document_health=build_document_health(
@@ -2384,6 +2393,7 @@ async def freight_operator_action(
                 document_context=document_context,
             )
             await session.commit()
+            await freight_realtime_hub.notify_workflow_events([approve_evt, *doc_events])
             return ShipmentOperatorActionResponse(
                 shipment_id=str(shipment.id),
                 action=request.action,
@@ -2399,18 +2409,17 @@ async def freight_operator_action(
 
         if request.action == OperatorAction.IGNORE_DOCUMENT_WARNING:
             _attachments, document_health, document_context = await _collect_document_state(session, shipment)
-            session.add(
-                WorkflowEvent(
-                    shipment_id=shipment.id,
-                    event_type=WorkflowEventType.DOCUMENT_WARNING_IGNORED.value,
-                    stage=shipment.status,
-                    payload_json={
-                        "ignored_warning": document_health.get("booking_review_warning"),
-                        "document_health_status": document_health.get("document_health_status"),
-                    },
-                )
+            ignore_evt = WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.DOCUMENT_WARNING_IGNORED.value,
+                stage=shipment.status,
+                payload_json={
+                    "ignored_warning": document_health.get("booking_review_warning"),
+                    "document_health_status": document_health.get("document_health_status"),
+                },
             )
-            await _persist_document_analysis_events(
+            session.add(ignore_evt)
+            doc_events = _persist_document_analysis_events(
                 session,
                 shipment,
                 document_health=build_document_health(
@@ -2422,6 +2431,7 @@ async def freight_operator_action(
                 document_context=document_context,
             )
             await session.commit()
+            await freight_realtime_hub.notify_workflow_events([ignore_evt, *doc_events])
             return ShipmentOperatorActionResponse(
                 shipment_id=str(shipment.id),
                 action=request.action,

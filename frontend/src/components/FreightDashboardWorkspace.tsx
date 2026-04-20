@@ -1,6 +1,8 @@
 "use client";
 
 import { startTransition, useEffect, useMemo, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from "react";
+
+import { useFreightSocket } from "@/hooks/useFreightSocket";
 import {
   AlertTriangle,
   ArrowRight,
@@ -561,7 +563,7 @@ function reviewPriorityClasses(priority: string) {
 
 function ShipmentStatusPill({ status }: { status: string }) {
   return (
-    <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-medium capitalize ${statusPillClass(status)}`}>
+    <span className={`inline-flex h-6 shrink-0 items-center whitespace-nowrap rounded-full border px-2.5 text-[10px] font-medium capitalize leading-none ${statusPillClass(status)}`}>
       {status.replaceAll("_", " ")}
     </span>
   );
@@ -570,6 +572,8 @@ function ShipmentStatusPill({ status }: { status: string }) {
 export function FreightDashboardWorkspace() {
   const [tab, setTab] = useState<DashboardTab>("shipments");
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("overview");
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [activeBoardFilter, setActiveBoardFilter] = useState<"all" | "today" | "attention">("today");
   const [overview, setOverview] = useState<OverviewResponse>(EMPTY_OVERVIEW);
   const [clients, setClients] = useState<ClientRecord[]>([]);
   const [carriers, setCarriers] = useState<CarrierRecord[]>([]);
@@ -648,6 +652,40 @@ export function FreightDashboardWorkspace() {
     if (!evaluation?.selected_bid_id) return null;
     return bids.find((bid) => bid.id === evaluation.selected_bid_id) || null;
   }, [bids, evaluation]);
+  const boardShipments = useMemo(() => {
+    const today = new Intl.DateTimeFormat("en-CA").format(new Date());
+    return shipments.filter((shipment) => {
+      if (activeBoardFilter === "attention") return shipmentNeedsAttention(shipment);
+      if (activeBoardFilter === "today") {
+        if (!shipment.ready_at) return shipmentNeedsAttention(shipment);
+        return new Intl.DateTimeFormat("en-CA").format(new Date(shipment.ready_at)) === today;
+      }
+      return true;
+    });
+  }, [shipments, activeBoardFilter]);
+  const groupedShipmentsByStatus = useMemo(() => {
+    const groups: Record<string, ShipmentRecord[]> = {
+      parsing: [],
+      needs_review: [],
+      waiting_bids: [],
+      quoted: [],
+      booked: [],
+    };
+    boardShipments.forEach((shipment) => {
+      if (shipmentNeedsAttention(shipment)) {
+        groups.needs_review.push(shipment);
+      } else if (["received", "parsing", "client_acknowledged"].includes(shipment.status)) {
+        groups.parsing.push(shipment);
+      } else if (["outreaching", "waiting_bids", "evaluating"].includes(shipment.status)) {
+        groups.waiting_bids.push(shipment);
+      } else if (["quoted", "awaiting_confirmation"].includes(shipment.status)) {
+        groups.quoted.push(shipment);
+      } else {
+        groups.booked.push(shipment);
+      }
+    });
+    return groups;
+  }, [boardShipments]);
 
   async function loadDashboard() {
     setLoading(true);
@@ -692,6 +730,46 @@ export function FreightDashboardWorkspace() {
     setBids(bidData);
     setDocuments(documentData);
   }
+
+  const refetchShipmentDetailTypes = useMemo(
+    () =>
+      new Set([
+        "bid_received",
+        "evaluation_completed",
+        "client_quote_sent",
+        "carrier_outreach_sent",
+        "document_analyzed",
+        "document_values_approved",
+        "document_warning_ignored",
+        "manual_review_required",
+        "tms_handoff_sent",
+        "tms_status_ingested",
+      ]),
+    [],
+  );
+
+  useFreightSocket({
+    onOverviewStale: () => {
+      void loadDashboard();
+    },
+    onShipmentUpdated: (shipmentId) => {
+      void loadDashboard();
+      if (shipmentId === selectedShipmentId) {
+        void loadShipmentContext(shipmentId);
+      }
+    },
+    onWorkflowEvent: ({ shipment_id, event }) => {
+      void loadDashboard();
+      if (shipment_id === selectedShipmentId) {
+        setEvents((prev) =>
+          prev.some((e) => e.id === event.id) ? prev : [event as WorkflowEventRecord, ...prev],
+        );
+        if (refetchShipmentDetailTypes.has(event.event_type)) {
+          void loadShipmentContext(shipment_id);
+        }
+      }
+    },
+  });
 
   async function refreshAll() {
     await loadDashboard();
@@ -1074,10 +1152,10 @@ export function FreightDashboardWorkspace() {
   }
 
   const metrics = [
-    { label: "Needs review", value: reviewQueue.length, detail: "operator tasks" },
-    { label: "Active shipments", value: overview.counts.shipments, detail: "live workflow cases" },
-    { label: "Waiting bids", value: overview.active_stages.waiting_bids || 0, detail: "awaiting carrier replies" },
-    { label: "Status stale", value: overview.status_metrics.stale_shipments, detail: "need fresh lookup" },
+    { label: "Active", value: overview.counts.shipments, detail: "live shipments" },
+    { label: "Review", value: reviewQueue.length, detail: "need operator" },
+    { label: "Bids", value: overview.active_stages.waiting_bids || 0, detail: "waiting carriers" },
+    { label: "Booked", value: overview.active_stages.booked || 0, detail: "moving loads" },
   ];
 
   const attentionItems = [
@@ -1088,11 +1166,18 @@ export function FreightDashboardWorkspace() {
   ];
 
   const secondaryActions = actionModel?.contextActions.filter((action) => action.operatorAction !== actionModel.operatorAction) || [];
+  const boardColumns = [
+    { key: "parsing", label: "Parsing", accent: "from-teal-300/18 to-teal-500/0" },
+    { key: "needs_review", label: "Needs Review", accent: "from-amber-300/18 to-rose-500/0" },
+    { key: "waiting_bids", label: "Waiting Bids", accent: "from-orange-300/18 to-orange-500/0" },
+    { key: "quoted", label: "Quoted", accent: "from-emerald-300/18 to-emerald-500/0" },
+    { key: "booked", label: "Booked / Active", accent: "from-cyan-300/18 to-lime-500/0" },
+  ] as const;
 
   const renderShipmentWorkspace = () => {
     if (!selectedShipment) {
       return (
-        <div className="glass-panel flex min-h-[560px] items-center justify-center p-8 text-sm text-[var(--text-muted)]">
+        <div className="flex h-full items-center justify-center p-8 text-sm text-[var(--text-muted)]">
           Select a shipment to open the operator workspace.
         </div>
       );
@@ -1100,8 +1185,8 @@ export function FreightDashboardWorkspace() {
 
     return (
       <div className="space-y-4">
-        <div className="glass-panel p-5">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
+          <div className="flex flex-col gap-4">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-2">
                 <ShipmentStatusPill status={selectedShipment.status} />
@@ -1115,12 +1200,12 @@ export function FreightDashboardWorkspace() {
                 </span>
               </div>
               <div>
-                <h2 className="text-3xl font-semibold tracking-[-0.04em] text-white">{formatRoute(selectedShipment)}</h2>
+                <h2 className="text-2xl font-semibold tracking-[-0.04em] text-white">{formatRoute(selectedShipment)}</h2>
                 <p className="mt-2 text-sm text-[var(--text-muted)]">
                   Client {selectedShipment.client_id ? "linked" : "not linked"} • Confidence {formatConfidence(selectedShipment.ai_confidence)} • Last agent decision {selectedShipment.ai_next_action || "pending"}
                 </p>
               </div>
-              <div className="grid gap-3 sm:grid-cols-4">
+              <div className="grid gap-3 sm:grid-cols-2">
                 <div className="rounded-2xl bg-white/5 p-3">
                   <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Pallets</p>
                   <p className="mt-2 text-white">{selectedShipment.pallets ?? "--"}</p>
@@ -1139,8 +1224,7 @@ export function FreightDashboardWorkspace() {
                 </div>
               </div>
             </div>
-
-            <div className="w-full max-w-[360px] rounded-[28px] border border-white/10 bg-slate-950/35 p-4">
+            <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">What happens next</p>
               <h3 className="mt-2 text-xl font-semibold text-white">{actionModel?.label || "Operator input needed"}</h3>
               <p className="mt-2 text-sm leading-6 text-[var(--text-muted)]">{actionModel?.reason}</p>
@@ -1175,9 +1259,8 @@ export function FreightDashboardWorkspace() {
           </div>
         </div>
 
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr),minmax(340px,0.85fr)]">
-          <div className="space-y-4">
-            <div className="glass-panel p-5">
+        <div className="space-y-4">
+          <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
               <div className="mb-4 flex items-center justify-between">
                 <div>
                   <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Editable shipment details</p>
@@ -1204,9 +1287,9 @@ export function FreightDashboardWorkspace() {
                 <input type="datetime-local" className="field-input sm:col-span-2" value={shipmentEditor.ready_at} onChange={(event) => setShipmentEditor((current) => ({ ...current, ready_at: event.target.value }))} />
                 <textarea className="field-input min-h-[140px] resize-none sm:col-span-2" placeholder="Notes" value={shipmentEditor.notes} onChange={(event) => setShipmentEditor((current) => ({ ...current, notes: event.target.value }))} />
               </div>
-            </div>
+          </div>
 
-            <div className="glass-panel p-5">
+          <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
               <div className="mb-4 flex items-center justify-between">
                 <div>
                   <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Operational context</p>
@@ -1406,11 +1489,10 @@ export function FreightDashboardWorkspace() {
                   ))}
                 </div>
               )}
-            </div>
           </div>
 
-          <div className="space-y-4">
-            <div className="glass-panel p-5">
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr),220px]">
+            <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Secondary actions</p>
               <div className="mt-4 grid gap-2">
                 {secondaryActions.length === 0 && (
@@ -1431,7 +1513,7 @@ export function FreightDashboardWorkspace() {
               </div>
             </div>
 
-            <div className="glass-panel p-5">
+            <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Quick health</p>
               <div className="mt-4 space-y-3 text-sm">
                 <div className="rounded-2xl bg-white/5 p-4">
@@ -1456,38 +1538,86 @@ export function FreightDashboardWorkspace() {
 
   return (
     <main className="min-h-screen px-4 py-5 text-[var(--text-main)] sm:px-6 lg:px-8">
-      <div className="mx-auto max-w-[1480px] space-y-6">
-        <section className="glass-panel overflow-hidden px-5 py-5 sm:px-6">
-          <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
-            <div className="space-y-4">
-              <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">
-                <LayoutDashboard size={14} /> Logistic Copilot
+      <div className="mx-auto max-w-[1540px] space-y-4">
+        <section className="relative overflow-hidden rounded-[18px] border border-cyan-300/12 bg-[linear-gradient(135deg,rgba(7,15,25,0.96),rgba(11,23,37,0.92)_46%,rgba(17,34,52,0.94)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.14),transparent_26%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.12),transparent_24%)] px-4 py-4 shadow-[0_18px_60px_rgba(0,0,0,0.26)] sm:px-5">
+          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(120,210,255,0.05)_18%,transparent_38%,transparent_62%,rgba(120,210,255,0.04)_82%,transparent)]" />
+          <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
+          <div className="pointer-events-none absolute inset-y-0 right-[26%] w-px bg-cyan-200/8" />
+
+          <div className="relative grid gap-4 xl:grid-cols-[minmax(0,1.2fr),minmax(420px,0.8fr)] xl:items-center">
+            <div className="min-w-0 space-y-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="inline-flex h-9 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[11px] uppercase tracking-[0.24em] text-cyan-100">
+                  <LayoutDashboard size={13} /> Logistic Copilot
+                </div>
+                <span className="hidden text-[11px] uppercase tracking-[0.24em] text-cyan-200/40 md:inline">
+                  Live operations board
+                </span>
               </div>
-              <div>
-                <h1 className="text-3xl font-semibold tracking-[-0.04em] text-white sm:text-4xl">
-                  Simple operator workspace for every shipment.
+              <div className="space-y-2">
+                <h1 className="text-xl font-semibold tracking-[-0.05em] text-white sm:text-[1.7rem]">
+                  Monitor active lanes. Surface blockers. Move faster.
                 </h1>
-                <p className="mt-3 max-w-3xl text-sm leading-6 text-[var(--text-muted)] sm:text-base">
-                  Pick one shipment, see what blocks it, fix details inline, and run the next correct workflow step with one main button.
+                <p className="max-w-2xl text-sm leading-6 text-slate-300">
+                  A sharper command deck for today&apos;s shipments, operator decisions, and time-sensitive follow-up.
                 </p>
               </div>
             </div>
-            <div className="grid gap-3 sm:grid-cols-2 xl:min-w-[520px]">
+
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
               {metrics.map((metric) => (
-                <div key={metric.label} className="rounded-[24px] border border-white/10 bg-white/[0.04] p-4">
-                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">{metric.label}</p>
-                  <p className="mt-4 text-3xl font-semibold text-white">{metric.value}</p>
-                  <p className="mt-1 text-sm text-[var(--text-muted)]">{metric.detail}</p>
+                <div key={metric.label} className="rounded-[14px] border border-cyan-200/10 bg-slate-950/26 px-3 py-3 backdrop-blur">
+                  <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/48">{metric.label}</p>
+                  <div className="mt-2 flex items-end justify-between gap-3">
+                    <span className="text-2xl font-semibold text-white">{metric.value}</span>
+                    <span className="text-[11px] text-slate-400">{metric.detail}</span>
+                  </div>
                 </div>
               ))}
             </div>
           </div>
-          <div className="mt-5 flex flex-wrap gap-2">
-            {attentionItems.map((item) => (
-              <span key={item} className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs text-[var(--text-muted)]">
-                {item}
-              </span>
-            ))}
+
+          <div className="relative mt-4 flex flex-wrap items-center gap-2 border-t border-cyan-200/10 pt-4">
+            <div className="flex flex-wrap gap-2">
+              {(["today", "attention", "all"] as const).map((filter) => (
+                <button
+                  key={filter}
+                  onClick={() => setActiveBoardFilter(filter)}
+                  className={`rounded-[10px] px-3 py-2 text-[11px] uppercase tracking-[0.2em] transition ${
+                    activeBoardFilter === filter
+                      ? "bg-cyan-100 text-slate-950"
+                      : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
+                  }`}
+                >
+                  {filter === "today" ? "Today" : filter === "attention" ? "Attention" : "All"}
+                </button>
+              ))}
+            </div>
+
+            <div className="hidden flex-wrap gap-2 xl:flex">
+              {attentionItems.slice(0, 3).map((item) => (
+                <span key={item} className="rounded-[10px] border border-cyan-200/10 bg-slate-950/20 px-3 py-2 text-[11px] text-slate-400">
+                  {item}
+                </span>
+              ))}
+            </div>
+
+            <div className="ml-auto flex flex-wrap gap-2">
+              <button
+                onClick={() => void handleOutlookSync()}
+                disabled={submitting !== null}
+                className="action-button border border-cyan-200/16 bg-cyan-200/12 text-cyan-50 hover:bg-cyan-200/20 disabled:opacity-50"
+              >
+                <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync"}
+              </button>
+              <button
+                onClick={() => void refreshAll()}
+                disabled={submitting !== null}
+                className="action-button border border-white/10 bg-white/6 text-white hover:bg-white/12 disabled:opacity-50"
+              >
+                <RefreshCcw size={16} /> Refresh
+              </button>
+            </div>
           </div>
         </section>
 
@@ -1525,77 +1655,98 @@ export function FreightDashboardWorkspace() {
 
         {!loading && tab === "shipments" && (
           <section className="space-y-4">
-            <div className="glass-panel p-4">
-              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Attention strip</p>
-                  <p className="mt-1 text-lg font-medium text-white">Start with blocked shipments, not with side panels.</p>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <button onClick={() => void handleOutlookSync()} disabled={submitting !== null} className="action-button bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">
-                    <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync Outlook"}
-                  </button>
-                  <button onClick={() => void refreshAll()} disabled={submitting !== null} className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">
-                    <RefreshCcw size={16} /> Refresh
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="grid gap-4 xl:grid-cols-[360px,minmax(0,1fr)]">
-              <div className="glass-panel p-3">
-                <div className="mb-3 px-2">
-                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Shipment list</p>
-                  <p className="mt-1 text-lg font-medium text-white">Open one case at a time</p>
-                </div>
-                <div className="space-y-2">
-                  {shipments.map((shipment) => {
-                    const isSelected = shipment.id === selectedShipmentId;
-                    return (
-                      <div
-                        key={shipment.id}
-                        onContextMenu={(event: ReactMouseEvent<HTMLDivElement>) => {
-                          event.preventDefault();
-                          setSelectedShipmentId(shipment.id);
-                          setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
-                        }}
-                        className={`rounded-[24px] border p-4 transition ${isSelected ? "border-cyan-300/40 bg-cyan-300/10" : "border-white/10 bg-white/5 hover:bg-white/10"}`}
-                      >
-                        <div className="flex items-start gap-3">
-                          <button onClick={() => setSelectedShipmentId(shipment.id)} className="flex-1 text-left">
-                            <div className="flex items-center justify-between gap-3">
-                              <ShipmentStatusPill status={shipment.status} />
-                              <span className={`rounded-full px-3 py-1 text-xs ${shipmentNeedsAttention(shipment) ? "bg-amber-300/10 text-amber-100" : "bg-emerald-300/10 text-emerald-100"}`}>
-                                {shipmentBlockingBadge(shipment)}
-                              </span>
-                            </div>
-                            <p className="mt-3 text-lg font-medium text-white">{formatRoute(shipment)}</p>
-                            <p className="mt-1 text-sm text-[var(--text-muted)]">
-                              Next: {shipment.ai_next_action ? shipment.ai_next_action.replaceAll("_", " ") : "operator review"}
-                            </p>
-                            <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
-                              <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Ready</p><p className="mt-1 text-white">{formatDate(shipment.ready_at)}</p></div>
-                              <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Confidence</p><p className="mt-1 text-white">{formatConfidence(shipment.ai_confidence)}</p></div>
-                            </div>
-                          </button>
-                          <button
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              setSelectedShipmentId(shipment.id);
-                              setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
-                            }}
-                            className="rounded-full p-2 text-[var(--text-muted)] transition hover:bg-white/10 hover:text-white"
-                          >
-                            <MoreHorizontal size={18} />
-                          </button>
+            <div className="overflow-x-auto rounded-[32px] border border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(75,211,255,0.08),transparent_32%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01))] p-4">
+              <div className="flex min-w-[1320px] gap-4">
+                {boardColumns.map((column) => {
+                  const items = groupedShipmentsByStatus[column.key] || [];
+                  return (
+                    <div key={column.key} className="flex min-h-[72vh] w-[260px] flex-col rounded-[28px] border border-white/10 bg-slate-950/25">
+                      <div className={`sticky top-0 z-10 rounded-t-[28px] border-b border-white/10 bg-gradient-to-b ${column.accent} px-4 py-4 backdrop-blur`}>
+                        <div className="flex items-center justify-between gap-3">
+                          <p className="text-sm font-medium text-white">{column.label}</p>
+                          <span className="rounded-full bg-white/10 px-2.5 py-1 text-xs text-white">{items.length}</span>
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
+                      <div className="flex-1 space-y-2 p-3">
+                        {items.length === 0 && (
+                          <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                            Nothing here right now.
+                          </div>
+                        )}
+                        {items.map((shipment) => {
+                          const isSelected = shipment.id === selectedShipmentId;
+                          return (
+                            <div
+                              key={shipment.id}
+                              onContextMenu={(event: ReactMouseEvent<HTMLDivElement>) => {
+                                event.preventDefault();
+                                setSelectedShipmentId(shipment.id);
+                                setDrawerOpen(true);
+                                setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
+                              }}
+                              className={`group relative overflow-hidden rounded-[22px] border px-3.5 py-3 transition ${
+                                isSelected
+                                  ? "border-cyan-300/40 bg-cyan-300/10 shadow-[0_0_0_1px_rgba(134,239,255,0.08)]"
+                                  : "border-white/10 bg-white/[0.05] hover:-translate-y-0.5 hover:border-white/20 hover:bg-white/[0.08]"
+                              }`}
+                            >
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setSelectedShipmentId(shipment.id);
+                                  setDrawerOpen(true);
+                                  setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
+                                }}
+                                className="absolute right-2.5 top-2.5 inline-flex h-7 w-7 items-center justify-center rounded-full text-[var(--text-muted)] opacity-100 transition hover:bg-white/10 hover:text-white xl:opacity-0 xl:group-hover:opacity-100"
+                              >
+                                <MoreHorizontal size={15} />
+                              </button>
+                              <div className="flex items-start">
+                                <button
+                                  onClick={() => {
+                                    setSelectedShipmentId(shipment.id);
+                                    setDrawerOpen(true);
+                                  }}
+                                  className="w-full pr-8 text-left"
+                                >
+                                  <div className="flex h-6 items-center justify-between gap-2">
+                                    <div className="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden">
+                                      <ShipmentStatusPill status={shipment.status} />
+                                      <span className={`inline-flex h-6 shrink-0 items-center whitespace-nowrap rounded-full px-2 text-[9px] font-medium uppercase tracking-[0.12em] ${
+                                        shipmentNeedsAttention(shipment) ? "bg-amber-300/10 text-amber-100" : "bg-emerald-300/10 text-emerald-100"
+                                      }`}>
+                                        {shipmentBlockingBadge(shipment)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <p className="mt-2 text-[15px] font-medium leading-5 text-white">{formatRoute(shipment)}</p>
+                                  <div className="mt-2 flex flex-wrap gap-1.5">
+                                    <span className="inline-flex h-6 items-center rounded-full bg-white/8 px-2.5 text-[10px] text-[var(--text-muted)]">
+                                      {shipment.ready_at ? formatDate(shipment.ready_at) : "Ready TBD"}
+                                    </span>
+                                    <span className="inline-flex h-6 items-center rounded-full bg-white/8 px-2.5 text-[10px] text-[var(--text-muted)]">
+                                      {shipment.weight_lb ?? "--"} lb
+                                    </span>
+                                    <span className="inline-flex h-6 items-center rounded-full bg-white/8 px-2.5 text-[10px] text-[var(--text-muted)]">
+                                      {shipment.pallets ?? "--"} pallets
+                                    </span>
+                                  </div>
+                                  <div className="mt-2 flex min-h-6 items-center justify-between gap-2">
+                                    <span className="line-clamp-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                                      {shipment.ai_next_action ? shipment.ai_next_action.replaceAll("_", " ") : "operator review"}
+                                    </span>
+                                    <span className="shrink-0 text-[10px] text-cyan-100">{formatConfidence(shipment.ai_confidence)}</span>
+                                  </div>
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-
-              {renderShipmentWorkspace()}
             </div>
           </section>
         )}
@@ -1740,47 +1891,6 @@ export function FreightDashboardWorkspace() {
           </section>
         )}
 
-        {!loading && tab === "shipments" && (
-          <section className="glass-panel p-5">
-            <div className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
-              <form className="space-y-3" onSubmit={handleCreateShipment}>
-                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Create shipment</p>
-                <select className="field-input" value={shipmentCreateForm.client_id} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, client_id: event.target.value }))}>
-                  <option value="">No linked client</option>
-                  {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
-                </select>
-                <input className="field-input" value={shipmentCreateForm.origin} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, origin: event.target.value }))} placeholder="Origin" />
-                <input className="field-input" value={shipmentCreateForm.destination} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, destination: event.target.value }))} placeholder="Destination" />
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <input className="field-input" value={shipmentCreateForm.pallets} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, pallets: event.target.value }))} placeholder="Pallets" />
-                  <input className="field-input" value={shipmentCreateForm.weight_lb} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, weight_lb: event.target.value }))} placeholder="Weight lb" />
-                </div>
-                <input className="field-input" value={shipmentCreateForm.equipment_type} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, equipment_type: event.target.value }))} placeholder="Equipment" />
-                <input type="datetime-local" className="field-input" value={shipmentCreateForm.ready_at} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, ready_at: event.target.value }))} />
-                <textarea className="field-input min-h-[100px] resize-none" value={shipmentCreateForm.notes} onChange={(event) => setShipmentCreateForm((current) => ({ ...current, notes: event.target.value }))} placeholder="Notes" />
-                <button className="action-button bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110" disabled={submitting !== null}>Create shipment</button>
-              </form>
-              <div className="space-y-3">
-                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Review queue snapshot</p>
-                {reviewQueue.slice(0, 4).map((item) => (
-                  <button key={item.workflow_event_id} onClick={() => setSelectedShipmentId(item.shipment_id)} className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="text-white">{item.event_type.replaceAll("_", " ")}</p>
-                      <span className={`rounded-full border px-3 py-1 text-xs ${reviewPriorityClasses(item.priority)}`}>{item.priority}</span>
-                    </div>
-                    <p className="mt-2 text-sm text-[var(--text-muted)]">{item.reason}</p>
-                  </button>
-                ))}
-                {lastSyncSummary && (
-                  <div className="rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-sm text-cyan-50">
-                    Last sync: {lastSyncSummary.imported} imported, {lastSyncSummary.parsed_shipments} parsed, {lastSyncSummary.manual_reviews} manual reviews.
-                  </div>
-                )}
-              </div>
-            </div>
-          </section>
-        )}
-
         {contextMenu && selectedShipment && actionModel && (
           <div
             className="fixed z-50 min-w-[240px] rounded-2xl border border-white/10 bg-slate-950/95 p-2 shadow-2xl backdrop-blur"
@@ -1804,6 +1914,38 @@ export function FreightDashboardWorkspace() {
               </button>
             ))}
           </div>
+        )}
+
+        {!loading && tab === "shipments" && (
+          <>
+            <div
+              className={`fixed inset-0 z-40 bg-slate-950/45 backdrop-blur-sm transition ${drawerOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}
+              onClick={() => setDrawerOpen(false)}
+            />
+            <aside
+              className={`fixed right-0 top-0 z-50 h-screen w-full max-w-[760px] border-l border-white/10 bg-[linear-gradient(180deg,rgba(13,21,32,0.98),rgba(9,16,26,0.96))] shadow-2xl transition-transform duration-300 ${
+                drawerOpen ? "translate-x-0" : "translate-x-full"
+              }`}
+            >
+              <div className="flex h-full flex-col">
+                <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Shipment workspace</p>
+                    <p className="mt-1 text-lg font-medium text-white">{selectedShipment ? formatRoute(selectedShipment) : "No shipment selected"}</p>
+                  </div>
+                  <button
+                    onClick={() => setDrawerOpen(false)}
+                    className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-white transition hover:bg-white/10"
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="flex-1 overflow-y-auto px-5 py-5">
+                  {renderShipmentWorkspace()}
+                </div>
+              </div>
+            </aside>
+          </>
         )}
       </div>
     </main>

@@ -9,6 +9,7 @@ from app.config import settings
 from app.memory.database import Carrier, Client, EmailMessage, EmailThread, Shipment, WorkflowEvent
 from app.schemas import OutlookIngestResult, ShipmentStage, WorkflowEventType
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
+from app.services.freight_realtime import freight_realtime_hub
 from app.services.outlook import OutlookMailboxMessage
 
 
@@ -229,6 +230,7 @@ async def ingest_outlook_message(
     )
     session.add(workflow_event)
     await session.commit()
+    await freight_realtime_hub.notify_workflow_event(workflow_event)
 
     return OutlookIngestResult(
         thread_id=str(thread.id),

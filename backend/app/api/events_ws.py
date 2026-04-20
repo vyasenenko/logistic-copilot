@@ -1,4 +1,8 @@
-"""WebSocket endpoint for live UI updates (heartbeat until real events are wired)."""
+"""WebSocket endpoint for live Freight dashboard updates.
+
+Deploying behind a reverse proxy: forward Upgrade and Connection headers and disable buffering
+for this path. Multiple uvicorn workers require a shared pub/sub (e.g. Redis); see freight_realtime hub.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.config import settings
+from app.services.freight_realtime import PROTOCOL_VERSION, freight_realtime_hub
 
 router = APIRouter()
 
@@ -32,6 +37,17 @@ async def websocket_events(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+    await freight_realtime_hub.register(websocket)
+    await websocket.send_text(
+        json.dumps(
+            {
+                "v": PROTOCOL_VERSION,
+                "type": "hello",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "protocol": PROTOCOL_VERSION,
+            }
+        )
+    )
     try:
         while True:
             try:
@@ -40,6 +56,7 @@ async def websocket_events(websocket: WebSocket) -> None:
                 await websocket.send_text(
                     json.dumps(
                         {
+                            "v": PROTOCOL_VERSION,
                             "type": "heartbeat",
                             "ts": datetime.now(timezone.utc).isoformat(),
                         }
@@ -50,3 +67,5 @@ async def websocket_events(websocket: WebSocket) -> None:
                 break
     except WebSocketDisconnect:
         pass
+    finally:
+        await freight_realtime_hub.unregister(websocket)
