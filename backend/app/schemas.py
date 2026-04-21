@@ -48,6 +48,8 @@ class WorkflowEventType(str, Enum):
     DOCUMENT_ANALYZED = "document_analyzed"
     DOCUMENT_VALUES_APPROVED = "document_values_approved"
     DOCUMENT_WARNING_IGNORED = "document_warning_ignored"
+    SHIPMENT_ARCHIVED = "shipment_archived"
+    SHIPMENT_SOURCE_SUPPRESSED = "shipment_source_suppressed"
     TMS_HANDOFF_SENT = "tms_handoff_sent"
     TMS_STATUS_LOOKUP = "tms_status_lookup"
     CUSTOMER_STATUS_SENT = "customer_status_sent"
@@ -211,6 +213,17 @@ class ShipmentRecord(BaseModel):
     status_stale: bool = False
     status_sla_hours: int | None = None
     manual_review_required: bool = False
+    board_stage: str | None = None
+    attention_state: str = "none"
+    attention_reason: str | None = None
+    attention_level: str = "normal"
+    has_active_review: bool = False
+    has_active_status_review: bool = False
+    has_active_booking_warning: bool = False
+    next_step_label: str | None = None
+    is_archived: bool = False
+    archived_reason: str | None = None
+    archived_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -239,6 +252,28 @@ class ShipmentDocumentRecord(BaseModel):
     review_required: bool = False
     review_reason: str | None = None
     source_email_id: str
+
+
+class ShipmentThreadMessageRecord(BaseModel):
+    id: str
+    thread_id: str
+    provider_message_id: str | None = None
+    direction: str
+    sender: str
+    recipients: list[str] = Field(default_factory=list)
+    subject: str
+    received_at: datetime
+    body_preview: str = ""
+    display_body: str = ""
+    has_raw_payload: bool = False
+
+
+class ShipmentThreadResponse(BaseModel):
+    shipment_id: str
+    thread_id: str | None = None
+    thread_subject: str | None = None
+    quote_token: str | None = None
+    messages: list[ShipmentThreadMessageRecord] = Field(default_factory=list)
 
 
 class DocumentContentResult(BaseModel):
@@ -446,6 +481,9 @@ class OutlookIngestResult(BaseModel):
     status_lookup_triggered: bool = False
     status_reply_sent: bool = False
     tms_status_updated: bool = False
+    suppressed: bool = False
+    suppression_reason: str | None = None
+    shipment_creation_skipped: bool = False
     event_type: WorkflowEventType = WorkflowEventType.EMAIL_RECEIVED
 
 
@@ -676,10 +714,18 @@ class OperatorAction(str, Enum):
     RERUN_DOCUMENT_EXTRACTION = "rerun_document_extraction"
     APPROVE_DOCUMENT_VALUES = "approve_document_values"
     IGNORE_DOCUMENT_WARNING = "ignore_document_warning"
+    ARCHIVE_SHIPMENT = "archive_shipment"
 
 
 class ShipmentOperatorActionRequest(BaseModel):
     action: OperatorAction
+    reason: str | None = None
+    suppress_source_thread: bool = True
+
+
+class ShipmentArchiveRequest(BaseModel):
+    reason: str | None = None
+    suppress_source_thread: bool = True
 
 
 class ShipmentOperatorActionResponse(BaseModel):
@@ -693,6 +739,9 @@ class ShipmentOperatorActionResponse(BaseModel):
     outreach_sent: bool = False
     evaluation_triggered: bool = False
     quote_sent: bool = False
+    archived: bool = False
+    suppression_applied: bool = False
+    suppressed_thread_id: str | None = None
     decision: WorkflowDecisionResult | None = None
 
 

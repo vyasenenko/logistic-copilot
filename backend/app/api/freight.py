@@ -1,6 +1,8 @@
 """Freight workflow foundation endpoints."""
 
 from datetime import datetime, timedelta, timezone
+import html
+import re
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -47,13 +49,12 @@ from app.schemas import (
     OutlookWebhookRequest,
     OutlookWebhookResponse,
     OperatorAction,
-    FreightOverviewCounts,
-    FreightStatusMetrics,
-    FreightSlaSummary,
     FreightOverviewResponse,
     MarginPolicy,
     ShipmentEvaluationResponse,
     ShipmentRecord,
+    ShipmentThreadMessageRecord,
+    ShipmentThreadResponse,
     ShipmentUpsertRequest,
     ShipmentStage,
     ReviewQueueItem,
@@ -61,6 +62,7 @@ from app.schemas import (
     StatusQueueActionRequest,
     StatusQueueActionResponse,
     StatusQueueItem,
+    ShipmentArchiveRequest,
     ShipmentOperatorActionRequest,
     ShipmentOperatorActionResponse,
     ShipmentDocumentRecord,
@@ -105,15 +107,70 @@ from app.services.workflow_event_codec import workflow_event_to_record
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
+from app.services.freight_read import build_freight_overview, is_status_stale as _is_status_stale
 
 router = APIRouter()
 
 
-STATUS_ACTIVE_SHIPMENT_STATES = {
-    ShipmentStage.BOOKED.value,
-    ShipmentStage.BOOKING_IN_PROGRESS.value,
-    ShipmentStage.AWAITING_CONFIRMATION.value,
-}
+def _shipment_matches_month_filter(
+    shipment: Shipment,
+    *,
+    month: str | None,
+) -> bool:
+    if not month:
+        return True
+    reference = shipment.ready_at or shipment.created_at
+    if reference is None:
+        return False
+    return reference.strftime("%Y-%m") == month
+
+
+def _clean_message_excerpt(value: str | None) -> str:
+    if not value:
+        return ""
+    cleaned = html.unescape(str(value))
+    cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</p\s*>", "\n\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\r\n?", "\n", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _message_display_body(message: EmailMessage) -> str:
+    payload = dict(message.raw_payload_json or {})
+    body = payload.get("body")
+    if isinstance(body, dict):
+        content = body.get("content")
+        if isinstance(content, str) and content.strip():
+            return _clean_message_excerpt(content)
+    unique_body = payload.get("uniqueBody")
+    if isinstance(unique_body, dict):
+        content = unique_body.get("content")
+        if isinstance(content, str) and content.strip():
+            return _clean_message_excerpt(content)
+    for key in ("bodyPreview", "content", "textBody"):
+        candidate = payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return _clean_message_excerpt(candidate)
+    return _clean_message_excerpt(message.body_preview)
+
+
+def _serialize_thread_message(message: EmailMessage) -> ShipmentThreadMessageRecord:
+    return ShipmentThreadMessageRecord(
+        id=str(message.id),
+        thread_id=str(message.thread_id),
+        provider_message_id=message.provider_message_id,
+        direction=message.direction,
+        sender=message.sender,
+        recipients=list(message.recipients_json or []),
+        subject=message.subject,
+        received_at=message.received_at,
+        body_preview=message.body_preview or "",
+        display_body=_message_display_body(message),
+        has_raw_payload=bool(message.raw_payload_json),
+    )
 
 
 def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
@@ -180,6 +237,10 @@ async def _process_outlook_mailbox_message(
     )
     if result is None:
         return None
+
+    if result.shipment_creation_skipped or result.suppressed:
+        result.next_action = "suppressed"
+        return result
 
     if result.created_message:
         try:
@@ -298,6 +359,22 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
             else None
         )
     )
+    ai_missing_fields = list(ai_payload.get("missing_fields", []) or [])
+    ai_ambiguity_reasons = list(ai_payload.get("ambiguity_reasons", []) or [])
+    manual_review_required = bool(ai_payload.get("manual_review_required", False))
+    booking_review_required = bool(ai_payload.get("booking_review_required", False))
+    status_review_required = bool(ai_payload.get("status_review_required", False))
+    status_stale = bool(ai_payload.get("status_stale", False))
+    board_stage = _board_stage_from_status(shipment.status)
+    attention_state, attention_reason, attention_level = _derive_attention_projection(
+        manual_review_required=manual_review_required,
+        ai_missing_fields=ai_missing_fields,
+        ai_ambiguity_reasons=ai_ambiguity_reasons,
+        status_review_required=status_review_required,
+        booking_review_required=booking_review_required,
+        status_stale=status_stale,
+    )
+    has_active_review = attention_state != "none"
     return ShipmentRecord(
         id=str(shipment.id),
         client_id=str(shipment.client_id) if shipment.client_id else None,
@@ -316,8 +393,8 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         notes=shipment.notes,
         ai_intent=ai_payload.get("intent"),
         ai_confidence=ai_payload.get("confidence"),
-        ai_missing_fields=list(ai_payload.get("missing_fields", []) or []),
-        ai_ambiguity_reasons=list(ai_payload.get("ambiguity_reasons", []) or []),
+        ai_missing_fields=ai_missing_fields,
+        ai_ambiguity_reasons=ai_ambiguity_reasons,
         ai_next_action=ai_payload.get("next_action"),
         booking_state=ai_payload.get("booking_state"),
         booking_error=ai_payload.get("booking_error"),
@@ -340,13 +417,108 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         tms_system=ai_payload.get("tms_system"),
         status_workflow_state=ai_payload.get("status_workflow_state"),
         status_sync_health=ai_payload.get("status_sync_health"),
-        status_review_required=bool(ai_payload.get("status_review_required", False)),
-        status_stale=bool(ai_payload.get("status_stale", False)),
+        status_review_required=status_review_required,
+        status_stale=status_stale,
         status_sla_hours=ai_payload.get("status_sla_hours"),
-        manual_review_required=bool(ai_payload.get("manual_review_required", False)),
+        manual_review_required=manual_review_required,
+        board_stage=board_stage,
+        attention_state=attention_state,
+        attention_reason=attention_reason,
+        attention_level=attention_level,
+        has_active_review=has_active_review,
+        has_active_status_review=status_review_required,
+        has_active_booking_warning=booking_review_required,
+        next_step_label=_shipment_next_step_label(
+            next_action=ai_payload.get("next_action"),
+            status_workflow_state=ai_payload.get("status_workflow_state"),
+            booking_state=ai_payload.get("booking_state"),
+            status=shipment.status,
+        ),
+        is_archived=bool(getattr(shipment, "is_archived", False)),
+        archived_reason=getattr(shipment, "archived_reason", None),
+        archived_at=getattr(shipment, "archived_at", None),
         created_at=shipment.created_at,
         updated_at=shipment.updated_at,
     )
+
+
+def _board_stage_from_status(status: str | None) -> str:
+    if status in {
+        ShipmentStage.RECEIVED.value,
+        ShipmentStage.PARSING.value,
+        ShipmentStage.WAITING_CUSTOMER_DETAILS.value,
+        ShipmentStage.CLIENT_ACKNOWLEDGED.value,
+    }:
+        return "parsing"
+    if status in {
+        ShipmentStage.OUTREACHING.value,
+        ShipmentStage.WAITING_BIDS.value,
+        ShipmentStage.EVALUATING.value,
+    }:
+        return "waiting_bids"
+    if status in {
+        ShipmentStage.QUOTED.value,
+        ShipmentStage.AWAITING_CONFIRMATION.value,
+    }:
+        return "quoted"
+    if status in {
+        ShipmentStage.EXPIRED.value,
+        ShipmentStage.DECLINED.value,
+    }:
+        return "closed"
+    return "booked"
+
+
+def _humanize_token(value: str | None) -> str | None:
+    if not value:
+        return None
+    return str(value).replace("_", " ").strip()
+
+
+def _shipment_next_step_label(
+    *,
+    next_action: str | None,
+    status_workflow_state: str | None,
+    booking_state: str | None,
+    status: str | None,
+) -> str | None:
+    for candidate in (next_action, status_workflow_state, booking_state, status):
+        label = _humanize_token(candidate)
+        if label:
+            return label
+    return None
+
+
+def _derive_attention_projection(
+    *,
+    manual_review_required: bool,
+    ai_missing_fields: list[str],
+    ai_ambiguity_reasons: list[str],
+    status_review_required: bool,
+    booking_review_required: bool,
+    status_stale: bool,
+) -> tuple[str, str | None, str]:
+    if ai_missing_fields:
+        return (
+            "missing_details",
+            f"Missing: {', '.join(field.replace('_', ' ') for field in ai_missing_fields)}",
+            "high",
+        )
+    if ai_ambiguity_reasons:
+        return (
+            "ambiguous",
+            _humanize_token(ai_ambiguity_reasons[0]),
+            "high",
+        )
+    if status_stale:
+        return ("stale", "Shipment status is stale", "critical")
+    if status_review_required:
+        return ("status_review", "Status workflow needs operator review", "high")
+    if booking_review_required:
+        return ("docs_warning", "Document review is blocking safe booking flow", "high")
+    if manual_review_required:
+        return ("review", "Operator review is required before automation continues", "high")
+    return ("none", None, "normal")
 
 
 def _normalize_shipment_ready_at_timezone_fields(shipment: Shipment) -> None:
@@ -359,6 +531,56 @@ def _normalize_shipment_ready_at_timezone_fields(shipment: Shipment) -> None:
     shipment.ready_at = wall
     shipment.ready_at_timezone = tz
     shipment.ready_at_offset_minutes = off
+
+
+async def _archive_shipment_and_optionally_suppress_source(
+    session: AsyncSession,
+    *,
+    shipment: Shipment,
+    reason: str | None,
+    suppress_source_thread: bool,
+) -> tuple[Shipment, EmailThread | None]:
+    now = datetime.now(timezone.utc)
+    archive_reason = (reason or "archived_by_operator").strip() or "archived_by_operator"
+    shipment.is_archived = True
+    shipment.archived_reason = archive_reason
+    shipment.archived_at = now
+    shipment.updated_at = now
+
+    archive_event = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.SHIPMENT_ARCHIVED.value,
+        stage=shipment.status,
+        payload_json={
+            "reason": archive_reason,
+            "suppress_source_thread": suppress_source_thread,
+            "email_thread_id": str(shipment.email_thread_id) if shipment.email_thread_id else None,
+        },
+    )
+    session.add(archive_event)
+
+    thread = await session.get(EmailThread, shipment.email_thread_id) if shipment.email_thread_id else None
+    if suppress_source_thread and thread is not None:
+        thread.shipment_ingest_suppressed = True
+        thread.shipment_ingest_suppressed_reason = archive_reason
+        thread.shipment_ingest_suppressed_at = now
+        suppress_event = WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.SHIPMENT_SOURCE_SUPPRESSED.value,
+            stage=shipment.status,
+            payload_json={
+                "reason": archive_reason,
+                "email_thread_id": str(thread.id),
+                "suppressed": True,
+            },
+        )
+        session.add(suppress_event)
+
+    await session.commit()
+    await session.refresh(shipment)
+    await freight_realtime_hub.publish_overview_stale_throttled(reason="shipment_archived")
+    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+    return shipment, thread
 
 
 def _serialize_workflow_event(event: WorkflowEvent) -> WorkflowEventRecord:
@@ -448,6 +670,16 @@ def _status_queue_task_type(review_type: str | None) -> str | None:
     return None
 
 
+def _status_task_type_from_event(event: WorkflowEvent, payload: dict) -> str | None:
+    if event.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value and payload.get("dry_run"):
+        return "status_reply"
+    if event.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value and payload.get("status_audit_kind") == "carrier_update_parsed":
+        return "carrier_update"
+    if event.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value:
+        return _status_queue_task_type(payload.get("review_type"))
+    return None
+
+
 def _serialize_bid_record(bid: CarrierBid, carrier: Carrier) -> BidRecord:
     return BidRecord(
         id=str(bid.id),
@@ -483,6 +715,28 @@ def _serialize_document_record(document: dict) -> ShipmentDocumentRecord:
     )
 
 
+def _is_phase1_ai_event(event: WorkflowEvent, payload: dict) -> bool:
+    if event.event_type in {
+        WorkflowEventType.SHIPMENT_PARSED.value,
+        WorkflowEventType.SHIPMENT_PARSE_FAILED.value,
+        WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
+        WorkflowEventType.CLIENT_ACK_SENT.value,
+        WorkflowEventType.CARRIER_OUTREACH_SENT.value,
+        WorkflowEventType.EVALUATION_COMPLETED.value,
+        WorkflowEventType.CLIENT_QUOTE_SENT.value,
+        WorkflowEventType.CUSTOMER_CONFIRMED.value,
+    }:
+        return True
+    if event.event_type != WorkflowEventType.MANUAL_REVIEW_REQUIRED.value:
+        return False
+    review_type = str(payload.get("review_type") or "")
+    if "status" in review_type:
+        return False
+    if "document" in review_type or "ocr" in review_type:
+        return False
+    return True
+
+
 async def _latest_ai_payloads(
     session: AsyncSession,
     shipment_ids: list[UUID],
@@ -499,6 +753,8 @@ async def _latest_ai_payloads(
         if event.shipment_id in payloads:
             continue
         payload = dict(event.payload_json or {})
+        if not _is_phase1_ai_event(event, payload):
+            continue
         if any(
             key in payload
             for key in (
@@ -628,21 +884,43 @@ async def _latest_status_review_payloads(
         select(WorkflowEvent)
         .where(
             WorkflowEvent.shipment_id.in_(shipment_ids),
-            WorkflowEvent.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+            WorkflowEvent.event_type.in_(
+                [
+                    WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+                    WorkflowEventType.TMS_STATUS_UPDATED.value,
+                    WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+                    WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
+                ]
+            ),
         )
         .order_by(WorkflowEvent.created_at.desc())
     )
     payloads: dict[UUID, dict] = {}
+    resolved: set[tuple[UUID, str]] = set()
+    seen: set[tuple[UUID, str]] = set()
     for event in result.scalars().all():
-        if event.shipment_id in payloads:
-            continue
         payload = dict(event.payload_json or {})
-        review_type = str(payload.get("review_type") or "")
-        if "status" not in review_type:
+        if event.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value:
+            task_type = str(payload.get("task_type") or "")
+            if task_type:
+                resolved.add((event.shipment_id, task_type))
             continue
+        if event.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value and not payload.get("dry_run"):
+            resolved.add((event.shipment_id, "status_reply"))
+            continue
+        if event.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value and payload.get("status_audit_kind") == "carrier_update_pushed":
+            resolved.add((event.shipment_id, "carrier_update"))
+            continue
+
+        task_type = _status_task_type_from_event(event, payload)
+        if task_type is None:
+            continue
+        key = (event.shipment_id, task_type)
+        if key in resolved or key in seen:
+            continue
+        seen.add(key)
         payloads[event.shipment_id] = {
             "status_review_required": True,
-            "manual_review_required": True,
         }
     return payloads
 
@@ -733,23 +1011,6 @@ async def _status_workflow_payloads(
     return payloads
 
 
-def _status_event_cutoff(*, now: datetime) -> datetime:
-    return now - timedelta(hours=settings.status_sla_hours_default)
-
-
-def _is_status_stale(
-    *,
-    shipment_status: str,
-    last_status_event_at: datetime | None,
-    now: datetime,
-) -> bool:
-    if shipment_status not in STATUS_ACTIVE_SHIPMENT_STATES:
-        return False
-    if last_status_event_at is None:
-        return True
-    return last_status_event_at < _status_event_cutoff(now=now)
-
-
 def _status_sync_health(
     *,
     status_stale: bool,
@@ -765,53 +1026,6 @@ def _status_sync_health(
     if status_workflow_state in {"status_reply_drafted", "carrier_update_parsed", "awaiting_status_review"}:
         return "attention_needed"
     return "healthy"
-
-
-async def _status_metrics_summary(session: AsyncSession) -> FreightStatusMetrics:
-    result = await session.execute(
-        select(WorkflowEvent.event_type, WorkflowEvent.payload_json, WorkflowEvent.created_at, Shipment.id, Shipment.status)
-        .join(Shipment, Shipment.id == WorkflowEvent.shipment_id)
-        .order_by(WorkflowEvent.created_at.desc())
-    )
-    metrics = FreightStatusMetrics()
-    latest_status_event_at: dict[UUID, datetime] = {}
-    now = datetime.now(timezone.utc)
-
-    for event_type, payload_json, created_at, shipment_id, shipment_status in result.all():
-        payload = dict(payload_json or {})
-        audit_kind = str(payload.get("status_audit_kind") or "")
-        if event_type == WorkflowEventType.TMS_STATUS_LOOKUP.value:
-            metrics.lookups += 1
-        elif event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value:
-            if payload.get("dry_run"):
-                metrics.replies_drafted += 1
-            else:
-                metrics.replies_sent += 1
-        elif event_type == WorkflowEventType.TMS_STATUS_UPDATED.value:
-            if audit_kind == "carrier_update_parsed":
-                metrics.carrier_updates_parsed += 1
-            else:
-                metrics.carrier_updates_pushed += 1
-        elif event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value and "status" in str(payload.get("review_type") or ""):
-            metrics.review_required += 1
-
-        if shipment_id not in latest_status_event_at and event_type in {
-            WorkflowEventType.TMS_STATUS_LOOKUP.value,
-            WorkflowEventType.CUSTOMER_STATUS_SENT.value,
-            WorkflowEventType.TMS_STATUS_UPDATED.value,
-        }:
-            latest_status_event_at[shipment_id] = created_at
-
-    shipment_result = await session.execute(select(Shipment.id, Shipment.status))
-    for shipment_id, shipment_status in shipment_result.all():
-        if _is_status_stale(
-            shipment_status=shipment_status,
-            last_status_event_at=latest_status_event_at.get(shipment_id),
-            now=now,
-        ):
-            metrics.stale_shipments += 1
-
-    return metrics
 
 
 def _latest_status_snapshot(status_payload: dict | None) -> dict:
@@ -885,7 +1099,7 @@ def _build_status_queue_item(
     status_payload = status_payload or {}
     tms_identity_payload = tms_identity_payload or {}
     workflow_payload = workflow_payload or {}
-    task_type: str | None = None
+    task_type: str | None = _status_task_type_from_event(event, payload)
     task_state: str | None = None
     reason = str(payload.get("reason", ""))
     structured_payload: dict = {}
@@ -899,7 +1113,6 @@ def _build_status_queue_item(
     source_email_id = payload.get("source_email_id")
 
     if event.event_type == WorkflowEventType.CUSTOMER_STATUS_SENT.value and payload.get("dry_run"):
-        task_type = "status_reply"
         task_state = "draft_ready"
         draft_subject = payload.get("subject")
         draft_body = payload.get("body")
@@ -907,13 +1120,11 @@ def _build_status_queue_item(
         alert_label = "Reply draft ready"
         recommended_next_action = "approve_and_send"
     elif event.event_type == WorkflowEventType.TMS_STATUS_UPDATED.value and payload.get("status_audit_kind") == "carrier_update_parsed":
-        task_type = "carrier_update"
         task_state = "awaiting_review"
         structured_payload = dict(payload.get("payload", {}) or {})
         alert_label = "Carrier update review"
         recommended_next_action = "approve_and_push"
     elif event.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value and "status" in str(review_type or ""):
-        task_type = _status_queue_task_type(str(review_type))
         task_state = "awaiting_approval" if task_type == "status_reply" else "awaiting_review"
         structured_payload = dict(payload.get("structured_payload", {}) or {})
         draft_subject = structured_payload.get("draft_subject") if task_type == "status_reply" else None
@@ -1098,6 +1309,8 @@ async def _active_status_queue_items(session: AsyncSession) -> list[StatusQueueI
         shipment = shipments_by_id.get(event.shipment_id)
         if shipment is None:
             continue
+        if shipment.is_archived:
+            continue
         item = _build_status_queue_item(
             event=event,
             shipment=shipment,
@@ -1149,6 +1362,8 @@ async def _resolved_status_queue_items(session: AsyncSession, *, limit: int = 25
         payload = dict(resolution_event.payload_json or {})
         shipment = shipments_by_id.get(resolution_event.shipment_id)
         if shipment is None:
+            continue
+        if shipment.is_archived:
             continue
         task_type = str(payload.get("task_type") or "")
         key = (resolution_event.shipment_id, task_type, str(payload.get("source_task_id") or ""))
@@ -1536,10 +1751,19 @@ async def update_carrier(
 
 
 @router.get("/freight/shipments", response_model=list[ShipmentRecord])
-async def list_shipments(session: AsyncSession = Depends(get_session)) -> list[ShipmentRecord]:
+async def list_shipments(
+    month: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}$"),
+    session: AsyncSession = Depends(get_session),
+) -> list[ShipmentRecord]:
     """List all tracked shipments."""
-    result = await session.execute(select(Shipment).order_by(Shipment.created_at.desc()))
-    shipments = list(result.scalars().all())
+    result = await session.execute(
+        select(Shipment).where(Shipment.is_archived.is_(False)).order_by(Shipment.created_at.desc())
+    )
+    shipments = [
+        shipment
+        for shipment in result.scalars().all()
+        if _shipment_matches_month_filter(shipment, month=month)
+    ]
     ai_payloads = await _latest_ai_payloads(session, [shipment.id for shipment in shipments])
     booking_payloads = await _latest_booking_payloads(session, [shipment.id for shipment in shipments])
     status_payloads = await _latest_status_payloads(session, [shipment.id for shipment in shipments])
@@ -1679,6 +1903,49 @@ async def get_shipment(
     )
 
 
+@router.get("/freight/shipments/{shipment_id}/thread", response_model=ShipmentThreadResponse)
+async def get_shipment_thread(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentThreadResponse:
+    """Return the email thread transcript linked to a shipment."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    if shipment.email_thread_id is None:
+        return ShipmentThreadResponse(
+            shipment_id=str(shipment.id),
+            thread_id=None,
+            thread_subject=None,
+            quote_token=shipment.quote_token,
+            messages=[],
+        )
+
+    thread = await session.get(EmailThread, shipment.email_thread_id)
+    if thread is None:
+        return ShipmentThreadResponse(
+            shipment_id=str(shipment.id),
+            thread_id=str(shipment.email_thread_id),
+            thread_subject=None,
+            quote_token=shipment.quote_token,
+            messages=[],
+        )
+
+    result = await session.execute(
+        select(EmailMessage)
+        .where(EmailMessage.thread_id == shipment.email_thread_id)
+        .order_by(EmailMessage.received_at.asc())
+    )
+    messages = [_serialize_thread_message(message) for message in result.scalars().all()]
+    return ShipmentThreadResponse(
+        shipment_id=str(shipment.id),
+        thread_id=str(thread.id),
+        thread_subject=thread.subject,
+        quote_token=shipment.quote_token or thread.quote_token,
+        messages=messages,
+    )
+
+
 @router.patch("/freight/shipments/{shipment_id}", response_model=ShipmentRecord)
 async def update_shipment(
     shipment_id: UUID,
@@ -1804,6 +2071,7 @@ async def freight_review_queue(
             status_payload=status_payloads.get(event.shipment_id),
         )
         for event in review_events
+        if (shipments_by_id.get(event.shipment_id) is not None and not shipments_by_id[event.shipment_id].is_archived)
     ]
     return sorted(items, key=_review_priority_score)
 
@@ -2170,6 +2438,9 @@ async def freight_operator_action(
     if shipment is None:
         raise HTTPException(status_code=404, detail="Shipment not found.")
 
+    if shipment.is_archived and request.action != OperatorAction.ARCHIVE_SHIPMENT:
+        raise HTTPException(status_code=409, detail="Shipment is archived and cannot continue active workflow actions.")
+
     policy = _build_automation_policy(
         auto_acknowledgement=True,
         acknowledgement_dry_run=False,
@@ -2182,6 +2453,24 @@ async def freight_operator_action(
     )
 
     try:
+        if request.action == OperatorAction.ARCHIVE_SHIPMENT:
+            shipment, thread = await _archive_shipment_and_optionally_suppress_source(
+                session,
+                shipment=shipment,
+                reason=request.reason,
+                suppress_source_thread=request.suppress_source_thread,
+            )
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message="Shipment archived and source thread ignored for future sync.",
+                next_action="archived",
+                archived=True,
+                suppression_applied=bool(thread is not None and request.suppress_source_thread),
+                suppressed_thread_id=str(thread.id) if thread is not None and request.suppress_source_thread else None,
+            )
+
         if request.action in {OperatorAction.RESUME_WORKFLOW, OperatorAction.APPROVE_AND_CONTINUE}:
             decision = await continue_phase1_workflow(session, shipment_id=shipment.id, policy=policy)
             return ShipmentOperatorActionResponse(
@@ -2444,6 +2733,26 @@ async def freight_operator_action(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     raise HTTPException(status_code=400, detail="Unsupported operator action.")
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/archive",
+    response_model=ShipmentOperatorActionResponse,
+)
+async def archive_shipment(
+    shipment_id: UUID,
+    request: ShipmentArchiveRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentOperatorActionResponse:
+    return await freight_operator_action(
+        shipment_id,
+        ShipmentOperatorActionRequest(
+            action=OperatorAction.ARCHIVE_SHIPMENT,
+            reason=request.reason,
+            suppress_source_thread=request.suppress_source_thread,
+        ),
+        session,
+    )
 
 
 @router.get("/freight/shipments/{shipment_id}/bids", response_model=list[BidRecord])
@@ -2769,34 +3078,7 @@ async def freight_overview(
     session: AsyncSession = Depends(get_session),
 ) -> FreightOverviewResponse:
     """Return current freight data footprint and shipment stage distribution."""
-    counts = FreightOverviewCounts(
-        clients=await session.scalar(select(func.count()).select_from(Client)) or 0,
-        carriers=await session.scalar(select(func.count()).select_from(Carrier)) or 0,
-        email_threads=await session.scalar(select(func.count()).select_from(EmailThread)) or 0,
-        email_messages=await session.scalar(select(func.count()).select_from(EmailMessage)) or 0,
-        shipments=await session.scalar(select(func.count()).select_from(Shipment)) or 0,
-        bids=await session.scalar(select(func.count()).select_from(CarrierBid)) or 0,
-        workflow_events=await session.scalar(select(func.count()).select_from(WorkflowEvent)) or 0,
-    )
-
-    result = await session.execute(
-        select(Shipment.status, func.count(Shipment.id))
-        .group_by(Shipment.status)
-        .order_by(Shipment.status)
-    )
-    active_stages = {str(status): total for status, total in result.all()}
-    status_metrics = await _status_metrics_summary(session)
-
-    return FreightOverviewResponse(
-        counts=counts,
-        active_stages=active_stages,
-        status_metrics=status_metrics,
-        sla=FreightSlaSummary(status_stale_after_hours=settings.status_sla_hours_default),
-        integrations={
-            "email_provider": "outlook",
-            "quote_wait_minutes_default": str(settings.quote_wait_minutes_default),
-        },
-    )
+    return await build_freight_overview(session)
 
 
 @router.post("/freight/outlook/ingest", response_model=OutlookSyncResponse)

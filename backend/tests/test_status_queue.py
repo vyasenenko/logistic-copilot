@@ -2,8 +2,11 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from app.api.freight import (
+    _board_stage_from_status,
     _build_resolved_status_queue_item,
     _build_status_queue_item,
+    _derive_attention_projection,
+    _status_task_type_from_event,
     _status_task_state_from_resolution,
     _status_queue_task_type,
     _status_sync_health,
@@ -18,12 +21,71 @@ def test_status_queue_task_type_mapping():
     assert _status_queue_task_type("other_review") is None
 
 
+def test_status_task_type_from_event_matches_queue_rules():
+    shipment = Shipment(id=uuid4(), status=ShipmentStage.BOOKED.value)
+
+    dry_run_reply = WorkflowEvent(
+        id=uuid4(),
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+        stage=shipment.status,
+        payload_json={"dry_run": True},
+        created_at=datetime.now(timezone.utc),
+    )
+    assert _status_task_type_from_event(dry_run_reply, dry_run_reply.payload_json or {}) == "status_reply"
+
+    carrier_preview = WorkflowEvent(
+        id=uuid4(),
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
+        stage=shipment.status,
+        payload_json={"status_audit_kind": "carrier_update_parsed"},
+        created_at=datetime.now(timezone.utc),
+    )
+    assert _status_task_type_from_event(carrier_preview, carrier_preview.payload_json or {}) == "carrier_update"
+
+
 def test_status_sync_health_prioritizes_stale_and_failure():
     assert _status_sync_health(status_stale=True, status_review_required=False, status_workflow_state=None) == "stale"
     assert _status_sync_health(status_stale=False, status_review_required=False, status_workflow_state="failed") == "failed"
     assert _status_sync_health(status_stale=False, status_review_required=True, status_workflow_state=None) == "review_required"
     assert _status_sync_health(status_stale=False, status_review_required=False, status_workflow_state="status_reply_drafted") == "attention_needed"
     assert _status_sync_health(status_stale=False, status_review_required=False, status_workflow_state="status_reply_sent") == "healthy"
+
+
+def test_board_stage_from_status_uses_business_lanes():
+    assert _board_stage_from_status(ShipmentStage.RECEIVED.value) == "parsing"
+    assert _board_stage_from_status(ShipmentStage.WAITING_CUSTOMER_DETAILS.value) == "parsing"
+    assert _board_stage_from_status(ShipmentStage.WAITING_BIDS.value) == "waiting_bids"
+    assert _board_stage_from_status(ShipmentStage.QUOTED.value) == "quoted"
+    assert _board_stage_from_status(ShipmentStage.BOOKING_FAILED.value) == "booked"
+    assert _board_stage_from_status(ShipmentStage.DECLINED.value) == "closed"
+
+
+def test_attention_projection_prioritizes_blocker_signal():
+    state, reason, level = _derive_attention_projection(
+        manual_review_required=True,
+        ai_missing_fields=["origin", "destination"],
+        ai_ambiguity_reasons=[],
+        status_review_required=False,
+        booking_review_required=False,
+        status_stale=False,
+    )
+    assert state == "missing_details"
+    assert "origin" in (reason or "")
+    assert level == "high"
+
+    stale_state, stale_reason, stale_level = _derive_attention_projection(
+        manual_review_required=False,
+        ai_missing_fields=[],
+        ai_ambiguity_reasons=[],
+        status_review_required=False,
+        booking_review_required=False,
+        status_stale=True,
+    )
+    assert stale_state == "stale"
+    assert stale_reason == "Shipment status is stale"
+    assert stale_level == "critical"
 
 
 def test_build_status_queue_item_for_status_reply_review():

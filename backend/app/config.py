@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     backend_host: str = "0.0.0.0"
     backend_port: int = 8000
     backend_cors_origins: str = "http://localhost:3000"
+    # Dev-only: allow any chrome-extension:// origin (unsafe for production)
+    cors_allow_chrome_extensions: bool = False
 
     # LangSmith
     langchain_tracing_v2: bool = True

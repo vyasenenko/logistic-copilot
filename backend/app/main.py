@@ -92,13 +92,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_cors_kw: dict = {
+    "allow_origins": settings.cors_origins,
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if settings.cors_allow_chrome_extensions:
+    _cors_kw["allow_origin_regex"] = r"chrome-extension://.*"
+
+app.add_middleware(CORSMiddleware, **_cors_kw)
 
 # --- Routes ---
 from app.api.chat import router as chat_router  # noqa: E402

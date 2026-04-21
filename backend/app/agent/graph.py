@@ -19,7 +19,8 @@ Architecture:
                 └──→ back to agent_node (loop)
 """
 
-from typing import AsyncGenerator, Literal
+import json
+from typing import Any, AsyncGenerator, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
@@ -111,6 +112,31 @@ def _build_graph() -> StateGraph:
 agent_graph = _build_graph()
 
 
+def _tool_start_sse_payload(event: dict) -> dict[str, Any]:
+    """Build structured SSE payload for tool_start (backward compatible with string-only clients)."""
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    name = (event.get("name") or data.get("name") or "").strip()
+    tool_input: Any = {}
+    if isinstance(data, dict):
+        tool_input = data.get("input")
+        if tool_input is None:
+            tool_input = data.get("tool_input")
+        if tool_input is None:
+            tool_input = {}
+    if not isinstance(tool_input, dict):
+        tool_input = {"value": tool_input}
+    return {"tool_name": name or "tool", "tool_input": tool_input}
+
+
+def _tool_end_sse_payload(event: dict, output_text: str) -> dict[str, Any]:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    name = (event.get("name") or data.get("name") or "").strip()
+    return {
+        "tool_name": name or "tool",
+        "tool_output": output_text[:4000],
+    }
+
+
 async def run_agent(
     user_message: str,
     conversation_history: list | None = None,
@@ -143,39 +169,41 @@ async def run_agent_stream(
         conversation_id=conversation_id,
     )
 
-    async for event in agent_graph.astream_events(initial_state, version="v2"):
-        kind = event["event"]
+    try:
+        async for event in agent_graph.astream_events(initial_state, version="v2"):
+            kind = event["event"]
 
-        if kind == "on_chat_model_stream":
-            chunk = event["data"]["chunk"]
-            content = chunk.content
-            if content:
-                # Claude returns list of content blocks, OpenAI returns str
-                if isinstance(content, list):
-                    text = "".join(
-                        block.get("text", "") if isinstance(block, dict) else str(block)
-                        for block in content
-                    )
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                content = chunk.content
+                if content:
+                    # Claude returns list of content blocks, OpenAI returns str
+                    if isinstance(content, list):
+                        text = "".join(
+                            block.get("text", "") if isinstance(block, dict) else str(block)
+                            for block in content
+                        )
+                    else:
+                        text = str(content)
+                    if text:
+                        yield {"event": "token", "data": text}
+
+            elif kind == "on_tool_start":
+                payload = _tool_start_sse_payload(event)
+                yield {"event": "tool_start", "data": payload}
+
+            elif kind == "on_tool_end":
+                raw = event.get("data", {})
+                if hasattr(raw, "content"):
+                    text = str(raw.content)
+                elif isinstance(raw, dict):
+                    out = raw.get("output")
+                    text = json.dumps(out, default=str) if out is not None else str(raw)
                 else:
-                    text = str(content)
-                if text:
-                    yield {"event": "token", "data": text}
+                    text = str(raw)
+                yield {"event": "tool_end", "data": _tool_end_sse_payload(event, text)}
 
-        elif kind == "on_tool_start":
-            yield {
-                "event": "tool_start",
-                "data": event["name"],
-            }
-
-        elif kind == "on_tool_end":
-            output = event.get("data", {})
-            if hasattr(output, "content"):
-                text = str(output.content)
-            else:
-                text = str(output)
-            yield {
-                "event": "tool_end",
-                "data": text[:1000],
-            }
-
-    yield {"event": "done", "data": ""}
+        yield {"event": "done", "data": ""}
+    except Exception as exc:
+        yield {"event": "error", "data": str(exc)}
+        yield {"event": "done", "data": ""}

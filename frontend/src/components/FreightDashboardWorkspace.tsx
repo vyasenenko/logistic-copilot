@@ -1,13 +1,20 @@
 "use client";
 
-import { startTransition, useEffect, useMemo, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { createPortal } from "react-dom";
 
 import { useFreightSocket } from "@/hooks/useFreightSocket";
 import {
   AlertTriangle,
+  Archive,
   ArrowRight,
   Building2,
+  Calendar,
   CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronUp,
+  ChevronRight,
   CircleDollarSign,
   ClipboardCheck,
   Clock3,
@@ -20,6 +27,7 @@ import {
   PencilLine,
   RadioTower,
   RefreshCcw,
+  Search,
   Send,
   ShieldCheck,
   Sparkles,
@@ -31,6 +39,8 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers";
 type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
+type DrawerMode = "overview" | "edit";
+type ThreadTab = "timeline" | "client" | "carrier_quotes" | "system";
 type StatusQueueAction = "preview" | "approve_and_send" | "approve_and_push" | "rebuild_draft" | "retry_push" | "dismiss";
 type OperatorAction =
   | "resume_workflow"
@@ -43,7 +53,8 @@ type OperatorAction =
   | "approve_status_reply"
   | "rerun_document_extraction"
   | "approve_document_values"
-  | "ignore_document_warning";
+  | "ignore_document_warning"
+  | "archive_shipment";
 
 interface OverviewResponse {
   counts: {
@@ -134,6 +145,17 @@ interface ShipmentRecord {
   status_stale: boolean;
   status_sla_hours: number | null;
   manual_review_required: boolean;
+  board_stage: string | null;
+  attention_state: string;
+  attention_reason: string | null;
+  attention_level: string;
+  has_active_review: boolean;
+  has_active_status_review: boolean;
+  has_active_booking_warning: boolean;
+  next_step_label: string | null;
+  is_archived: boolean;
+  archived_reason: string | null;
+  archived_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -234,6 +256,60 @@ interface OutlookSyncResponse {
 
 interface ShipmentOperatorActionResponse {
   message: string;
+  archived?: boolean;
+  suppression_applied?: boolean;
+  suppressed_thread_id?: string | null;
+}
+
+interface ShipmentThreadMessageRecord {
+  id: string;
+  thread_id: string;
+  provider_message_id: string | null;
+  direction: string;
+  sender: string;
+  recipients: string[];
+  subject: string;
+  received_at: string;
+  body_preview: string;
+  display_body: string;
+  has_raw_payload: boolean;
+}
+
+interface ShipmentThreadResponse {
+  shipment_id: string;
+  thread_id: string | null;
+  thread_subject: string | null;
+  quote_token: string | null;
+  messages: ShipmentThreadMessageRecord[];
+}
+
+function threadMessageVisual(message: ShipmentThreadMessageRecord) {
+  const sender = message.sender.toLowerCase();
+  const recipients = message.recipients.join(" ").toLowerCase();
+  const combined = `${sender} ${recipients}`;
+  if (combined.includes("mailer-daemon") || combined.includes("postmaster") || combined.includes("microsoftexchange") || combined.includes("delivery")) {
+    return {
+      card: "border-rose-300/18 bg-rose-300/10",
+      label: "System",
+    };
+  }
+  if (message.direction === "outbound") {
+    return {
+      card: "border-cyan-300/18 bg-cyan-300/10 shadow-[0_0_0_1px_rgba(134,239,255,0.04)]",
+      label: "Outbound",
+    };
+  }
+  return {
+    card: "border-white/10 bg-white/5",
+    label: "Inbound",
+  };
+}
+
+function isSystemThreadMessage(message: ShipmentThreadMessageRecord) {
+  const sender = message.sender.toLowerCase();
+  const recipients = message.recipients.join(" ").toLowerCase();
+  const combined = `${sender} ${recipients}`;
+  return combined.includes("mailer-daemon") || combined.includes("postmaster") || combined.includes("microsoftexchange") || combined.includes("delivery");
 }
 
 interface StatusQueueActionResponse {
@@ -299,6 +375,11 @@ interface ShipmentActionModel {
   operatorAction: OperatorAction | null;
   requiresSave: boolean;
   contextActions: ShipmentContextAction[];
+}
+
+interface ArchiveDialogState {
+  shipmentId: string;
+  shipmentLabel: string;
 }
 
 const EMPTY_OVERVIEW: OverviewResponse = {
@@ -368,6 +449,47 @@ function formatDate(value: string | null) {
   }).format(new Date(value));
 }
 
+function currentMonthValue() {
+  return new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+  }).format(new Date()).slice(0, 7);
+}
+
+function formatMonthLabel(value: string) {
+  const [year, month] = value.split("-");
+  const parsed = new Date(Number(year), Number(month) - 1, 1);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    year: "numeric",
+  }).format(parsed);
+}
+
+function shiftMonthValue(value: string, delta: number) {
+  const [year, month] = value.split("-");
+  const parsed = new Date(Number(year), Number(month) - 1 + delta, 1);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat("en-CA", {
+    year: "numeric",
+    month: "2-digit",
+  }).format(parsed).slice(0, 7);
+}
+
+function monthGridForYear(year: number) {
+  return Array.from({ length: 12 }, (_, index) => {
+    const monthValue = `${year}-${String(index + 1).padStart(2, "0")}`;
+    return {
+      value: monthValue,
+      shortLabel: new Intl.DateTimeFormat("en-US", { month: "short" }).format(new Date(year, index, 1)),
+    };
+  });
+}
+
 function formatAge(value: string | null) {
   if (!value) return "No recent activity";
   const diffMs = Date.now() - new Date(value).getTime();
@@ -414,22 +536,16 @@ function statusPillClass(status: string) {
 }
 
 function shipmentNeedsAttention(shipment: ShipmentRecord) {
-  return Boolean(
-    shipment.manual_review_required ||
-      shipment.ai_missing_fields.length ||
-      shipment.ai_ambiguity_reasons.length ||
-      shipment.status_review_required ||
-      shipment.booking_review_required,
-  );
+  return shipment.attention_state !== "none" || shipment.has_active_review;
 }
 
 function shipmentBlockingBadge(shipment: ShipmentRecord) {
-  if (shipment.ai_missing_fields.length > 0) return "Missing details";
-  if (shipment.ai_ambiguity_reasons.length > 0) return "Ambiguous";
-  if (shipment.manual_review_required) return "Needs review";
-  if (shipment.booking_review_required) return "Docs warning";
-  if (shipment.status_review_required) return "Status review";
-  if (shipment.status_stale) return "Status stale";
+  if (shipment.attention_state === "missing_details") return "Missing details";
+  if (shipment.attention_state === "ambiguous") return "Ambiguous";
+  if (shipment.attention_state === "review") return "Needs review";
+  if (shipment.attention_state === "docs_warning") return "Docs warning";
+  if (shipment.attention_state === "status_review") return "Status review";
+  if (shipment.attention_state === "stale") return "Status stale";
   if (shipment.status === "waiting_bids") return "Waiting bids";
   return "Ready";
 }
@@ -473,6 +589,7 @@ function deriveShipmentActionModel(
   if (statusReplyTask) {
     baseActions.push({ key: "approve_status_reply", label: "Preview status reply", operatorAction: "approve_status_reply" });
   }
+  baseActions.push({ key: "archive_shipment", label: "Archive and ignore source", operatorAction: "archive_shipment", tone: "warning" });
 
   if (!hasMinimumFields(editor)) {
     const missing = ["origin", "destination", "pallets", "weight_lb", "equipment_type", "ready_at"].filter(
@@ -570,10 +687,19 @@ function ShipmentStatusPill({ status }: { status: string }) {
 }
 
 export function FreightDashboardWorkspace() {
+  const BOARD_FILTER_STORAGE_KEY = "logistic-copilot-board-filter";
+  const BOARD_MONTH_STORAGE_KEY = "logistic-copilot-board-month";
+  const BOARD_CONTROLS_STORAGE_KEY = "logistic-copilot-board-controls-expanded";
   const [tab, setTab] = useState<DashboardTab>("shipments");
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("overview");
+  const [drawerMode, setDrawerMode] = useState<DrawerMode>("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [activeBoardFilter, setActiveBoardFilter] = useState<"all" | "today" | "attention">("today");
+  const [activeBoardFilter, setActiveBoardFilter] = useState<"all" | "today" | "attention">("all");
+  const [shipmentSearch, setShipmentSearch] = useState("");
+  const [selectedBoardMonth, setSelectedBoardMonth] = useState(currentMonthValue());
+  const [boardControlsExpanded, setBoardControlsExpanded] = useState(false);
+  const [monthPickerOpen, setMonthPickerOpen] = useState(false);
+  const [monthPickerYear, setMonthPickerYear] = useState(() => Number(currentMonthValue().slice(0, 4)));
   const [overview, setOverview] = useState<OverviewResponse>(EMPTY_OVERVIEW);
   const [clients, setClients] = useState<ClientRecord[]>([]);
   const [carriers, setCarriers] = useState<CarrierRecord[]>([]);
@@ -583,7 +709,8 @@ export function FreightDashboardWorkspace() {
   const [events, setEvents] = useState<WorkflowEventRecord[]>([]);
   const [bids, setBids] = useState<BidRecord[]>([]);
   const [documents, setDocuments] = useState<ShipmentDocumentRecord[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -601,9 +728,18 @@ export function FreightDashboardWorkspace() {
   const [statusReplyDraftSubject, setStatusReplyDraftSubject] = useState("");
   const [statusReplyDraftBody, setStatusReplyDraftBody] = useState("");
   const [carrierStatusForm, setCarrierStatusForm] = useState({ status_text: "", eta_text: "", location_text: "", notes: "" });
+  const [activeThreadTab, setActiveThreadTab] = useState<ThreadTab>("timeline");
   const [contextMenu, setContextMenu] = useState<{ shipmentId: string; x: number; y: number } | null>(null);
+  const [archiveDialog, setArchiveDialog] = useState<ArchiveDialogState | null>(null);
+  const [archiveReason, setArchiveReason] = useState("invalid shipment from non-delivery email");
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [threadError, setThreadError] = useState<string | null>(null);
+  const [threadCache, setThreadCache] = useState<Record<string, ShipmentThreadResponse>>({});
   const [clientForm, setClientForm] = useState({ name: "", email: "", default_margin_percent: "15", default_margin_floor: "0" });
   const [carrierForm, setCarrierForm] = useState({ name: "", email: "", rating: "0", regions: "midwest,northeast", equipment: "dry van" });
+  const drawerScrollRef = useRef<HTMLDivElement | null>(null);
+  const monthPickerRef = useRef<HTMLDivElement | null>(null);
+  const overviewRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [shipmentCreateForm, setShipmentCreateForm] = useState({
     client_id: "",
     origin: "Chicago, IL",
@@ -627,6 +763,40 @@ export function FreightDashboardWorkspace() {
     () => shipments.find((shipment) => shipment.id === selectedShipmentId) || null,
     [shipments, selectedShipmentId],
   );
+  const selectedClient = useMemo(
+    () => (selectedShipment?.client_id ? clients.find((client) => client.id === selectedShipment.client_id) || null : null),
+    [clients, selectedShipment],
+  );
+  const threadData = useMemo(
+    () => (selectedShipmentId ? threadCache[selectedShipmentId] || null : null),
+    [selectedShipmentId, threadCache],
+  );
+  const selectedClientEmail = selectedClient?.email.trim().toLowerCase() || null;
+  const filteredThreadMessages = useMemo(() => {
+    const messages = threadData?.messages || [];
+    if (activeThreadTab === "timeline") {
+      return messages;
+    }
+    if (activeThreadTab === "system") {
+      return messages.filter((message) => isSystemThreadMessage(message));
+    }
+    if (activeThreadTab === "client") {
+      if (!selectedClientEmail) return [];
+      return messages.filter((message) => {
+        const sender = message.sender.toLowerCase();
+        const recipients = message.recipients.map((recipient) => recipient.toLowerCase());
+        return sender.includes(selectedClientEmail) || recipients.some((recipient) => recipient.includes(selectedClientEmail));
+      });
+    }
+    return messages.filter((message) => {
+      if (isSystemThreadMessage(message)) return false;
+      if (!selectedClientEmail) return true;
+      const sender = message.sender.toLowerCase();
+      const recipients = message.recipients.map((recipient) => recipient.toLowerCase());
+      const touchesClient = sender.includes(selectedClientEmail) || recipients.some((recipient) => recipient.includes(selectedClientEmail));
+      return !touchesClient;
+    });
+  }, [activeThreadTab, selectedClientEmail, threadData]);
   const filteredStatusQueue = useMemo(
     () => statusQueue.filter((task) => task.queue_scope === statusQueueScope),
     [statusQueue, statusQueueScope],
@@ -654,31 +824,49 @@ export function FreightDashboardWorkspace() {
   }, [bids, evaluation]);
   const boardShipments = useMemo(() => {
     const today = new Intl.DateTimeFormat("en-CA").format(new Date());
+    const query = shipmentSearch.trim().toLowerCase();
     return shipments.filter((shipment) => {
-      if (activeBoardFilter === "attention") return shipmentNeedsAttention(shipment);
+      if (activeBoardFilter === "attention" && !shipmentNeedsAttention(shipment)) {
+        return false;
+      }
       if (activeBoardFilter === "today") {
         if (!shipment.ready_at) return shipmentNeedsAttention(shipment);
-        return new Intl.DateTimeFormat("en-CA").format(new Date(shipment.ready_at)) === today;
+        if (new Intl.DateTimeFormat("en-CA").format(new Date(shipment.ready_at)) !== today) {
+          return false;
+        }
       }
-      return true;
+      if (!query) return true;
+      const searchHaystack = [
+        formatRoute(shipment),
+        shipment.origin || "",
+        shipment.destination || "",
+        shipment.quote_token || "",
+        shipment.notes || "",
+        shipment.status || "",
+        shipment.next_step_label || "",
+        shipment.ai_next_action || "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      return searchHaystack.includes(query);
     });
-  }, [shipments, activeBoardFilter]);
+  }, [shipments, activeBoardFilter, shipmentSearch]);
   const groupedShipmentsByStatus = useMemo(() => {
     const groups: Record<string, ShipmentRecord[]> = {
       parsing: [],
-      needs_review: [],
       waiting_bids: [],
       quoted: [],
       booked: [],
     };
     boardShipments.forEach((shipment) => {
-      if (shipmentNeedsAttention(shipment)) {
-        groups.needs_review.push(shipment);
-      } else if (["received", "parsing", "client_acknowledged"].includes(shipment.status)) {
+      if (shipment.board_stage === "closed") {
+        return;
+      }
+      if (shipment.board_stage === "parsing") {
         groups.parsing.push(shipment);
-      } else if (["outreaching", "waiting_bids", "evaluating"].includes(shipment.status)) {
+      } else if (shipment.board_stage === "waiting_bids") {
         groups.waiting_bids.push(shipment);
-      } else if (["quoted", "awaiting_confirmation"].includes(shipment.status)) {
+      } else if (shipment.board_stage === "quoted") {
         groups.quoted.push(shipment);
       } else {
         groups.booked.push(shipment);
@@ -687,15 +875,84 @@ export function FreightDashboardWorkspace() {
     return groups;
   }, [boardShipments]);
 
-  async function loadDashboard() {
-    setLoading(true);
+  function mergeShipmentIntoState(shipment: ShipmentRecord) {
+    setShipments((current) => {
+      const index = current.findIndex((item) => item.id === shipment.id);
+      if (index === -1) {
+        return [shipment, ...current];
+      }
+      const next = [...current];
+      next[index] = shipment;
+      return next;
+    });
+  }
+
+  function removeShipmentFromState(shipmentId: string) {
+    setShipments((current) => {
+      const next = current.filter((item) => item.id !== shipmentId);
+      if (selectedShipmentId === shipmentId) {
+        setSelectedShipmentId(next[0]?.id || null);
+      }
+      return next;
+    });
+  }
+
+  async function refreshOverview() {
+    const overviewData = await fetchJson<OverviewResponse>("/api/freight/overview");
+    setOverview(overviewData);
+  }
+
+  async function refreshReviewQueue() {
+    const reviewData = await fetchJson<ReviewQueueItem[]>("/api/freight/reviews");
+    setReviewQueue(reviewData);
+  }
+
+  async function refreshStatusQueue() {
+    const statusQueueData = await fetchJson<StatusQueueItem[]>("/api/freight/status-queue?include_resolved=true");
+    setStatusQueue(statusQueueData);
+    setSelectedStatusTaskId((current) => current && statusQueueData.some((item) => item.task_id === current) ? current : statusQueueData[0]?.task_id || null);
+  }
+
+  async function refreshShipmentList(month = selectedBoardMonth) {
+    const shipmentData = await fetchJson<ShipmentRecord[]>(`/api/freight/shipments?month=${encodeURIComponent(month)}`);
+    setShipments(shipmentData);
+    setSelectedShipmentId((current) => current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null);
+  }
+
+  async function refreshSelectedShipment(shipmentId: string) {
+    try {
+      const shipment = await fetchJson<ShipmentRecord>(`/api/freight/shipments/${shipmentId}`);
+      mergeShipmentIntoState(shipment);
+      return shipment;
+    } catch (refreshError) {
+      if (refreshError instanceof Error && refreshError.message.includes("404")) {
+        removeShipmentFromState(shipmentId);
+        return null;
+      }
+      throw refreshError;
+    }
+  }
+
+  async function refreshSelectedShipmentContext(shipmentId: string) {
+    await loadShipmentContext(shipmentId);
+    if (drawerOpen) {
+      await loadShipmentThread(shipmentId, true);
+    }
+  }
+
+  async function hardRefreshDashboard(options?: { initial?: boolean }) {
+    if (options?.initial) {
+      setInitialLoading(true);
+    } else {
+      setBackgroundRefreshing(true);
+    }
     setError(null);
     try {
       const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData] = await Promise.all([
         fetchJson<OverviewResponse>("/api/freight/overview"),
         fetchJson<ClientRecord[]>("/api/freight/clients"),
         fetchJson<CarrierRecord[]>("/api/freight/carriers"),
-        fetchJson<ShipmentRecord[]>("/api/freight/shipments"),
+        fetchJson<ShipmentRecord[]>(`/api/freight/shipments?month=${encodeURIComponent(selectedBoardMonth)}`),
         fetchJson<ReviewQueueItem[]>("/api/freight/reviews"),
         fetchJson<StatusQueueItem[]>("/api/freight/status-queue?include_resolved=true"),
       ]);
@@ -716,7 +973,11 @@ export function FreightDashboardWorkspace() {
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Failed to load dashboard.");
     } finally {
-      setLoading(false);
+      if (options?.initial) {
+        setInitialLoading(false);
+      } else {
+        setBackgroundRefreshing(false);
+      }
     }
   }
 
@@ -729,6 +990,59 @@ export function FreightDashboardWorkspace() {
     setEvents(eventData);
     setBids(bidData);
     setDocuments(documentData);
+  }
+
+  async function loadShipmentThread(shipmentId: string, force = false) {
+    if (!force && threadCache[shipmentId]) {
+      setThreadError(null);
+      return;
+    }
+    setThreadLoading(true);
+    setThreadError(null);
+    try {
+      const response = await fetchJson<ShipmentThreadResponse>(`/api/freight/shipments/${shipmentId}/thread`);
+      setThreadCache((current) => ({ ...current, [shipmentId]: response }));
+    } catch (loadError) {
+      setThreadError(loadError instanceof Error ? loadError.message : "Failed to load thread.");
+    } finally {
+      setThreadLoading(false);
+    }
+  }
+
+  function enterEditMode() {
+    if (!selectedShipment) return;
+    setDrawerMode("edit");
+  }
+
+  function closeDrawer() {
+    if (drawerMode === "edit" && shipmentFormDirty) {
+      const confirmed = window.confirm("You have unsaved shipment edits. Close without saving?");
+      if (!confirmed) return;
+      setShipmentEditor(buildShipmentEditor(selectedShipment));
+    }
+    setDrawerOpen(false);
+    setDrawerMode("overview");
+  }
+
+  function backToOverview() {
+    if (shipmentFormDirty) {
+      const confirmed = window.confirm("Discard unsaved shipment edits and return to overview?");
+      if (!confirmed) return;
+      setShipmentEditor(buildShipmentEditor(selectedShipment));
+    }
+    setDrawerMode("overview");
+  }
+
+  function selectShipment(shipmentId: string, options?: { openDrawer?: boolean }) {
+    if (drawerMode === "edit" && shipmentFormDirty && shipmentId !== selectedShipmentId) {
+      const confirmed = window.confirm("You have unsaved shipment edits. Switch shipments without saving?");
+      if (!confirmed) return false;
+    }
+    setSelectedShipmentId(shipmentId);
+    if (options?.openDrawer) {
+      setDrawerOpen(true);
+    }
+    return true;
   }
 
   const refetchShipmentDetailTypes = useMemo(
@@ -748,54 +1062,148 @@ export function FreightDashboardWorkspace() {
     [],
   );
 
+  function scheduleDashboardWideBackgroundRefresh() {
+    if (overviewRefreshTimerRef.current) {
+      clearTimeout(overviewRefreshTimerRef.current);
+    }
+    overviewRefreshTimerRef.current = setTimeout(() => {
+      setBackgroundRefreshing(true);
+      void Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue(), refreshShipmentList()])
+        .catch((loadError) => {
+          setError(loadError instanceof Error ? loadError.message : "Failed to refresh dashboard.");
+        })
+        .finally(() => {
+          setBackgroundRefreshing(false);
+        });
+    }, 180);
+  }
+
+  useEffect(() => {
+    void hardRefreshDashboard({ initial: true });
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storedFilter = window.localStorage.getItem(BOARD_FILTER_STORAGE_KEY);
+    if (storedFilter === "today" || storedFilter === "attention" || storedFilter === "all") {
+      setActiveBoardFilter(storedFilter);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(BOARD_FILTER_STORAGE_KEY, activeBoardFilter);
+  }, [activeBoardFilter]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storedMonth = window.localStorage.getItem(BOARD_MONTH_STORAGE_KEY);
+    if (storedMonth && /^\d{4}-\d{2}$/.test(storedMonth)) {
+      setSelectedBoardMonth(storedMonth);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(BOARD_MONTH_STORAGE_KEY, selectedBoardMonth);
+  }, [selectedBoardMonth]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const storedControlsState = window.localStorage.getItem(BOARD_CONTROLS_STORAGE_KEY);
+    if (storedControlsState === "true") {
+      setBoardControlsExpanded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(BOARD_CONTROLS_STORAGE_KEY, String(boardControlsExpanded));
+  }, [boardControlsExpanded]);
+
+  useEffect(() => {
+    setMonthPickerYear(Number(selectedBoardMonth.slice(0, 4)));
+  }, [selectedBoardMonth]);
+
+  useEffect(() => {
+    if (initialLoading || tab !== "shipments") {
+      return;
+    }
+    void refreshShipmentList(selectedBoardMonth).catch((loadError) => {
+      setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipments for selected month.");
+    });
+  }, [selectedBoardMonth]);
+
+  useEffect(() => {
+    return () => {
+      if (overviewRefreshTimerRef.current) {
+        clearTimeout(overviewRefreshTimerRef.current);
+      }
+    };
+  }, []);
+
   useFreightSocket({
     onOverviewStale: () => {
-      void loadDashboard();
+      scheduleDashboardWideBackgroundRefresh();
     },
     onShipmentUpdated: (shipmentId) => {
-      void loadDashboard();
+      void refreshSelectedShipment(shipmentId).catch((loadError) => {
+        setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment.");
+      });
       if (shipmentId === selectedShipmentId) {
-        void loadShipmentContext(shipmentId);
+        void refreshSelectedShipmentContext(shipmentId).catch((loadError) => {
+          setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment context.");
+        });
       }
     },
     onWorkflowEvent: ({ shipment_id, event }) => {
-      void loadDashboard();
       if (shipment_id === selectedShipmentId) {
         setEvents((prev) =>
           prev.some((e) => e.id === event.id) ? prev : [event as WorkflowEventRecord, ...prev],
         );
         if (refetchShipmentDetailTypes.has(event.event_type)) {
-          void loadShipmentContext(shipment_id);
+          void refreshSelectedShipmentContext(shipment_id).catch((loadError) => {
+            setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment context.");
+          });
         }
       }
+      void refreshSelectedShipment(shipment_id).catch((loadError) => {
+        setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment.");
+      });
+      scheduleDashboardWideBackgroundRefresh();
     },
   });
-
-  async function refreshAll() {
-    await loadDashboard();
-    if (selectedShipmentId) {
-      await loadShipmentContext(selectedShipmentId);
-    }
-  }
-
-  useEffect(() => {
-    void loadDashboard();
-  }, []);
 
   useEffect(() => {
     if (!selectedShipmentId) {
       setEvents([]);
       setBids([]);
       setDocuments([]);
+      setDrawerMode("overview");
+      setThreadError(null);
       return;
     }
+    setDrawerMode("overview");
     setEvaluation(null);
     setQuotePreview(null);
     setStatusReplyPreview(null);
     setTmsPreview(null);
     setBookingResult(null);
+    setThreadError(null);
     void loadShipmentContext(selectedShipmentId);
   }, [selectedShipmentId]);
+
+  useEffect(() => {
+    setActiveThreadTab("timeline");
+  }, [selectedShipmentId]);
+
+  useEffect(() => {
+    if (!drawerOpen || !selectedShipmentId) {
+      return;
+    }
+    setThreadError(null);
+    void loadShipmentThread(selectedShipmentId);
+  }, [drawerOpen, selectedShipmentId]);
 
   useEffect(() => {
     setShipmentEditor(buildShipmentEditor(selectedShipment));
@@ -819,32 +1227,100 @@ export function FreightDashboardWorkspace() {
     const handleEsc = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setContextMenu(null);
+        setMonthPickerOpen(false);
+      }
+    };
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!monthPickerRef.current) return;
+      if (!monthPickerRef.current.contains(event.target as Node)) {
+        setMonthPickerOpen(false);
       }
     };
     window.addEventListener("click", close);
     window.addEventListener("contextmenu", close);
     window.addEventListener("keydown", handleEsc);
+    window.addEventListener("mousedown", handlePointerDown);
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("contextmenu", close);
       window.removeEventListener("keydown", handleEsc);
+      window.removeEventListener("mousedown", handlePointerDown);
     };
   }, []);
+
+  useEffect(() => {
+    if (!drawerOpen) return;
+    drawerScrollRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [drawerOpen, selectedShipmentId]);
 
   async function handleOperatorAction(action: OperatorAction, shipmentId?: string) {
     const targetShipmentId = shipmentId || selectedShipment?.id;
     if (!targetShipmentId) return;
+    let reason: string | null = null;
+    let suppressSourceThread = true;
+    if (action === "archive_shipment") {
+      const targetShipment = shipments.find((shipment) => shipment.id === targetShipmentId) || selectedShipment;
+      setContextMenu(null);
+      setArchiveReason("invalid shipment from non-delivery email");
+      setArchiveDialog({
+        shipmentId: targetShipmentId,
+        shipmentLabel: targetShipment ? formatRoute(targetShipment) : "this shipment",
+      });
+      return;
+    }
     setSubmitting(action);
     setError(null);
     try {
       const response = await fetchJson<ShipmentOperatorActionResponse>(`/api/freight/shipments/${targetShipmentId}/operator-action`, {
         method: "POST",
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ action, reason, suppress_source_thread: suppressSourceThread }),
       });
       setNotice(response.message);
-      await refreshAll();
+      await Promise.all([
+        refreshSelectedShipment(targetShipmentId),
+        refreshOverview(),
+        refreshReviewQueue(),
+        refreshStatusQueue(),
+      ]);
+      if (targetShipmentId === selectedShipmentId) {
+        await refreshSelectedShipmentContext(targetShipmentId);
+      }
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to run action.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  function updateBoardMonth(nextMonth: string) {
+    setSelectedBoardMonth(nextMonth);
+  }
+
+  function shiftBoardMonth(delta: number) {
+    updateBoardMonth(shiftMonthValue(selectedBoardMonth, delta));
+  }
+
+  async function confirmArchiveShipment() {
+    if (!archiveDialog) return;
+    setSubmitting("archive_shipment");
+    setError(null);
+    try {
+      const response = await fetchJson<ShipmentOperatorActionResponse>(`/api/freight/shipments/${archiveDialog.shipmentId}/operator-action`, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "archive_shipment",
+          reason: archiveReason.trim() || "archived_by_operator",
+          suppress_source_thread: true,
+        }),
+      });
+      setNotice(response.message);
+      setDrawerOpen(false);
+      setContextMenu(null);
+      setArchiveDialog(null);
+      removeShipmentFromState(archiveDialog.shipmentId);
+      await Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue()]);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to archive shipment.");
     } finally {
       setSubmitting(null);
     }
@@ -870,7 +1346,12 @@ export function FreightDashboardWorkspace() {
       });
       setNotice(response.message);
       setSelectedShipmentId(response.shipment_id);
-      await refreshAll();
+      await Promise.all([
+        refreshSelectedShipment(response.shipment_id),
+        refreshOverview(),
+        refreshStatusQueue(),
+      ]);
+      await refreshSelectedShipmentContext(response.shipment_id);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to process status task.");
     } finally {
@@ -883,7 +1364,7 @@ export function FreightDashboardWorkspace() {
     setSubmitting("save_shipment");
     setError(null);
     try {
-      await fetchJson<ShipmentRecord>(`/api/freight/shipments/${selectedShipment.id}`, {
+      const updatedShipment = await fetchJson<ShipmentRecord>(`/api/freight/shipments/${selectedShipment.id}`, {
         method: "PATCH",
         body: JSON.stringify({
           client_id: shipmentEditor.client_id || null,
@@ -901,8 +1382,15 @@ export function FreightDashboardWorkspace() {
           notes: shipmentEditor.notes,
         }),
       });
+      mergeShipmentIntoState(updatedShipment);
       setNotice("Shipment details saved.");
-      await refreshAll();
+      await Promise.all([
+        refreshOverview(),
+        refreshReviewQueue(),
+        refreshStatusQueue(),
+      ]);
+      await refreshSelectedShipmentContext(selectedShipment.id);
+      setDrawerMode("overview");
       return true;
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to save shipment.");
@@ -924,7 +1412,7 @@ export function FreightDashboardWorkspace() {
   async function handleContextAction(action: ShipmentContextAction) {
     setContextMenu(null);
     if (action.key === "edit") {
-      setWorkspaceSection("overview");
+      enterEditMode();
       return;
     }
     if (!selectedShipment || !action.operatorAction) return;
@@ -939,7 +1427,7 @@ export function FreightDashboardWorkspace() {
     event.preventDefault();
     setSubmitting("create_shipment");
     try {
-      await fetchJson<ShipmentRecord>("/api/freight/shipments", {
+      const createdShipment = await fetchJson<ShipmentRecord>("/api/freight/shipments", {
         method: "POST",
         body: JSON.stringify({
           client_id: shipmentCreateForm.client_id || null,
@@ -957,8 +1445,10 @@ export function FreightDashboardWorkspace() {
           notes: shipmentCreateForm.notes,
         }),
       });
+      mergeShipmentIntoState(createdShipment);
+      setSelectedShipmentId(createdShipment.id);
       setNotice("Shipment created.");
-      await refreshAll();
+      await Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue()]);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to create shipment.");
     } finally {
@@ -970,7 +1460,7 @@ export function FreightDashboardWorkspace() {
     event.preventDefault();
     setSubmitting("create_client");
     try {
-      await fetchJson<ClientRecord>("/api/freight/clients", {
+      const createdClient = await fetchJson<ClientRecord>("/api/freight/clients", {
         method: "POST",
         body: JSON.stringify({
           name: clientForm.name,
@@ -980,9 +1470,10 @@ export function FreightDashboardWorkspace() {
           default_margin_floor: Number(clientForm.default_margin_floor || 0),
         }),
       });
+      setClients((current) => [createdClient, ...current]);
       setNotice("Client added.");
       setClientForm({ name: "", email: "", default_margin_percent: "15", default_margin_floor: "0" });
-      await refreshAll();
+      await refreshOverview();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to create client.");
     } finally {
@@ -994,7 +1485,7 @@ export function FreightDashboardWorkspace() {
     event.preventDefault();
     setSubmitting("create_carrier");
     try {
-      await fetchJson<CarrierRecord>("/api/freight/carriers", {
+      const createdCarrier = await fetchJson<CarrierRecord>("/api/freight/carriers", {
         method: "POST",
         body: JSON.stringify({
           name: carrierForm.name,
@@ -1006,9 +1497,10 @@ export function FreightDashboardWorkspace() {
           metadata: {},
         }),
       });
+      setCarriers((current) => [createdCarrier, ...current]);
       setNotice("Carrier added.");
       setCarrierForm({ name: "", email: "", rating: "0", regions: "midwest,northeast", equipment: "dry van" });
-      await refreshAll();
+      await refreshOverview();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to create carrier.");
     } finally {
@@ -1033,7 +1525,10 @@ export function FreightDashboardWorkspace() {
       });
       setLastSyncSummary(response);
       setNotice(`Sync imported ${response.imported} messages and flagged ${response.manual_reviews} review items.`);
-      await refreshAll();
+      await hardRefreshDashboard();
+      if (selectedShipmentId) {
+        await refreshSelectedShipmentContext(selectedShipmentId);
+      }
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to sync Outlook.");
     } finally {
@@ -1048,7 +1543,11 @@ export function FreightDashboardWorkspace() {
       const response = await fetchJson<EvaluationResponse>(`/api/freight/shipments/${selectedShipment.id}/evaluate`, { method: "POST" });
       setEvaluation(response);
       setNotice(`Best bid selected at $${response.selected_amount.toFixed(2)}.`);
-      await refreshAll();
+      await Promise.all([
+        refreshSelectedShipment(selectedShipment.id),
+        refreshOverview(),
+      ]);
+      await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to evaluate bids.");
     } finally {
@@ -1117,7 +1616,12 @@ export function FreightDashboardWorkspace() {
       });
       setBookingResult(response);
       setNotice(`Shipment booked and confirmation sent to ${response.confirmation.client_email}.`);
-      await refreshAll();
+      await Promise.all([
+        refreshSelectedShipment(selectedShipment.id),
+        refreshOverview(),
+        refreshStatusQueue(),
+      ]);
+      await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to book shipment.");
     } finally {
@@ -1143,7 +1647,11 @@ export function FreightDashboardWorkspace() {
         }),
       });
       setNotice("Bid recorded.");
-      await refreshAll();
+      await Promise.all([
+        refreshSelectedShipment(selectedShipment.id),
+        refreshOverview(),
+      ]);
+      await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to intake bid.");
     } finally {
@@ -1153,22 +1661,26 @@ export function FreightDashboardWorkspace() {
 
   const metrics = [
     { label: "Active", value: overview.counts.shipments, detail: "live shipments" },
-    { label: "Review", value: reviewQueue.length, detail: "need operator" },
+    { label: "Attention", value: shipments.filter((item) => shipmentNeedsAttention(item)).length, detail: "need operator" },
     { label: "Bids", value: overview.active_stages.waiting_bids || 0, detail: "waiting carriers" },
     { label: "Booked", value: overview.active_stages.booked || 0, detail: "moving loads" },
   ];
 
+  const uniqueReviewShipmentCount = new Set(reviewQueue.map((item) => item.shipment_id)).size;
+  const attentionShipmentCount = shipments.filter((item) => shipmentNeedsAttention(item)).length;
   const attentionItems = [
-    `${reviewQueue.length} needs review`,
+    `${uniqueReviewShipmentCount} shipments in review`,
     `${overview.status_metrics.stale_shipments} stale`,
     `${overview.active_stages.waiting_bids || 0} waiting bids`,
-    `${shipments.filter((item) => shipmentNeedsAttention(item)).length} awaiting operator`,
+    `${attentionShipmentCount} awaiting operator`,
   ];
 
-  const secondaryActions = actionModel?.contextActions.filter((action) => action.operatorAction !== actionModel.operatorAction) || [];
+  const secondaryActions =
+    actionModel?.contextActions.filter(
+      (action) => action.operatorAction !== actionModel.operatorAction && action.key !== "archive_shipment",
+    ) || [];
   const boardColumns = [
     { key: "parsing", label: "Parsing", accent: "from-teal-300/18 to-teal-500/0" },
-    { key: "needs_review", label: "Needs Review", accent: "from-amber-300/18 to-rose-500/0" },
     { key: "waiting_bids", label: "Waiting Bids", accent: "from-orange-300/18 to-orange-500/0" },
     { key: "quoted", label: "Quoted", accent: "from-emerald-300/18 to-emerald-500/0" },
     { key: "booked", label: "Booked / Active", accent: "from-cyan-300/18 to-lime-500/0" },
@@ -1183,9 +1695,80 @@ export function FreightDashboardWorkspace() {
       );
     }
 
-    return (
-      <div className="space-y-4">
+    const editableMetricCard = (
+      label: string,
+      value: string,
+      onClick: () => void,
+    ) => (
+      <button
+        type="button"
+        onClick={onClick}
+        className="rounded-2xl bg-white/5 p-3 text-left transition hover:bg-white/9 hover:ring-1 hover:ring-cyan-200/20"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">{label}</p>
+          <span className="text-[10px] uppercase tracking-[0.16em] text-cyan-100/70">Edit</span>
+        </div>
+        <p className="mt-2 text-white">{value}</p>
+      </button>
+    );
+
+    if (drawerMode === "edit") {
+      const fieldLabelClass = "mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]";
+
+      return (
         <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
+          <div className="mb-4">
+            <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Edit shipment</p>
+            <h3 className="mt-1 text-xl font-semibold text-white">{formatRoute(selectedShipment)}</h3>
+            <p className="mt-2 text-sm leading-6 text-[var(--text-muted)]">
+              Correct shipment values here while the linked email thread stays visible in the context rail.
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="block">
+              <span className={fieldLabelClass}>Linked customer</span>
+              <select className="field-input" value={shipmentEditor.client_id} onChange={(event) => setShipmentEditor((current) => ({ ...current, client_id: event.target.value }))}>
+                <option value="">No linked customer</option>
+                {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
+              </select>
+            </label>
+            <label className="block">
+              <span className={fieldLabelClass}>Equipment type</span>
+              <input className="field-input" placeholder="Dry Van, Reefer, Flatbed..." value={shipmentEditor.equipment_type} onChange={(event) => setShipmentEditor((current) => ({ ...current, equipment_type: event.target.value }))} />
+            </label>
+            <label className="block">
+              <span className={fieldLabelClass}>Origin</span>
+              <input className="field-input" placeholder="Chicago, IL" value={shipmentEditor.origin} onChange={(event) => setShipmentEditor((current) => ({ ...current, origin: event.target.value }))} />
+            </label>
+            <label className="block">
+              <span className={fieldLabelClass}>Destination</span>
+              <input className="field-input" placeholder="New York, NY" value={shipmentEditor.destination} onChange={(event) => setShipmentEditor((current) => ({ ...current, destination: event.target.value }))} />
+            </label>
+            <label className="block">
+              <span className={fieldLabelClass}>Pallets</span>
+              <input className="field-input" inputMode="numeric" placeholder="5" value={shipmentEditor.pallets} onChange={(event) => setShipmentEditor((current) => ({ ...current, pallets: event.target.value }))} />
+            </label>
+            <label className="block">
+              <span className={fieldLabelClass}>Weight (lb)</span>
+              <input className="field-input" inputMode="decimal" placeholder="10000" value={shipmentEditor.weight_lb} onChange={(event) => setShipmentEditor((current) => ({ ...current, weight_lb: event.target.value }))} />
+            </label>
+            <label className="block sm:col-span-2">
+              <span className={fieldLabelClass}>Ready time</span>
+              <input type="datetime-local" className="field-input" value={shipmentEditor.ready_at} onChange={(event) => setShipmentEditor((current) => ({ ...current, ready_at: event.target.value }))} />
+            </label>
+            <label className="block sm:col-span-2">
+              <span className={fieldLabelClass}>Operator notes</span>
+              <textarea className="field-input min-h-[140px] resize-none" placeholder="Shipment notes, handling requirements, clarification details..." value={shipmentEditor.notes} onChange={(event) => setShipmentEditor((current) => ({ ...current, notes: event.target.value }))} />
+            </label>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="rounded-[28px] border border-white/10 bg-white/[0.03] px-5 pb-5 pt-3.5">
           <div className="flex flex-col gap-4">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-2">
@@ -1202,26 +1785,14 @@ export function FreightDashboardWorkspace() {
               <div>
                 <h2 className="text-2xl font-semibold tracking-[-0.04em] text-white">{formatRoute(selectedShipment)}</h2>
                 <p className="mt-2 text-sm text-[var(--text-muted)]">
-                  Client {selectedShipment.client_id ? "linked" : "not linked"} • Confidence {formatConfidence(selectedShipment.ai_confidence)} • Last agent decision {selectedShipment.ai_next_action || "pending"}
+                  Customer {selectedShipment.client_id ? "linked" : "not linked"} • Created {formatDate(selectedShipment.created_at)} • Confidence {formatConfidence(selectedShipment.ai_confidence)} • Last agent decision {selectedShipment.next_step_label || selectedShipment.ai_next_action || "pending"}
                 </p>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
-                <div className="rounded-2xl bg-white/5 p-3">
-                  <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Pallets</p>
-                  <p className="mt-2 text-white">{selectedShipment.pallets ?? "--"}</p>
-                </div>
-                <div className="rounded-2xl bg-white/5 p-3">
-                  <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Weight</p>
-                  <p className="mt-2 text-white">{selectedShipment.weight_lb ?? "--"} lb</p>
-                </div>
-                <div className="rounded-2xl bg-white/5 p-3">
-                  <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Equipment</p>
-                  <p className="mt-2 text-white">{selectedShipment.equipment_type || "--"}</p>
-                </div>
-                <div className="rounded-2xl bg-white/5 p-3">
-                  <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Ready</p>
-                  <p className="mt-2 text-white">{formatDate(selectedShipment.ready_at)}</p>
-                </div>
+                {editableMetricCard("Pallets", String(selectedShipment.pallets ?? "--"), enterEditMode)}
+                {editableMetricCard("Weight", `${selectedShipment.weight_lb ?? "--"} lb`, enterEditMode)}
+                {editableMetricCard("Equipment", selectedShipment.equipment_type || "--", enterEditMode)}
+                {editableMetricCard("Ready", formatDate(selectedShipment.ready_at), enterEditMode)}
               </div>
             </div>
             <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
@@ -1244,51 +1815,22 @@ export function FreightDashboardWorkspace() {
                   </button>
                 ) : (
                   <button
-                    onClick={() => void persistShipmentEdits()}
-                    disabled={submitting !== null || !shipmentFormDirty}
+                    onClick={enterEditMode}
+                    disabled={submitting !== null}
                     className="action-button w-full bg-white/10 text-white hover:bg-white/15 disabled:opacity-50"
                   >
-                    Save changes
+                    Edit shipment
                   </button>
                 )}
                 <p className="text-xs text-[var(--text-muted)]">
-                  {shipmentFormDirty ? "Unsaved shipment edits are waiting." : "The main button always maps to the current shipment state."}
+                  The main button always maps to the current shipment state.
                 </p>
               </div>
             </div>
           </div>
         </div>
 
-        <div className="space-y-4">
-          <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
-              <div className="mb-4 flex items-center justify-between">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Editable shipment details</p>
-                  <h3 className="mt-1 text-xl font-semibold text-white">Fix fields and save in place</h3>
-                </div>
-                <button
-                  onClick={() => void persistShipmentEdits()}
-                  disabled={!shipmentFormDirty || submitting !== null}
-                  className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50"
-                >
-                  Save changes
-                </button>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <select className="field-input" value={shipmentEditor.client_id} onChange={(event) => setShipmentEditor((current) => ({ ...current, client_id: event.target.value }))}>
-                  <option value="">No linked client</option>
-                  {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
-                </select>
-                <input className="field-input" placeholder="Equipment" value={shipmentEditor.equipment_type} onChange={(event) => setShipmentEditor((current) => ({ ...current, equipment_type: event.target.value }))} />
-                <input className="field-input" placeholder="Origin" value={shipmentEditor.origin} onChange={(event) => setShipmentEditor((current) => ({ ...current, origin: event.target.value }))} />
-                <input className="field-input" placeholder="Destination" value={shipmentEditor.destination} onChange={(event) => setShipmentEditor((current) => ({ ...current, destination: event.target.value }))} />
-                <input className="field-input" placeholder="Pallets" value={shipmentEditor.pallets} onChange={(event) => setShipmentEditor((current) => ({ ...current, pallets: event.target.value }))} />
-                <input className="field-input" placeholder="Weight lb" value={shipmentEditor.weight_lb} onChange={(event) => setShipmentEditor((current) => ({ ...current, weight_lb: event.target.value }))} />
-                <input type="datetime-local" className="field-input sm:col-span-2" value={shipmentEditor.ready_at} onChange={(event) => setShipmentEditor((current) => ({ ...current, ready_at: event.target.value }))} />
-                <textarea className="field-input min-h-[140px] resize-none sm:col-span-2" placeholder="Notes" value={shipmentEditor.notes} onChange={(event) => setShipmentEditor((current) => ({ ...current, notes: event.target.value }))} />
-              </div>
-          </div>
-
+        <div className="flex flex-col gap-4">
           <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
               <div className="mb-4 flex items-center justify-between">
                 <div>
@@ -1325,8 +1867,8 @@ export function FreightDashboardWorkspace() {
                     </div>
                     <div className="rounded-2xl bg-white/5 p-4">
                       <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Operator context</p>
-                      <p className="mt-2 text-white">Review required: {selectedShipment.manual_review_required ? "yes" : "no"}</p>
-                      <p className="mt-1 text-sm text-[var(--text-muted)]">Next agent action: {selectedShipment.ai_next_action || "pending"}</p>
+                      <p className="mt-2 text-white">Review required: {selectedShipment.has_active_review ? "yes" : "no"}</p>
+                      <p className="mt-1 text-sm text-[var(--text-muted)]">Next agent action: {selectedShipment.next_step_label || selectedShipment.ai_next_action || "pending"}</p>
                       {selectedShipment.ai_ambiguity_reasons.length > 0 && (
                         <div className="mt-3 flex flex-wrap gap-2">
                           {selectedShipment.ai_ambiguity_reasons.map((reason) => (
@@ -1505,12 +2047,38 @@ export function FreightDashboardWorkspace() {
                     key={action.key}
                     onClick={() => void handleContextAction(action)}
                     disabled={submitting !== null}
-                    className="action-button justify-start bg-white/10 text-white hover:bg-white/15 disabled:opacity-50"
+                    className={`action-button justify-start disabled:opacity-50 ${
+                      action.tone === "warning"
+                        ? "bg-amber-300/12 text-amber-100 hover:bg-amber-300/18"
+                        : "bg-white/10 text-white hover:bg-white/15"
+                    }`}
                   >
                     {action.label}
                   </button>
                 ))}
               </div>
+              {selectedShipment && (
+                <div className="mt-4 rounded-[20px] border border-amber-300/18 bg-amber-300/6 p-3">
+                  <div className="flex items-center gap-3">
+                    <div className="rounded-full bg-amber-300/12 p-2 text-amber-100">
+                      <Archive size={16} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium leading-5 text-amber-50">Archive invalid shipment</p>
+                      <p className="text-xs leading-5 text-amber-100/70">
+                        Remove from live board and ignore its source thread on future syncs.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => void handleOperatorAction("archive_shipment", selectedShipment.id)}
+                      disabled={submitting !== null}
+                      className="action-button shrink-0 bg-amber-300/16 px-3 py-2 text-sm text-amber-50 hover:bg-amber-300/22 disabled:opacity-50"
+                    >
+                      <Archive size={14} className="mr-2" /> Archive
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
@@ -1533,6 +2101,140 @@ export function FreightDashboardWorkspace() {
           </div>
         </div>
       </div>
+    );
+  };
+
+  const renderThreadRail = () => {
+    if (!drawerOpen || !selectedShipment) {
+      return null;
+    }
+
+    return (
+      <aside className="pointer-events-auto fixed top-6 right-[calc(50vw+160px)] bottom-6 z-[45] hidden w-[475px] overflow-hidden rounded-[30px] border border-cyan-300/14 bg-[linear-gradient(135deg,rgba(7,15,25,0.94),rgba(11,23,37,0.9)_46%,rgba(17,34,52,0.92)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.13),transparent_28%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.11),transparent_24%)] shadow-[-20px_22px_80px_rgba(0,0,0,0.32)] backdrop-blur-xl xl:flex">
+        <div className="flex h-full min-h-0 w-full flex-col">
+          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(120,210,255,0.05)_18%,transparent_38%,transparent_62%,rgba(120,210,255,0.04)_82%,transparent)]" />
+          <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
+          <div className="pointer-events-none absolute inset-y-0 right-[24%] w-px bg-cyan-200/8" />
+
+          <div className="relative border-b border-cyan-200/10 px-5 py-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="inline-flex h-8 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[10px] uppercase tracking-[0.24em] text-cyan-100">
+                  Thread context
+                </div>
+                <h3 className="mt-1 break-words text-lg font-semibold text-white">
+                  {threadData?.thread_subject || formatRoute(selectedShipment)}
+                </h3>
+                <p className="mt-2 break-all text-sm text-[var(--text-muted)]">
+                  {threadData?.quote_token || selectedShipment.quote_token || "No quote token"}
+                </p>
+              </div>
+              <button
+                onClick={() => void loadShipmentThread(selectedShipment.id, true)}
+                disabled={threadLoading}
+                className="action-button shrink-0 border border-cyan-200/16 bg-cyan-200/10 px-3 py-2 text-cyan-50 hover:bg-cyan-200/18 disabled:opacity-50"
+              >
+                {threadLoading ? "Loading..." : "Refresh"}
+              </button>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              {([
+                { key: "timeline", label: "Timeline" },
+                { key: "client", label: "Customer" },
+                { key: "carrier_quotes", label: "Carrier Quotes" },
+                { key: "system", label: "System" },
+              ] as const).map((tab) => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setActiveThreadTab(tab.key)}
+                  className={`rounded-[10px] px-3 py-2 text-[10px] uppercase tracking-[0.18em] transition ${
+                    activeThreadTab === tab.key
+                      ? "bg-cyan-100 text-slate-950"
+                      : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-5 py-4">
+            {threadLoading && !threadData && (
+              <div className="space-y-3">
+                {[1, 2, 3].map((item) => (
+                  <div key={item} className="animate-pulse rounded-2xl border border-white/8 bg-white/5 p-4">
+                    <div className="h-4 w-40 rounded bg-white/10" />
+                    <div className="mt-3 h-3 w-full rounded bg-white/10" />
+                    <div className="mt-2 h-3 w-4/5 rounded bg-white/10" />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!threadLoading && threadError && (
+              <div className="rounded-2xl border border-rose-300/20 bg-rose-300/10 p-4 text-sm text-rose-100">
+                <p>{threadError}</p>
+                <button
+                  onClick={() => void loadShipmentThread(selectedShipment.id, true)}
+                  className="mt-3 text-sm font-medium text-white underline decoration-white/30 underline-offset-4"
+                >
+                  Retry thread load
+                </button>
+              </div>
+            )}
+
+            {!threadLoading && !threadError && (!threadData || threadData.messages.length === 0) && (
+              <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-5 text-sm text-[var(--text-muted)]">
+                No linked email thread.
+              </div>
+            )}
+
+            {!threadLoading && !threadError && threadData && threadData.messages.length > 0 && filteredThreadMessages.length === 0 && (
+              <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-5 text-sm text-[var(--text-muted)]">
+                {activeThreadTab === "client" && "No customer conversation found for this shipment yet."}
+                {activeThreadTab === "carrier_quotes" && "No carrier quote conversation found for this shipment yet."}
+                {activeThreadTab === "system" && "No system or delivery-failure messages found for this shipment."}
+              </div>
+            )}
+
+            {!threadLoading && !threadError && threadData && filteredThreadMessages.length > 0 && (
+              <div className="space-y-4">
+                {filteredThreadMessages.map((message) => {
+                  const visual = threadMessageVisual(message);
+                  return (
+                    <div key={message.id} className={`min-w-0 overflow-hidden rounded-2xl border p-4 ${visual.card}`}>
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="break-all text-sm font-medium text-white">{message.sender}</p>
+                            <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-300">
+                              {visual.label}
+                            </span>
+                          </div>
+                          {message.recipients.length > 0 && (
+                            <p className="mt-1 break-all text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
+                              To: {message.recipients.join(", ")}
+                            </p>
+                          )}
+                          <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                            {formatDate(message.received_at)}
+                          </p>
+                        </div>
+                      </div>
+                      <p className="mt-3 break-words text-sm font-medium text-white">{message.subject || "No subject"}</p>
+                      <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-slate-200 [overflow-wrap:anywhere]">
+                        {message.display_body || message.body_preview || "No message text available."}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      </aside>
     );
   };
 
@@ -1564,61 +2266,33 @@ export function FreightDashboardWorkspace() {
               </div>
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
               {metrics.map((metric) => (
-                <div key={metric.label} className="rounded-[14px] border border-cyan-200/10 bg-slate-950/26 px-3 py-3 backdrop-blur">
+                <div key={metric.label} className="rounded-[14px] border border-cyan-200/10 bg-slate-950/26 px-3 py-2.5 backdrop-blur">
                   <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/48">{metric.label}</p>
-                  <div className="mt-2 flex items-end justify-between gap-3">
-                    <span className="text-2xl font-semibold text-white">{metric.value}</span>
+                  <div className="mt-1.5 flex items-end justify-between gap-3">
+                    <span className="text-[1.9rem] font-semibold leading-none text-white">{metric.value}</span>
                     <span className="text-[11px] text-slate-400">{metric.detail}</span>
                   </div>
                 </div>
               ))}
-            </div>
-          </div>
-
-          <div className="relative mt-4 flex flex-wrap items-center gap-2 border-t border-cyan-200/10 pt-4">
-            <div className="flex flex-wrap gap-2">
-              {(["today", "attention", "all"] as const).map((filter) => (
-                <button
-                  key={filter}
-                  onClick={() => setActiveBoardFilter(filter)}
-                  className={`rounded-[10px] px-3 py-2 text-[11px] uppercase tracking-[0.2em] transition ${
-                    activeBoardFilter === filter
-                      ? "bg-cyan-100 text-slate-950"
-                      : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
-                  }`}
-                >
-                  {filter === "today" ? "Today" : filter === "attention" ? "Attention" : "All"}
-                </button>
-              ))}
-            </div>
-
-            <div className="hidden flex-wrap gap-2 xl:flex">
-              {attentionItems.slice(0, 3).map((item) => (
-                <span key={item} className="rounded-[10px] border border-cyan-200/10 bg-slate-950/20 px-3 py-2 text-[11px] text-slate-400">
-                  {item}
-                </span>
-              ))}
-            </div>
-
-            <div className="ml-auto flex flex-wrap gap-2">
               <button
                 onClick={() => void handleOutlookSync()}
                 disabled={submitting !== null}
-                className="action-button border border-cyan-200/16 bg-cyan-200/12 text-cyan-50 hover:bg-cyan-200/20 disabled:opacity-50"
+                className="rounded-[14px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-3 py-2.5 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
               >
-                <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync"}
-              </button>
-              <button
-                onClick={() => void refreshAll()}
-                disabled={submitting !== null}
-                className="action-button border border-white/10 bg-white/6 text-white hover:bg-white/12 disabled:opacity-50"
-              >
-                <RefreshCcw size={16} /> Refresh
+                <div className="flex flex-col">
+                  <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Outlook</p>
+                  <div className="mt-2">
+                    <span className="inline-flex items-center gap-2 text-base font-semibold text-white">
+                      <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync"}
+                    </span>
+                  </div>
+                </div>
               </button>
             </div>
           </div>
+
         </section>
 
         {error && <div className="glass-panel-strong border-red-400/20 px-5 py-4 text-sm text-red-100">{error}</div>}
@@ -1628,8 +2302,7 @@ export function FreightDashboardWorkspace() {
           <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
             {[
               { key: "shipments", label: "Shipments", icon: Package2 },
-              { key: "status_ops", label: "Status Ops", icon: RadioTower },
-              { key: "clients", label: "Clients", icon: Users },
+              { key: "clients", label: "Customers", icon: Users },
               { key: "carriers", label: "Carriers", icon: Truck },
             ].map(({ key, label, icon: Icon }) => {
               const active = tab === key;
@@ -1647,14 +2320,166 @@ export function FreightDashboardWorkspace() {
           </div>
         </section>
 
-        {loading ? (
+        {initialLoading ? (
           <div className="glass-panel flex min-h-[480px] items-center justify-center p-8 text-[var(--text-muted)]">
             <Loader2 className="mr-3 animate-spin" size={18} /> Loading dashboard...
           </div>
         ) : null}
 
-        {!loading && tab === "shipments" && (
+        {!initialLoading && tab === "shipments" && (
           <section className="space-y-4">
+            <div className="glass-panel overflow-visible px-4 py-4">
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Board controls</p>
+                    <p className="mt-1 text-sm text-slate-300">
+                      Search shipments, switch operational month, and control the live board from one surface.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {(["today", "attention", "all"] as const).map((filter) => (
+                      <button
+                        key={filter}
+                        onClick={() => setActiveBoardFilter(filter)}
+                        className={`rounded-[10px] px-3 py-2 text-[11px] uppercase tracking-[0.2em] transition ${
+                          activeBoardFilter === filter
+                            ? "bg-cyan-100 text-slate-950"
+                            : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
+                        }`}
+                      >
+                        {filter === "today" ? "Today" : filter === "attention" ? "Attention" : "All"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {boardControlsExpanded ? (
+                  <>
+                    <div className="grid gap-3 xl:grid-cols-[minmax(340px,430px),minmax(280px,1fr)] xl:items-end">
+                      <div className="min-w-0">
+                        <span className="mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Month</span>
+                        <div ref={monthPickerRef} className="relative">
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => shiftBoardMonth(-1)}
+                              className="inline-flex h-[52px] w-[46px] shrink-0 items-center justify-center rounded-[16px] border border-cyan-200/10 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
+                              aria-label="Previous month"
+                            >
+                              <ChevronLeft size={18} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setMonthPickerOpen((open) => !open)}
+                              className="flex h-[52px] min-w-[240px] flex-1 items-center justify-between gap-3 rounded-[16px] border border-cyan-200/12 bg-[linear-gradient(135deg,rgba(110,184,255,0.08),rgba(110,184,255,0.02))] px-4 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] transition hover:border-cyan-200/20 hover:bg-cyan-200/8"
+                            >
+                              <span className="flex min-w-0 items-center gap-3">
+                                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-[12px] border border-cyan-200/12 bg-cyan-200/8 text-cyan-100">
+                                  <Calendar size={16} />
+                                </span>
+                                <span className="min-w-0">
+                                  <span className="block text-[10px] uppercase tracking-[0.18em] text-cyan-200/55">Operational month</span>
+                                  <span className="block truncate text-sm font-medium text-white">{formatMonthLabel(selectedBoardMonth)}</span>
+                                </span>
+                              </span>
+                              <span className="text-[11px] uppercase tracking-[0.16em] text-slate-400">{monthPickerOpen ? "Close" : "Choose"}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => shiftBoardMonth(1)}
+                              className="inline-flex h-[52px] w-[46px] shrink-0 items-center justify-center rounded-[16px] border border-cyan-200/10 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
+                              aria-label="Next month"
+                            >
+                              <ChevronRight size={18} />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <label className="relative min-w-0">
+                        <span className="mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Search</span>
+                        <Search size={16} className="pointer-events-none absolute left-3 top-[calc(50%+12px)] -translate-y-1/2 text-[var(--text-muted)]" />
+                        <input
+                          className="field-input h-[52px] rounded-[16px] pl-10"
+                          value={shipmentSearch}
+                          onChange={(event) => setShipmentSearch(event.target.value)}
+                          placeholder="Search by route, city, token, notes..."
+                        />
+                      </label>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2 border-t border-cyan-200/10 pt-4">
+                      <span className="rounded-[10px] border border-cyan-200/10 bg-slate-950/22 px-3 py-2 text-[11px] text-slate-300">
+                        {formatMonthLabel(selectedBoardMonth)}
+                      </span>
+                      <span className="rounded-[10px] border border-cyan-200/10 bg-slate-950/22 px-3 py-2 text-[11px] text-slate-300">
+                        Showing {boardShipments.length} shipments
+                      </span>
+                      {attentionItems.slice(0, 3).map((item) => (
+                        <span key={item} className="rounded-[10px] border border-cyan-200/10 bg-slate-950/20 px-3 py-2 text-[11px] text-slate-400">
+                          {item}
+                        </span>
+                      ))}
+                      <div className="ml-auto flex flex-wrap gap-2">
+                        {shipmentSearch.trim() ? (
+                          <button
+                            onClick={() => setShipmentSearch("")}
+                            className="rounded-[12px] border border-white/10 bg-slate-950/28 px-3.5 py-2 text-[11px] uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-200/14 hover:bg-cyan-200/8 hover:text-white"
+                          >
+                            Clear search
+                          </button>
+                        ) : null}
+                        <button
+                          onClick={() => void hardRefreshDashboard()}
+                          disabled={submitting !== null}
+                          className="inline-flex items-center gap-2 rounded-[14px] bg-white/[0.025] px-4 py-2.5 text-sm font-medium text-slate-400 transition hover:bg-white/[0.04] hover:text-slate-200 disabled:opacity-50"
+                        >
+                          <RefreshCcw size={16} /> {backgroundRefreshing ? "Refreshing..." : "Refresh board"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBoardControlsExpanded(false)}
+                          className="inline-flex items-center gap-2 rounded-[12px] border border-cyan-200/10 bg-slate-950/24 px-3.5 py-2 text-[11px] uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-200/18 hover:bg-cyan-200/8 hover:text-white"
+                        >
+                          <ChevronUp size={14} /> Collapse controls
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="rounded-[20px] border border-cyan-200/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.008))] px-3 py-3">
+                    <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                      <div className="flex min-w-0 flex-1 flex-wrap gap-1.5">
+                        <span className="inline-flex items-center gap-1.5 rounded-[11px] border border-cyan-200/12 bg-cyan-200/8 px-2.5 py-1.5 text-[10px] text-cyan-100">
+                          <Calendar size={14} /> {formatMonthLabel(selectedBoardMonth)}
+                        </span>
+                        <span className="rounded-[11px] border border-cyan-200/10 bg-slate-950/24 px-2.5 py-1.5 text-[10px] text-slate-300">
+                          {boardShipments.length} shipments visible
+                        </span>
+                        <span className="rounded-[11px] border border-cyan-200/10 bg-slate-950/20 px-2.5 py-1.5 text-[10px] text-slate-400">
+                          {attentionShipmentCount} awaiting operator
+                        </span>
+                        {shipmentSearch.trim() ? (
+                          <span className="rounded-[11px] border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[10px] text-slate-300">
+                            Search: {shipmentSearch}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setBoardControlsExpanded(true)}
+                          className="inline-flex items-center gap-2 rounded-[12px] border border-cyan-200/12 bg-[linear-gradient(135deg,rgba(110,184,255,0.08),rgba(110,184,255,0.02))] px-3 py-2 text-[12px] font-medium text-white transition hover:border-cyan-200/22 hover:bg-cyan-200/8"
+                        >
+                          <ChevronDown size={16} /> Expand controls
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
             <div className="overflow-x-auto rounded-[32px] border border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(75,211,255,0.08),transparent_32%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01))] p-4">
               <div className="flex min-w-[1320px] gap-4">
                 {boardColumns.map((column) => {
@@ -1680,11 +2505,10 @@ export function FreightDashboardWorkspace() {
                               key={shipment.id}
                               onContextMenu={(event: ReactMouseEvent<HTMLDivElement>) => {
                                 event.preventDefault();
-                                setSelectedShipmentId(shipment.id);
-                                setDrawerOpen(true);
+                                if (!selectShipment(shipment.id, { openDrawer: true })) return;
                                 setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
                               }}
-                              className={`group relative overflow-hidden rounded-[22px] border px-3.5 py-3 transition ${
+                              className={`group relative overflow-hidden rounded-[18px] border px-3 pt-2 pb-1.5 transition ${
                                 isSelected
                                   ? "border-cyan-300/40 bg-cyan-300/10 shadow-[0_0_0_1px_rgba(134,239,255,0.08)]"
                                   : "border-white/10 bg-white/[0.05] hover:-translate-y-0.5 hover:border-white/20 hover:bg-white/[0.08]"
@@ -1693,49 +2517,44 @@ export function FreightDashboardWorkspace() {
                               <button
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  setSelectedShipmentId(shipment.id);
-                                  setDrawerOpen(true);
+                                  if (!selectShipment(shipment.id, { openDrawer: true })) return;
                                   setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
                                 }}
-                                className="absolute right-2.5 top-2.5 inline-flex h-7 w-7 items-center justify-center rounded-full text-[var(--text-muted)] opacity-100 transition hover:bg-white/10 hover:text-white xl:opacity-0 xl:group-hover:opacity-100"
+                                className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full text-[var(--text-muted)] opacity-100 transition hover:bg-white/10 hover:text-white xl:opacity-0 xl:group-hover:opacity-100"
                               >
-                                <MoreHorizontal size={15} />
+                                <MoreHorizontal size={14} />
                               </button>
                               <div className="flex items-start">
                                 <button
                                   onClick={() => {
-                                    setSelectedShipmentId(shipment.id);
-                                    setDrawerOpen(true);
+                                    selectShipment(shipment.id, { openDrawer: true });
                                   }}
-                                  className="w-full pr-8 text-left"
+                                  className="w-full text-left"
                                 >
-                                  <div className="flex h-6 items-center justify-between gap-2">
-                                    <div className="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-hidden">
+                                  <div className="flex items-center justify-between gap-2 pr-7">
+                                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                                       <ShipmentStatusPill status={shipment.status} />
-                                      <span className={`inline-flex h-6 shrink-0 items-center whitespace-nowrap rounded-full px-2 text-[9px] font-medium uppercase tracking-[0.12em] ${
+                                      <span className={`inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-full px-2 text-[9px] font-medium uppercase tracking-[0.1em] ${
                                         shipmentNeedsAttention(shipment) ? "bg-amber-300/10 text-amber-100" : "bg-emerald-300/10 text-emerald-100"
                                       }`}>
                                         {shipmentBlockingBadge(shipment)}
                                       </span>
                                     </div>
-                                  </div>
-                                  <p className="mt-2 text-[15px] font-medium leading-5 text-white">{formatRoute(shipment)}</p>
-                                  <div className="mt-2 flex flex-wrap gap-1.5">
-                                    <span className="inline-flex h-6 items-center rounded-full bg-white/8 px-2.5 text-[10px] text-[var(--text-muted)]">
-                                      {shipment.ready_at ? formatDate(shipment.ready_at) : "Ready TBD"}
-                                    </span>
-                                    <span className="inline-flex h-6 items-center rounded-full bg-white/8 px-2.5 text-[10px] text-[var(--text-muted)]">
-                                      {shipment.weight_lb ?? "--"} lb
-                                    </span>
-                                    <span className="inline-flex h-6 items-center rounded-full bg-white/8 px-2.5 text-[10px] text-[var(--text-muted)]">
-                                      {shipment.pallets ?? "--"} pallets
+                                    <span className="shrink-0 rounded-full bg-cyan-300/10 px-2 py-0.5 text-[10px] text-cyan-100">
+                                      {formatConfidence(shipment.ai_confidence)}
                                     </span>
                                   </div>
-                                  <div className="mt-2 flex min-h-6 items-center justify-between gap-2">
-                                    <span className="line-clamp-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                                      {shipment.ai_next_action ? shipment.ai_next_action.replaceAll("_", " ") : "operator review"}
+                                  <p className="mt-1.5 line-clamp-2 text-[13px] font-medium leading-4.5 text-white">{formatRoute(shipment)}</p>
+                                  <div className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] leading-4 text-[var(--text-muted)]">
+                                    <p className="min-w-0 whitespace-normal">{shipment.ready_at ? formatDate(shipment.ready_at) : "TBD"}</p>
+                                    <p className="min-w-0 text-right whitespace-normal">Weight: {shipment.weight_lb ?? "--"} lb</p>
+                                    <p className="min-w-0 whitespace-normal">Token: {shipment.quote_token || "--"}</p>
+                                    <p className="min-w-0 text-right whitespace-normal">Pallets: {shipment.pallets ?? "--"}</p>
+                                  </div>
+                                  <div className="mt-1">
+                                    <span className="line-clamp-2 text-[10px] uppercase tracking-[0.14em] text-[var(--text-muted)]">
+                                      {shipment.next_step_label || (shipment.ai_next_action ? shipment.ai_next_action.replaceAll("_", " ") : "operator review")}
                                     </span>
-                                    <span className="shrink-0 text-[10px] text-cyan-100">{formatConfidence(shipment.ai_confidence)}</span>
                                   </div>
                                 </button>
                               </div>
@@ -1751,7 +2570,7 @@ export function FreightDashboardWorkspace() {
           </section>
         )}
 
-        {!loading && tab === "status_ops" && (
+        {!initialLoading && tab === "status_ops" && (
           <section className="grid gap-4 xl:grid-cols-[380px,minmax(0,1fr)]">
             <div className="glass-panel p-4">
               <div className="mb-4 flex items-center justify-between">
@@ -1770,7 +2589,7 @@ export function FreightDashboardWorkspace() {
                     key={task.task_id}
                     onClick={() => {
                       setSelectedStatusTaskId(task.task_id);
-                      setSelectedShipmentId(task.shipment_id);
+                      selectShipment(task.shipment_id);
                     }}
                     className={`w-full rounded-2xl border p-4 text-left transition ${task.task_id === selectedStatusTaskId ? "border-cyan-300/40 bg-cyan-300/10" : "border-white/10 bg-white/5 hover:bg-white/10"}`}
                   >
@@ -1836,17 +2655,94 @@ export function FreightDashboardWorkspace() {
           </section>
         )}
 
-        {!loading && tab === "clients" && (
+        {monthPickerOpen && typeof document !== "undefined"
+          ? createPortal(
+              <div className="fixed inset-0 z-[170] flex items-center justify-center bg-slate-950/58 px-4 backdrop-blur-[6px]" onClick={() => setMonthPickerOpen(false)}>
+                <div
+                  ref={monthPickerRef}
+                  className="relative w-full max-w-[620px] overflow-hidden rounded-[32px] border border-cyan-200/14 bg-[#0c1525] shadow-[0_30px_120px_rgba(2,8,23,0.68)] isolate"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(103,232,249,0.08),transparent_38%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0))]" />
+                  <div className="relative space-y-5 p-6">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/55">Operational month</p>
+                        <p className="mt-2 text-3xl font-semibold tracking-[-0.04em] text-white">{formatMonthLabel(selectedBoardMonth)}</p>
+                        <p className="mt-1 text-sm text-slate-400">Choose the board window you want to operate in.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setMonthPickerOpen(false)}
+                        className="inline-flex h-10 items-center rounded-full border border-cyan-200/12 bg-white/[0.03] px-4 text-sm text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
+                      >
+                        Close
+                      </button>
+                    </div>
+
+                    <div className="flex items-center justify-between rounded-[22px] border border-cyan-200/10 bg-white/[0.03] px-4 py-3">
+                      <button
+                        type="button"
+                        onClick={() => setMonthPickerYear((value) => value - 1)}
+                        className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-cyan-200/12 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
+                        aria-label="Previous year"
+                      >
+                        <ChevronLeft size={18} />
+                      </button>
+                      <div className="text-center">
+                        <p className="text-[10px] uppercase tracking-[0.2em] text-cyan-200/48">Pick month</p>
+                        <p className="mt-1 text-xl font-semibold text-white">{monthPickerYear}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setMonthPickerYear((value) => value + 1)}
+                        className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-cyan-200/12 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
+                        aria-label="Next year"
+                      >
+                        <ChevronRight size={18} />
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                      {monthGridForYear(monthPickerYear).map((monthOption) => {
+                        const active = monthOption.value === selectedBoardMonth;
+                        return (
+                          <button
+                            key={monthOption.value}
+                            type="button"
+                            onClick={() => {
+                              updateBoardMonth(monthOption.value);
+                              setMonthPickerOpen(false);
+                            }}
+                            className={`rounded-[16px] px-3 py-3 text-left text-sm transition ${
+                              active
+                                ? "bg-cyan-100 text-slate-950 shadow-[0_10px_30px_rgba(180,255,250,0.18)]"
+                                : "border border-cyan-200/10 bg-white/[0.03] text-slate-200 hover:border-cyan-200/18 hover:bg-cyan-200/8 hover:text-white"
+                            }`}
+                          >
+                            {monthOption.shortLabel}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>,
+              document.body,
+            )
+          : null}
+
+        {!initialLoading && tab === "clients" && (
           <section className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
             <form className="glass-panel p-5 space-y-3" onSubmit={handleCreateClient}>
-              <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">New client</p>
-              <input className="field-input" value={clientForm.name} onChange={(event) => setClientForm((current) => ({ ...current, name: event.target.value }))} placeholder="Client name" />
-              <input className="field-input" value={clientForm.email} onChange={(event) => setClientForm((current) => ({ ...current, email: event.target.value }))} placeholder="Client email" />
+              <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">New customer</p>
+              <input className="field-input" value={clientForm.name} onChange={(event) => setClientForm((current) => ({ ...current, name: event.target.value }))} placeholder="Customer name" />
+              <input className="field-input" value={clientForm.email} onChange={(event) => setClientForm((current) => ({ ...current, email: event.target.value }))} placeholder="Customer email" />
               <div className="grid gap-3 sm:grid-cols-2">
                 <input className="field-input" value={clientForm.default_margin_percent} onChange={(event) => setClientForm((current) => ({ ...current, default_margin_percent: event.target.value }))} placeholder="Margin %" />
                 <input className="field-input" value={clientForm.default_margin_floor} onChange={(event) => setClientForm((current) => ({ ...current, default_margin_floor: event.target.value }))} placeholder="Margin floor" />
               </div>
-              <button className="action-button bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110" disabled={submitting !== null}>Add client</button>
+              <button className="action-button bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110" disabled={submitting !== null}>Add customer</button>
             </form>
             <div className="glass-panel p-5 space-y-3">
               {clients.map((client) => (
@@ -1864,7 +2760,7 @@ export function FreightDashboardWorkspace() {
           </section>
         )}
 
-        {!loading && tab === "carriers" && (
+        {!initialLoading && tab === "carriers" && (
           <section className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
             <form className="glass-panel p-5 space-y-3" onSubmit={handleCreateCarrier}>
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">New carrier</p>
@@ -1897,7 +2793,7 @@ export function FreightDashboardWorkspace() {
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(event) => event.stopPropagation()}
           >
-            <button onClick={() => { setSelectedShipmentId(contextMenu.shipmentId); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
+            <button onClick={() => { selectShipment(contextMenu.shipmentId); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
               <Package2 size={16} /> Open shipment
             </button>
             {actionModel.label && actionModel.operatorAction && (
@@ -1905,42 +2801,137 @@ export function FreightDashboardWorkspace() {
                 <CheckCircle2 size={16} /> {actionModel.label}
               </button>
             )}
-            <button onClick={() => { setWorkspaceSection("overview"); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
+            <button onClick={() => { enterEditMode(); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
               <PencilLine size={16} /> Edit details
             </button>
             {secondaryActions.map((action) => (
-              <button key={action.key} onClick={() => void handleContextAction(action)} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
-                <RefreshCcw size={16} /> {action.label}
+              <button
+                key={action.key}
+                onClick={() => void handleContextAction(action)}
+                className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm transition ${
+                  action.tone === "warning" ? "text-amber-100 hover:bg-amber-300/10" : "text-white hover:bg-white/10"
+                }`}
+              >
+                {action.key === "archive_shipment" ? <Archive size={16} /> : <RefreshCcw size={16} />} {action.label}
               </button>
             ))}
           </div>
         )}
 
-        {!loading && tab === "shipments" && (
+        {!initialLoading && tab === "shipments" && (
           <>
             <div
-              className={`fixed inset-0 z-40 bg-slate-950/45 backdrop-blur-sm transition ${drawerOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}
-              onClick={() => setDrawerOpen(false)}
+              className={`fixed inset-0 z-40 mt-0 bg-slate-950/45 backdrop-blur-sm transition ${drawerOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}
+              onClick={closeDrawer}
             />
+            {renderThreadRail()}
+            <div
+              className={`fixed inset-0 z-[60] flex items-center justify-center bg-slate-950/55 px-4 backdrop-blur-sm transition ${
+                archiveDialog ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+              }`}
+              onClick={() => setArchiveDialog(null)}
+            >
+              <div
+                className="w-full max-w-[560px] rounded-[30px] border border-amber-300/20 bg-[linear-gradient(180deg,rgba(15,21,31,0.98),rgba(10,16,24,0.98))] p-6 shadow-[0_32px_100px_rgba(0,0,0,0.45)]"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="flex items-start gap-4">
+                  <div className="rounded-full bg-amber-300/12 p-3 text-amber-100">
+                    <AlertTriangle size={18} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs uppercase tracking-[0.18em] text-amber-200/70">Archive shipment</p>
+                    <h3 className="mt-2 text-2xl font-semibold tracking-[-0.04em] text-white">Move this shipment to archive?</h3>
+                    <p className="mt-3 text-sm leading-6 text-slate-300">
+                      <span className="font-medium text-white">{archiveDialog?.shipmentLabel || "This shipment"}</span> will be removed from the active board,
+                      and its email source thread will be ignored during future syncs so it does not get recreated again.
+                    </p>
+                    <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm leading-6 text-slate-300">
+                      Use this for bounced emails, malformed AI-created shipments, duplicate noise, or any thread you want the automation loop to stop processing.
+                    </div>
+                    <div className="mt-4">
+                      <label className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Archive reason</label>
+                      <input
+                        className="field-input"
+                        value={archiveReason}
+                        onChange={(event) => setArchiveReason(event.target.value)}
+                        placeholder="invalid shipment from non-delivery email"
+                      />
+                    </div>
+                    <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                      <button
+                        onClick={() => setArchiveDialog(null)}
+                        disabled={submitting !== null}
+                        className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => void confirmArchiveShipment()}
+                        disabled={submitting !== null}
+                        className="action-button bg-amber-300 text-slate-950 hover:brightness-105 disabled:opacity-50"
+                      >
+                        {submitting === "archive_shipment" ? "Archiving..." : "Archive and ignore source"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
             <aside
-              className={`fixed right-0 top-0 z-50 h-screen w-full max-w-[760px] border-l border-white/10 bg-[linear-gradient(180deg,rgba(13,21,32,0.98),rgba(9,16,26,0.96))] shadow-2xl transition-transform duration-300 ${
+              className={`fixed inset-y-0 top-0 right-0 z-50 !mt-0 h-[100dvh] w-full max-w-[760px] border-l border-white/10 bg-[linear-gradient(180deg,rgba(13,21,32,0.98),rgba(9,16,26,0.96))] shadow-2xl transition-transform duration-300 ${
                 drawerOpen ? "translate-x-0" : "translate-x-full"
               }`}
             >
               <div className="flex h-full flex-col">
-                <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-                  <div>
+                <div className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-2.5">
+                  <div className="min-w-0">
                     <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Shipment workspace</p>
-                    <p className="mt-1 text-lg font-medium text-white">{selectedShipment ? formatRoute(selectedShipment) : "No shipment selected"}</p>
+                    <p className="mt-0.5 text-lg font-medium text-white">{selectedShipment ? formatRoute(selectedShipment) : "No shipment selected"}</p>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      {selectedShipment?.quote_token && (
+                        <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                          {selectedShipment.quote_token}
+                        </span>
+                      )}
+                      {selectedShipment && <ShipmentStatusPill status={selectedShipment.status} />}
+                    </div>
                   </div>
-                  <button
-                    onClick={() => setDrawerOpen(false)}
-                    className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-white transition hover:bg-white/10"
-                  >
-                    Close
-                  </button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {drawerMode === "edit" ? (
+                      <>
+                        <button
+                          onClick={backToOverview}
+                          className="action-button bg-white/10 px-3 py-1.5 text-sm text-white hover:bg-white/15"
+                        >
+                          Back to overview
+                        </button>
+                        <button
+                          onClick={() => void persistShipmentEdits()}
+                          disabled={!shipmentFormDirty || submitting !== null}
+                          className="action-button bg-[var(--accent-cyan)] px-3 py-1.5 text-sm text-slate-950 hover:brightness-110 disabled:opacity-50"
+                        >
+                          {submitting === "save_shipment" ? "Saving..." : "Save changes"}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={enterEditMode}
+                        disabled={!selectedShipment}
+                        className="action-button bg-white/10 px-3 py-1.5 text-sm text-white hover:bg-white/15 disabled:opacity-50"
+                      >
+                        Edit shipment
+                      </button>
+                    )}
+                    <button
+                      onClick={closeDrawer}
+                      className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white transition hover:bg-white/10"
+                    >
+                      Close
+                    </button>
+                  </div>
                 </div>
-                <div className="flex-1 overflow-y-auto px-5 py-5">
+                <div ref={drawerScrollRef} className="flex-1 overflow-y-auto px-5 pb-5 pt-4">
                   {renderShipmentWorkspace()}
                 </div>
               </div>

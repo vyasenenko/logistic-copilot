@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +18,37 @@ from app.services.outlook import OutlookMailboxMessage
 def _display_name_from_email(email: str) -> str:
     local_part = email.split("@", 1)[0]
     return local_part.replace(".", " ").replace("_", " ").title() or email
+
+
+def _looks_like_bounce_or_non_delivery(mailbox_message: OutlookMailboxMessage) -> tuple[bool, str | None]:
+    sender = (mailbox_message.sender_email or "").lower()
+    subject = (mailbox_message.subject or "").lower()
+    body_preview = (mailbox_message.body_preview or "").lower()
+    sender_hints = ("mailer-daemon", "postmaster", "microsoft outlook", "mail delivery subsystem")
+    subject_hints = (
+        "undeliverable",
+        "delivery has failed",
+        "delivery failed",
+        "message blocked",
+        "not delivered",
+        "failed delivery",
+        "returned mail",
+    )
+    body_hints = (
+        "не удалось выполнить доставку",
+        "message not delivered",
+        "remote server returned",
+        "delivery to the following recipients failed",
+        "service unavailable. access denied",
+    )
+
+    if any(hint in sender for hint in sender_hints):
+        return True, "bounce_sender_detected"
+    if any(hint in subject for hint in subject_hints):
+        return True, "bounce_subject_detected"
+    if any(hint in body_preview for hint in body_hints):
+        return True, "bounce_body_detected"
+    return False, None
 
 
 async def _find_or_create_thread(
@@ -108,6 +141,16 @@ async def _find_or_create_shipment(
     client: Client | None,
     body_preview: str,
 ) -> tuple[Shipment, bool]:
+    if bool(getattr(thread, "shipment_ingest_suppressed", False)):
+        existing_archived = await session.scalar(
+            select(Shipment)
+            .where(Shipment.email_thread_id == thread.id)
+            .order_by(Shipment.created_at.desc())
+        )
+        if existing_archived is not None:
+            return existing_archived, False
+        raise RuntimeError("Shipment creation suppressed for this email thread")
+
     shipment = await session.scalar(
         select(Shipment).where(
             or_(Shipment.email_thread_id == thread.id, Shipment.quote_token == thread.quote_token)
@@ -152,7 +195,7 @@ async def ingest_outlook_message(
     )
     if existing_message is not None:
         shipment = await session.scalar(
-            select(Shipment).where(Shipment.email_thread_id == existing_message.thread_id)
+            select(Shipment).where(Shipment.email_thread_id == existing_message.thread_id).order_by(Shipment.created_at.desc())
         )
         if shipment is None:
             return None
@@ -165,6 +208,9 @@ async def ingest_outlook_message(
             created_message=False,
             created_shipment=False,
             created_client=False,
+            suppressed=bool(shipment.is_archived and shipment.email_thread_id),
+            suppression_reason=shipment.archived_reason if shipment.is_archived else None,
+            shipment_creation_skipped=bool(shipment.is_archived),
         )
 
     quote_reference = generate_quote_reference()
@@ -181,6 +227,12 @@ async def ingest_outlook_message(
         mailbox_message=mailbox_message,
         quote_token=quote_token,
     )
+
+    looks_like_bounce, suppression_reason = _looks_like_bounce_or_non_delivery(mailbox_message)
+    if looks_like_bounce:
+        thread.shipment_ingest_suppressed = True
+        thread.shipment_ingest_suppressed_reason = suppression_reason
+        thread.shipment_ingest_suppressed_at = datetime.now(timezone.utc)
 
     email_message = EmailMessage(
         thread_id=thread.id,
@@ -202,7 +254,7 @@ async def ingest_outlook_message(
 
     client = None
     created_client = False
-    if carrier is None:
+    if carrier is None and not thread.shipment_ingest_suppressed:
         client, created_client = await _find_or_create_client(
             session,
             sender_email=mailbox_message.sender_email,
@@ -210,35 +262,51 @@ async def ingest_outlook_message(
             create_if_missing=create_client_if_missing,
         )
 
-    shipment, created_shipment = await _find_or_create_shipment(
-        session,
-        thread=thread,
-        client=client,
-        body_preview=mailbox_message.body_preview,
-    )
+    shipment = None
+    created_shipment = False
+    shipment_creation_skipped = False
+    if not thread.shipment_ingest_suppressed:
+        shipment, created_shipment = await _find_or_create_shipment(
+            session,
+            thread=thread,
+            client=client,
+            body_preview=mailbox_message.body_preview,
+        )
+    else:
+        shipment_creation_skipped = True
+        shipment = await session.scalar(
+            select(Shipment).where(Shipment.email_thread_id == thread.id).order_by(Shipment.created_at.desc())
+        )
 
-    workflow_event = WorkflowEvent(
-        shipment_id=shipment.id,
-        event_type=WorkflowEventType.EMAIL_RECEIVED.value,
-        stage=ShipmentStage.RECEIVED.value,
-        payload_json={
-            "provider_message_id": mailbox_message.provider_message_id,
-            "conversation_id": mailbox_message.conversation_id,
-            "sender": mailbox_message.sender_email,
-            "subject": mailbox_message.subject,
-        },
-    )
-    session.add(workflow_event)
+    workflow_event = None
+    if shipment is not None:
+        workflow_event = WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.EMAIL_RECEIVED.value,
+            stage=ShipmentStage.RECEIVED.value,
+            payload_json={
+                "provider_message_id": mailbox_message.provider_message_id,
+                "conversation_id": mailbox_message.conversation_id,
+                "sender": mailbox_message.sender_email,
+                "subject": mailbox_message.subject,
+                "suppressed": bool(thread.shipment_ingest_suppressed),
+            },
+        )
+        session.add(workflow_event)
     await session.commit()
-    await freight_realtime_hub.notify_workflow_event(workflow_event)
+    if workflow_event is not None:
+        await freight_realtime_hub.notify_workflow_event(workflow_event)
 
     return OutlookIngestResult(
         thread_id=str(thread.id),
         email_message_id=str(email_message.id),
-        shipment_id=str(shipment.id),
-        client_id=str(client.id) if client else None,
+        shipment_id=str(shipment.id) if shipment else "",
+        client_id=str(client.id) if client else (str(shipment.client_id) if shipment and shipment.client_id else None),
         created_thread=created_thread,
         created_message=True,
         created_shipment=created_shipment,
         created_client=created_client,
+        suppressed=bool(thread.shipment_ingest_suppressed),
+        suppression_reason=thread.shipment_ingest_suppressed_reason,
+        shipment_creation_skipped=shipment_creation_skipped,
     )

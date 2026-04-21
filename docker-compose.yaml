@@ -16,7 +16,10 @@ services:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - S3_ENDPOINT_URL=http://minio:9000
-      - BACKEND_CORS_ORIGINS=http://localhost:${FRONTEND_HTTP_PORT:-3000}
+      # Do not hardcode: overrides .env and breaks Chrome extension / tunnel Origins on preflight (OPTIONS → 400).
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:${FRONTEND_HTTP_PORT:-3000}}
+      # Default true in compose so chrome-extension:// preflight succeeds; set false in .env for production-like runs.
+      - CORS_ALLOW_CHROME_EXTENSIONS=${CORS_ALLOW_CHROME_EXTENSIONS:-true}
     depends_on:
       postgres:
         condition: service_healthy

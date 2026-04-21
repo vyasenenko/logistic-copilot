@@ -89,6 +89,7 @@ async def chat(
                     "data": event["data"],
                     "conversation_id": str(conv.id),
                 },
+                default=str,
                 ensure_ascii=False,
             )
             yield f"data: {sse_data}\n\n"

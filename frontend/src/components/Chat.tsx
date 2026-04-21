@@ -14,6 +14,8 @@ interface Message {
 interface ToolEvent {
   tool: string;
   status: "running" | "done";
+  toolInput?: Record<string, unknown>;
+  toolOutput?: string;
 }
 
 interface ChatProps {
@@ -104,16 +106,72 @@ export function Chat({ conversationId, onConversationCreated }: ChatProps) {
                 return updated;
               });
             } else if (event.event === "tool_start") {
+              const raw = event.data;
+              const toolName =
+                typeof raw === "string"
+                  ? raw
+                  : String(raw?.tool_name || raw?.name || "tool");
+              const toolInput =
+                typeof raw === "object" && raw !== null && "tool_input" in raw
+                  ? (raw.tool_input as Record<string, unknown>)
+                  : undefined;
               setActiveTools((prev) => [
                 ...prev,
-                { tool: event.data, status: "running" },
+                { tool: toolName, status: "running", toolInput },
               ]);
             } else if (event.event === "tool_end") {
-              setActiveTools((prev) =>
-                prev.map((t) =>
-                  t.status === "running" ? { ...t, status: "done" } : t
-                )
-              );
+              const raw = event.data;
+              const toolName =
+                typeof raw === "object" && raw !== null && "tool_name" in raw
+                  ? String((raw as { tool_name: string }).tool_name)
+                  : null;
+              const toolOutput =
+                typeof raw === "object" && raw !== null && "tool_output" in raw
+                  ? String((raw as { tool_output: string }).tool_output)
+                  : typeof raw === "string"
+                    ? raw
+                    : undefined;
+              setActiveTools((prev) => {
+                if (prev.length === 0) return prev;
+                if (toolName) {
+                  let matched = false;
+                  return prev.map((t) => {
+                    if (!matched && t.status === "running" && t.tool === toolName) {
+                      matched = true;
+                      return {
+                        ...t,
+                        status: "done" as const,
+                        toolOutput: toolOutput ?? t.toolOutput,
+                      };
+                    }
+                    return t;
+                  });
+                }
+                let seen = false;
+                return prev.map((t) => {
+                  if (!seen && t.status === "running") {
+                    seen = true;
+                    return {
+                      ...t,
+                      status: "done" as const,
+                      toolOutput: toolOutput ?? t.toolOutput,
+                    };
+                  }
+                  return t;
+                });
+              });
+            } else if (event.event === "error") {
+              const errText =
+                typeof event.data === "string" ? event.data : JSON.stringify(event.data);
+              assistantContent += `\n\n[Error] ${errText}`;
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  role: "assistant",
+                  content: assistantContent,
+                };
+                return updated;
+              });
             }
 
             // Capture conversation ID
@@ -177,12 +235,30 @@ export function Chat({ conversationId, onConversationCreated }: ChatProps) {
 
         {/* Active tools indicator */}
         {activeTools.length > 0 && (
-          <div className="flex items-center gap-2 text-agent-muted text-sm">
-            <Wrench size={14} className="animate-spin" />
-            {activeTools
-              .filter((t) => t.status === "running")
-              .map((t) => t.tool)
-              .join(", ")}
+          <div className="flex flex-col gap-1 text-agent-muted text-sm border border-agent-border rounded-xl p-3 bg-agent-surface/50">
+            <div className="flex items-center gap-2">
+              <Wrench size={14} className="animate-spin shrink-0" />
+              <span>Tools</span>
+            </div>
+            <ul className="space-y-1 font-mono text-xs break-all">
+              {activeTools.map((t, idx) => (
+                <li key={`${t.tool}-${idx}`}>
+                  <span className="text-agent-text">{t.tool}</span>{" "}
+                  <span className="opacity-70">({t.status})</span>
+                  {t.toolInput && Object.keys(t.toolInput).length > 0 && (
+                    <pre className="mt-1 whitespace-pre-wrap text-[11px] opacity-80 max-h-24 overflow-y-auto">
+                      {JSON.stringify(t.toolInput, null, 0)}
+                    </pre>
+                  )}
+                  {t.toolOutput && t.status === "done" && (
+                    <pre className="mt-1 whitespace-pre-wrap text-[11px] opacity-70 max-h-20 overflow-y-auto">
+                      {t.toolOutput.slice(0, 800)}
+                      {t.toolOutput.length > 800 ? "…" : ""}
+                    </pre>
+                  )}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 

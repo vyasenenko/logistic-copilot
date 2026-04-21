@@ -86,6 +86,9 @@ class EmailThread(Base):
     subject = Column(String(500), nullable=False)
     normalized_subject = Column(String(500), nullable=False)
     last_message_at = Column(DateTime(timezone=True), nullable=True)
+    shipment_ingest_suppressed = Column(Boolean, default=False, nullable=False)
+    shipment_ingest_suppressed_reason = Column(String(500), nullable=True)
+    shipment_ingest_suppressed_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -135,6 +138,9 @@ class Shipment(Base):
     ready_at_offset_minutes = Column(Integer, nullable=True)
     margin_policy_json = Column(JSON, default=dict, nullable=False)
     notes = Column(Text, default="", nullable=False)
+    is_archived = Column(Boolean, default=False, nullable=False)
+    archived_reason = Column(String(500), nullable=True)
+    archived_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -219,6 +225,24 @@ async def init_db() -> None:
                 END$$;
                 """
             )
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS archived_reason VARCHAR(500)")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP WITH TIME ZONE")
+        )
+        await conn.execute(
+            text("ALTER TABLE email_threads ADD COLUMN IF NOT EXISTS shipment_ingest_suppressed BOOLEAN DEFAULT FALSE NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE email_threads ADD COLUMN IF NOT EXISTS shipment_ingest_suppressed_reason VARCHAR(500)")
+        )
+        await conn.execute(
+            text("ALTER TABLE email_threads ADD COLUMN IF NOT EXISTS shipment_ingest_suppressed_at TIMESTAMP WITH TIME ZONE")
         )
 
 
