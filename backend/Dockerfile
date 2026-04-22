@@ -4,7 +4,8 @@ WORKDIR /app
 
 # Install system deps + FFmpeg + fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev ffmpeg fonts-dejavu-core && \
+    ca-certificates gcc libpq-dev ffmpeg fonts-dejavu-core && \
+    update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml .

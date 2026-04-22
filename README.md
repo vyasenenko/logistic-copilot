@@ -111,7 +111,7 @@ Agent/
 │   ├── namespace.yaml
 │   ├── secrets.yaml
 │   ├── configmap.yaml
-│   ├── databases.yaml      # PostgreSQL + Qdrant StatefulSets
+│   ├── databases.yaml      # Qdrant StatefulSet (Postgres = external / managed DB)
 │   ├── app.yaml            # Backend + Frontend Deployments
 │   └── ingress.yaml        # Nginx Ingress + TLS
 ├── docker-compose.yaml     # Локальная разработка
@@ -121,29 +121,35 @@ Agent/
 
 ## Деплой на DigitalOcean (Kubernetes)
 
+PostgreSQL в кластере **не** поднимается: managed Postgres и параметры подключения задаются в `k8s/configmap.yaml` / `k8s/secrets.yaml`. Для DO Managed DB включите `POSTGRES_SSL=true` в ConfigMap (и при необходимости разрешите исходящий трафик с нод кластера к БД в панели DO).
+
+Образы по умолчанию — **Docker Hub** `issist/logistic-copilot-backend` и `issist/logistic-copilot-frontend` (тег в `k8s/app.yaml`). Перед `apply` заполните плейсхолдеры в ConfigMap (Spaces, Azure, TMS) и все секреты в `k8s/secrets.yaml` из вашего `.env`.
+
 ```bash
-# 1. Создать кластер DOKS в DigitalOcean
+# 1. Кластер DOKS + kubectl context
 
-# 2. Создать Container Registry
-doctl registry create ai-agent
+# 2. Собрать и запушить образы (подставьте свой тег)
+docker build -t issist/logistic-copilot-backend:TAG ./backend
+docker build -t issist/logistic-copilot-frontend:TAG ./frontend
+docker push issist/logistic-copilot-backend:TAG
+docker push issist/logistic-copilot-frontend:TAG
+# Обновите image: в k8s/app.yaml на тот же TAG (или используйте :latest).
 
-# 3. Собрать и запушить образы
-docker build -t registry.digitalocean.com/ai-agent/backend:latest ./backend
-docker build -t registry.digitalocean.com/ai-agent/frontend:latest ./frontend
-docker push registry.digitalocean.com/ai-agent/backend:latest
-docker push registry.digitalocean.com/ai-agent/frontend:latest
-
-# 4. Применить K8s манифесты
+# 3. Применить манифесты
 kubectl apply -f k8s/namespace.yaml
-kubectl apply -f k8s/secrets.yaml      # ← заполнить реальными ключами!
+kubectl apply -f k8s/secrets.yaml
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/databases.yaml
 kubectl apply -f k8s/app.yaml
 kubectl apply -f k8s/ingress.yaml
 
-# 5. Установить Nginx Ingress + cert-manager
-helm install ingress-nginx ingress-nginx/ingress-nginx -n ai-agent
-helm install cert-manager jetstack/cert-manager --set installCRDs=true
+# 4. Ingress + cert-manager + ClusterIssuer (email в letsencrypt-clusterissuer.yaml)
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace
+helm install cert-manager jetstack/cert-manager -n cert-manager --create-namespace --set crds.enabled=true
+kubectl apply -f k8s/letsencrypt-clusterissuer.yaml
 ```
 
 ## Добавление новых инструментов

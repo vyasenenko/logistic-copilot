@@ -133,10 +133,21 @@ def infer_shipment_timezone(origin: str | None, destination: str | None) -> str 
     return resolve_us_timezone(origin) or resolve_us_timezone(destination)
 
 
+def infer_delivery_timezone(origin: str | None, destination: str | None) -> str | None:
+    """Infer delivery timezone prioritizing destination, then origin."""
+    return resolve_us_timezone(destination) or resolve_us_timezone(origin)
+
+
 def local_naive_to_utc(local_naive: datetime, timezone_name: str) -> datetime:
     """Interpret naive datetime in timezone_name and convert to UTC."""
     local = local_naive.replace(tzinfo=ZoneInfo(timezone_name))
     return local.astimezone(timezone.utc)
+
+
+def utc_to_local_naive(utc_value: datetime, timezone_name: str) -> datetime:
+    """Convert a UTC/aware instant into naive local civil time for timezone_name."""
+    instant = utc_value.astimezone(timezone.utc) if utc_value.tzinfo else utc_value.replace(tzinfo=timezone.utc)
+    return instant.astimezone(ZoneInfo(timezone_name)).replace(tzinfo=None)
 
 
 def offset_minutes_for_local_naive(timezone_name: str, local_naive: datetime) -> int:
@@ -164,6 +175,89 @@ def format_ready_at_wall_display(local_naive: datetime | None, timezone_name: st
     return base
 
 
+def format_route_datetime_display(local_naive: datetime | None, timezone_name: str | None) -> str:
+    """Human/TMS-friendly local route time: wall clock + optional IANA zone."""
+    return format_ready_at_wall_display(local_naive, timezone_name)
+
+
+def normalize_route_datetime_fields(
+    *,
+    utc_value: datetime | None,
+    local_value: datetime | None,
+    timezone_name: str | None,
+) -> tuple[datetime | None, datetime | None, str | None, int | None]:
+    """
+    Normalize a route-scoped datetime pair into canonical UTC instant + local wall time.
+
+    Returns (utc_instant, local_naive, timezone_name, offset_minutes).
+    """
+    if utc_value is None and local_value is None:
+        return None, None, timezone_name, None
+
+    normalized_utc: datetime | None = None
+    normalized_local: datetime | None = None
+
+    if local_value is not None:
+        if local_value.tzinfo is not None:
+            normalized_utc = local_value.astimezone(timezone.utc)
+            normalized_local = (
+                local_value.astimezone(ZoneInfo(timezone_name)).replace(tzinfo=None)
+                if timezone_name
+                else local_value.replace(tzinfo=None)
+            )
+        else:
+            normalized_local = local_value
+            normalized_utc = (
+                local_naive_to_utc(local_value, timezone_name)
+                if timezone_name
+                else None
+            )
+    elif utc_value is not None:
+        normalized_utc = utc_value.astimezone(timezone.utc) if utc_value.tzinfo else utc_value.replace(tzinfo=timezone.utc)
+        normalized_local = (
+            utc_to_local_naive(normalized_utc, timezone_name)
+            if timezone_name
+            else None
+        )
+
+    offset = (
+        offset_minutes_for_local_naive(timezone_name, normalized_local)
+        if timezone_name and normalized_local is not None
+        else None
+    )
+    return normalized_utc, normalized_local, timezone_name, offset
+
+
+def normalize_pickup_datetime_fields(
+    *,
+    ready_at: datetime | None,
+    ready_at_local: datetime | None,
+    origin: str | None,
+    destination: str | None,
+) -> tuple[datetime | None, datetime | None, str | None, int | None]:
+    timezone_name = infer_shipment_timezone(origin, destination)
+    return normalize_route_datetime_fields(
+        utc_value=ready_at,
+        local_value=ready_at_local,
+        timezone_name=timezone_name,
+    )
+
+
+def normalize_delivery_datetime_fields(
+    *,
+    delivery_at: datetime | None,
+    delivery_at_local: datetime | None,
+    origin: str | None,
+    destination: str | None,
+) -> tuple[datetime | None, datetime | None, str | None, int | None]:
+    timezone_name = infer_delivery_timezone(origin, destination)
+    return normalize_route_datetime_fields(
+        utc_value=delivery_at,
+        local_value=delivery_at_local,
+        timezone_name=timezone_name,
+    )
+
+
 def apply_shipment_ready_at_wall_fields(
     ready_at: datetime | None,
     origin: str | None,
@@ -174,24 +268,12 @@ def apply_shipment_ready_at_wall_fields(
 
     Aware datetimes are converted to local wall time in the resolved zone (or UTC if unknown zone).
     """
-    if ready_at is None:
-        return None, None, None
-
-    timezone_name = infer_shipment_timezone(origin, destination)
-    wall: datetime
-    if ready_at.tzinfo is None:
-        wall = ready_at
-    elif timezone_name:
-        wall = ready_at.astimezone(ZoneInfo(timezone_name)).replace(tzinfo=None)
-    else:
-        wall = ready_at.astimezone(timezone.utc).replace(tzinfo=None)
-
-    offset: int | None
-    if timezone_name:
-        offset = offset_minutes_for_local_naive(timezone_name, wall)
-    else:
-        offset = None
-
+    _, wall, timezone_name, offset = normalize_pickup_datetime_fields(
+        ready_at=ready_at,
+        ready_at_local=ready_at if ready_at and ready_at.tzinfo is None else None,
+        origin=origin,
+        destination=destination,
+    )
     return wall, timezone_name, offset
 
 

@@ -163,6 +163,9 @@ class ShipmentUpsertRequest(BaseModel):
     weight_lb: float | None = Field(None, ge=0)
     equipment_type: str | None = Field(None, max_length=100)
     ready_at: datetime | None = None
+    ready_at_local: datetime | None = None
+    delivery_at: datetime | None = None
+    delivery_at_local: datetime | None = None
     margin_policy: MarginPolicy | None = None
     notes: str = ""
 
@@ -179,8 +182,15 @@ class ShipmentRecord(BaseModel):
     weight_lb: float | None = None
     equipment_type: str | None = None
     ready_at: datetime | None = None
+    ready_at_local: datetime | None = None
+    ready_at_display: str | None = None
     ready_at_timezone: str | None = None
     ready_at_offset_minutes: int | None = None
+    delivery_at: datetime | None = None
+    delivery_at_local: datetime | None = None
+    delivery_at_display: str | None = None
+    delivery_at_timezone: str | None = None
+    delivery_at_offset_minutes: int | None = None
     margin_policy: dict = Field(default_factory=dict)
     notes: str = ""
     ai_intent: str | None = None
@@ -274,6 +284,27 @@ class ShipmentThreadResponse(BaseModel):
     thread_subject: str | None = None
     quote_token: str | None = None
     messages: list[ShipmentThreadMessageRecord] = Field(default_factory=list)
+
+
+class ShipmentMagicField(str, Enum):
+    READY_AT_LOCAL = "ready_at_local"
+
+
+class ShipmentMagicFillRequest(BaseModel):
+    field: ShipmentMagicField
+    apply_value: bool = True
+
+
+class ShipmentMagicFillResponse(BaseModel):
+    shipment_id: str
+    field: ShipmentMagicField
+    status: str
+    message: str
+    confidence: float = 0
+    suggested_value: str | None = None
+    ambiguity_reasons: list[str] = Field(default_factory=list)
+    source_messages: int = 0
+    shipment: ShipmentRecord | None = None
 
 
 class DocumentContentResult(BaseModel):
@@ -525,10 +556,21 @@ class ShipmentExtractionResult(BaseModel):
     weight_lb: float | None = Field(None, ge=0)
     equipment_type: str | None = None
     ready_at: datetime | None = None
+    ready_at_local_text: str | None = None
+    delivery_at: datetime | None = None
+    delivery_at_local_text: str | None = None
     notes: str = ""
     missing_fields: list[str] = Field(default_factory=list)
     ambiguity_reasons: list[str] = Field(default_factory=list)
     confidence: float = Field(0, ge=0, le=1)
+
+
+class ShipmentFieldExtractionResult(BaseModel):
+    field: str
+    value_local_text: str | None = None
+    confidence: float = Field(0, ge=0, le=1)
+    notes: str = ""
+    ambiguity_reasons: list[str] = Field(default_factory=list)
 
 
 class CarrierBidExtractionResult(BaseModel):

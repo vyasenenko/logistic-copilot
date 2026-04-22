@@ -159,8 +159,6 @@ async def _find_or_create_shipment(
     if shipment is not None:
         if client and shipment.client_id is None:
             shipment.client_id = client.id
-        if not shipment.notes:
-            shipment.notes = body_preview
         return shipment, False
 
     shipment = Shipment(
@@ -172,7 +170,7 @@ async def _find_or_create_shipment(
             "percent": client.default_margin_percent if client else settings.profit_margin_percent_default,
             "floor_amount": client.default_margin_floor if client else settings.profit_margin_floor_default,
         },
-        notes=body_preview,
+        notes=None,
     )
     session.add(shipment)
     await session.flush()

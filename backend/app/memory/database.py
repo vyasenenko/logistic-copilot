@@ -1,5 +1,6 @@
 """PostgreSQL database — conversations and message history."""
 
+import ssl
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
@@ -11,7 +12,23 @@ from sqlalchemy.orm import DeclarativeBase, relationship
 
 from app.config import settings
 
-engine = create_async_engine(settings.postgres_url, echo=False)
+
+def _postgres_connect_args() -> dict:
+    if not settings.postgres_ssl:
+        return {}
+    if settings.postgres_ssl_skip_verify:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return {"ssl": ctx}
+    ctx = ssl.create_default_context()
+    ca_file = settings.postgres_ssl_ca_file.strip()
+    if ca_file:
+        ctx.load_verify_locations(ca_file)
+    return {"ssl": ctx}
+
+
+engine = create_async_engine(settings.postgres_url, echo=False, connect_args=_postgres_connect_args())
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -132,10 +149,17 @@ class Shipment(Base):
     pallets = Column(Integer, nullable=True)
     weight_lb = Column(Float, nullable=True)
     equipment_type = Column(String(100), nullable=True)
-    # Naive local "wall clock" time; zone is ready_at_timezone (IANA). Not stored as UTC instant.
-    ready_at = Column(DateTime(timezone=False), nullable=True)
+    # Canonical pickup-ready UTC instant.
+    ready_at = Column(DateTime(timezone=True), nullable=True)
+    # Pickup local "wall clock" time; zone is ready_at_timezone (IANA).
+    ready_at_local = Column(DateTime(timezone=False), nullable=True)
     ready_at_timezone = Column(String(64), nullable=True)
     ready_at_offset_minutes = Column(Integer, nullable=True)
+    # Canonical delivery UTC instant and local destination wall time.
+    delivery_at = Column(DateTime(timezone=True), nullable=True)
+    delivery_at_local = Column(DateTime(timezone=False), nullable=True)
+    delivery_at_timezone = Column(String(64), nullable=True)
+    delivery_at_offset_minutes = Column(Integer, nullable=True)
     margin_policy_json = Column(JSON, default=dict, nullable=False)
     notes = Column(Text, default="", nullable=False)
     is_archived = Column(Boolean, default=False, nullable=False)
@@ -200,6 +224,21 @@ async def init_db() -> None:
             text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ready_at_offset_minutes INTEGER")
         )
         await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ready_at_local TIMESTAMP WITHOUT TIME ZONE")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS delivery_at TIMESTAMP WITH TIME ZONE")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS delivery_at_local TIMESTAMP WITHOUT TIME ZONE")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS delivery_at_timezone VARCHAR(64)")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS delivery_at_offset_minutes INTEGER")
+        )
+        await conn.execute(
             text(
                 """
                 DO $$
@@ -211,16 +250,37 @@ async def init_db() -> None:
                       AND column_name = 'ready_at'
                       AND data_type = 'timestamp with time zone'
                   ) THEN
+                    UPDATE shipments
+                    SET ready_at_local = ready_at
+                    WHERE ready_at IS NOT NULL
+                      AND ready_at_local IS NULL;
+
                     ALTER TABLE shipments
-                      ALTER COLUMN ready_at TYPE timestamp without time zone
+                      ALTER COLUMN ready_at TYPE timestamp with time zone
                       USING (
                         CASE
                           WHEN ready_at IS NULL THEN NULL
                           WHEN ready_at_timezone IS NOT NULL
                             THEN (ready_at AT TIME ZONE ready_at_timezone)
-                          ELSE (ready_at AT TIME ZONE 'UTC')
+                          ELSE NULL
                         END
                       );
+                  ELSIF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'shipments'
+                      AND column_name = 'ready_at'
+                      AND data_type = 'timestamp with time zone'
+                  ) THEN
+                    UPDATE shipments
+                    SET ready_at_local = (
+                      CASE
+                        WHEN ready_at_timezone IS NOT NULL THEN (ready_at AT TIME ZONE ready_at_timezone)
+                        ELSE ready_at_local
+                      END
+                    )
+                    WHERE ready_at IS NOT NULL
+                      AND ready_at_local IS NULL;
                   END IF;
                 END$$;
                 """

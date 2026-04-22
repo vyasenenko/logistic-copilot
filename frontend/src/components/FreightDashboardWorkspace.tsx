@@ -4,6 +4,7 @@ import { startTransition, useEffect, useMemo, useRef, useState, type FormEvent, 
 import { createPortal } from "react-dom";
 
 import { useFreightSocket } from "@/hooks/useFreightSocket";
+import { DateTimePickerField } from "@/components/DateTimePickerField";
 import {
   AlertTriangle,
   Archive,
@@ -41,6 +42,7 @@ type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers";
 type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
 type DrawerMode = "overview" | "edit";
 type ThreadTab = "timeline" | "client" | "carrier_quotes" | "system";
+type EditFocusTarget = "client_id" | "equipment_type" | "origin" | "destination" | "pallets" | "weight_lb" | "ready_at" | "delivery_at" | "notes";
 type StatusQueueAction = "preview" | "approve_and_send" | "approve_and_push" | "rebuild_draft" | "retry_push" | "dismiss";
 type OperatorAction =
   | "resume_workflow"
@@ -113,6 +115,13 @@ interface ShipmentRecord {
   weight_lb: number | null;
   equipment_type: string | null;
   ready_at: string | null;
+  ready_at_local: string | null;
+  ready_at_display: string | null;
+  delivery_at: string | null;
+  delivery_at_local: string | null;
+  delivery_at_display: string | null;
+  delivery_at_timezone: string | null;
+  delivery_at_offset_minutes: number | null;
   margin_policy: Record<string, number>;
   notes: string;
   ai_intent: string | null;
@@ -261,6 +270,18 @@ interface ShipmentOperatorActionResponse {
   suppressed_thread_id?: string | null;
 }
 
+interface ShipmentMagicFillResponse {
+  shipment_id: string;
+  field: "ready_at_local";
+  status: string;
+  message: string;
+  confidence: number;
+  suggested_value: string | null;
+  ambiguity_reasons: string[];
+  source_messages: number;
+  shipment: ShipmentRecord | null;
+}
+
 interface ShipmentThreadMessageRecord {
   id: string;
   thread_id: string;
@@ -357,6 +378,7 @@ interface ShipmentEditorState {
   weight_lb: string;
   equipment_type: string;
   ready_at: string;
+  delivery_at: string;
   notes: string;
 }
 
@@ -449,6 +471,12 @@ function formatDate(value: string | null) {
   }).format(new Date(value));
 }
 
+function formatShipmentSchedule(displayValue: string | null, localValue: string | null) {
+  if (displayValue) return displayValue;
+  if (!localValue) return "Not scheduled";
+  return localValue.replace("T", " ").slice(0, 16);
+}
+
 function currentMonthValue() {
   return new Intl.DateTimeFormat("en-CA", {
     year: "numeric",
@@ -526,7 +554,8 @@ function buildShipmentEditor(shipment: ShipmentRecord | null): ShipmentEditorSta
     pallets: shipment?.pallets?.toString() || "",
     weight_lb: shipment?.weight_lb?.toString() || "",
     equipment_type: shipment?.equipment_type || "",
-    ready_at: toDateTimeLocal(shipment?.ready_at || null),
+    ready_at: toDateTimeLocal(shipment?.ready_at_local || null),
+    delivery_at: toDateTimeLocal(shipment?.delivery_at_local || null),
     notes: shipment?.notes || "",
   };
 }
@@ -537,6 +566,11 @@ function statusPillClass(status: string) {
 
 function shipmentNeedsAttention(shipment: ShipmentRecord) {
   return shipment.attention_state !== "none" || shipment.has_active_review;
+}
+
+function shipmentShowsDeliveryTime(shipment: ShipmentRecord | null) {
+  if (!shipment) return false;
+  return ["booking_in_progress", "booking_failed", "booked"].includes(shipment.status);
 }
 
 function shipmentBlockingBadge(shipment: ShipmentRecord) {
@@ -728,6 +762,7 @@ export function FreightDashboardWorkspace() {
   const [statusReplyDraftSubject, setStatusReplyDraftSubject] = useState("");
   const [statusReplyDraftBody, setStatusReplyDraftBody] = useState("");
   const [carrierStatusForm, setCarrierStatusForm] = useState({ status_text: "", eta_text: "", location_text: "", notes: "" });
+  const [magicFillingField, setMagicFillingField] = useState<string | null>(null);
   const [activeThreadTab, setActiveThreadTab] = useState<ThreadTab>("timeline");
   const [contextMenu, setContextMenu] = useState<{ shipmentId: string; x: number; y: number } | null>(null);
   const [archiveDialog, setArchiveDialog] = useState<ArchiveDialogState | null>(null);
@@ -735,11 +770,15 @@ export function FreightDashboardWorkspace() {
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState<string | null>(null);
   const [threadCache, setThreadCache] = useState<Record<string, ShipmentThreadResponse>>({});
+  const [pendingEditFocus, setPendingEditFocus] = useState<EditFocusTarget | null>(null);
+  const [readyPickerOpenSignal, setReadyPickerOpenSignal] = useState(0);
+  const [deliveryPickerOpenSignal, setDeliveryPickerOpenSignal] = useState(0);
   const [clientForm, setClientForm] = useState({ name: "", email: "", default_margin_percent: "15", default_margin_floor: "0" });
   const [carrierForm, setCarrierForm] = useState({ name: "", email: "", rating: "0", regions: "midwest,northeast", equipment: "dry van" });
   const drawerScrollRef = useRef<HTMLDivElement | null>(null);
   const monthPickerRef = useRef<HTMLDivElement | null>(null);
   const overviewRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const editFieldRefs = useRef<Partial<Record<EditFocusTarget, HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null>>>({});
   const [shipmentCreateForm, setShipmentCreateForm] = useState({
     client_id: "",
     origin: "Chicago, IL",
@@ -748,6 +787,7 @@ export function FreightDashboardWorkspace() {
     weight_lb: "10000",
     equipment_type: "Dry Van",
     ready_at: "",
+    delivery_at: "",
     margin_percent: "15",
     margin_floor: "0",
     notes: "Need pickup tomorrow 08:00.",
@@ -830,8 +870,8 @@ export function FreightDashboardWorkspace() {
         return false;
       }
       if (activeBoardFilter === "today") {
-        if (!shipment.ready_at) return shipmentNeedsAttention(shipment);
-        if (new Intl.DateTimeFormat("en-CA").format(new Date(shipment.ready_at)) !== today) {
+        if (!shipment.ready_at_local) return shipmentNeedsAttention(shipment);
+        if (shipment.ready_at_local.slice(0, 10) !== today) {
           return false;
         }
       }
@@ -1009,8 +1049,9 @@ export function FreightDashboardWorkspace() {
     }
   }
 
-  function enterEditMode() {
+  function enterEditMode(target?: EditFocusTarget) {
     if (!selectedShipment) return;
+    setPendingEditFocus(target || null);
     setDrawerMode("edit");
   }
 
@@ -1210,6 +1251,26 @@ export function FreightDashboardWorkspace() {
   }, [selectedShipment]);
 
   useEffect(() => {
+    if (drawerMode !== "edit" || !pendingEditFocus) return;
+    requestAnimationFrame(() => {
+      if (pendingEditFocus === "ready_at") {
+        setReadyPickerOpenSignal((current) => current + 1);
+        return;
+      }
+      if (pendingEditFocus === "delivery_at") {
+        setDeliveryPickerOpenSignal((current) => current + 1);
+        return;
+      }
+      const field = editFieldRefs.current[pendingEditFocus];
+      field?.focus();
+      if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) {
+        field.select?.();
+      }
+    });
+    setPendingEditFocus(null);
+  }, [drawerMode, pendingEditFocus]);
+
+  useEffect(() => {
     const activeSelectedTask = statusQueue.find((item) => item.task_id === selectedStatusTaskId) || null;
     if (!activeSelectedTask) return;
     setStatusReplyDraftSubject(activeSelectedTask.draft_subject || "");
@@ -1374,7 +1435,8 @@ export function FreightDashboardWorkspace() {
           pallets: shipmentEditor.pallets ? Number(shipmentEditor.pallets) : null,
           weight_lb: shipmentEditor.weight_lb ? Number(shipmentEditor.weight_lb) : null,
           equipment_type: shipmentEditor.equipment_type || null,
-          ready_at: shipmentEditor.ready_at ? new Date(shipmentEditor.ready_at).toISOString() : null,
+          ready_at_local: shipmentEditor.ready_at || null,
+          delivery_at_local: shipmentEditor.delivery_at || null,
           margin_policy: {
             percent: Number(selectedShipment.margin_policy.percent || 0),
             floor_amount: Number(selectedShipment.margin_policy.floor_amount || 0),
@@ -1397,6 +1459,38 @@ export function FreightDashboardWorkspace() {
       return false;
     } finally {
       setSubmitting(null);
+    }
+  }
+
+  async function runMagicFill(field: "ready_at_local") {
+    if (!selectedShipment) return;
+    setMagicFillingField(field);
+    setError(null);
+    setNotice(null);
+    try {
+      console.debug("[magic-fill] request", {
+        shipmentId: selectedShipment.id,
+        field,
+      });
+      const response = await fetchJson<ShipmentMagicFillResponse>(`/api/freight/shipments/${selectedShipment.id}/magic-fill`, {
+        method: "POST",
+        body: JSON.stringify({
+          field,
+          apply_value: true,
+        }),
+      });
+      console.debug("[magic-fill] response", response);
+      if (response.shipment) {
+        mergeShipmentIntoState(response.shipment);
+        setShipmentEditor(buildShipmentEditor(response.shipment));
+        await refreshSelectedShipmentContext(response.shipment.id);
+      }
+      setNotice(response.message);
+    } catch (actionError) {
+      console.error("[magic-fill] failed", actionError);
+      setError(actionError instanceof Error ? actionError.message : "Magic fill failed.");
+    } finally {
+      setMagicFillingField(null);
     }
   }
 
@@ -1437,7 +1531,8 @@ export function FreightDashboardWorkspace() {
           pallets: Number(shipmentCreateForm.pallets || 0),
           weight_lb: Number(shipmentCreateForm.weight_lb || 0),
           equipment_type: shipmentCreateForm.equipment_type,
-          ready_at: shipmentCreateForm.ready_at ? new Date(shipmentCreateForm.ready_at).toISOString() : null,
+          ready_at_local: shipmentCreateForm.ready_at || null,
+          delivery_at_local: shipmentCreateForm.delivery_at || null,
           margin_policy: {
             percent: Number(shipmentCreateForm.margin_percent || 0),
             floor_amount: Number(shipmentCreateForm.margin_floor || 0),
@@ -1699,10 +1794,18 @@ export function FreightDashboardWorkspace() {
       label: string,
       value: string,
       onClick: () => void,
+      magicAction?: { label: string; onClick: () => void; loading?: boolean },
     ) => (
-      <button
-        type="button"
+      <div
+        role="button"
+        tabIndex={0}
         onClick={onClick}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onClick();
+          }
+        }}
         className="rounded-2xl bg-white/5 p-3 text-left transition hover:bg-white/9 hover:ring-1 hover:ring-cyan-200/20"
       >
         <div className="flex items-center justify-between gap-3">
@@ -1710,7 +1813,23 @@ export function FreightDashboardWorkspace() {
           <span className="text-[10px] uppercase tracking-[0.16em] text-cyan-100/70">Edit</span>
         </div>
         <p className="mt-2 text-white">{value}</p>
-      </button>
+        {magicAction && (
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                magicAction.onClick();
+              }}
+              disabled={Boolean(magicAction.loading)}
+              className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200/16 bg-cyan-200/8 px-3 py-1.5 text-[10px] uppercase tracking-[0.18em] text-cyan-50 transition hover:bg-cyan-200/14 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Sparkles size={12} />
+              {magicAction.loading ? "Reading thread..." : magicAction.label}
+            </button>
+          </div>
+        )}
+      </div>
     );
 
     if (drawerMode === "edit") {
@@ -1728,38 +1847,111 @@ export function FreightDashboardWorkspace() {
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="block">
               <span className={fieldLabelClass}>Linked customer</span>
-              <select className="field-input" value={shipmentEditor.client_id} onChange={(event) => setShipmentEditor((current) => ({ ...current, client_id: event.target.value }))}>
+              <select
+                ref={(node) => {
+                  editFieldRefs.current.client_id = node;
+                }}
+                className="field-input"
+                value={shipmentEditor.client_id}
+                onChange={(event) => setShipmentEditor((current) => ({ ...current, client_id: event.target.value }))}
+              >
                 <option value="">No linked customer</option>
                 {clients.map((client) => <option key={client.id} value={client.id}>{client.name}</option>)}
               </select>
             </label>
             <label className="block">
               <span className={fieldLabelClass}>Equipment type</span>
-              <input className="field-input" placeholder="Dry Van, Reefer, Flatbed..." value={shipmentEditor.equipment_type} onChange={(event) => setShipmentEditor((current) => ({ ...current, equipment_type: event.target.value }))} />
+              <input
+                ref={(node) => {
+                  editFieldRefs.current.equipment_type = node;
+                }}
+                className="field-input"
+                placeholder="Dry Van, Reefer, Flatbed..."
+                value={shipmentEditor.equipment_type}
+                onChange={(event) => setShipmentEditor((current) => ({ ...current, equipment_type: event.target.value }))}
+              />
             </label>
             <label className="block">
               <span className={fieldLabelClass}>Origin</span>
-              <input className="field-input" placeholder="Chicago, IL" value={shipmentEditor.origin} onChange={(event) => setShipmentEditor((current) => ({ ...current, origin: event.target.value }))} />
+              <input
+                ref={(node) => {
+                  editFieldRefs.current.origin = node;
+                }}
+                className="field-input"
+                placeholder="Chicago, IL"
+                value={shipmentEditor.origin}
+                onChange={(event) => setShipmentEditor((current) => ({ ...current, origin: event.target.value }))}
+              />
             </label>
             <label className="block">
               <span className={fieldLabelClass}>Destination</span>
-              <input className="field-input" placeholder="New York, NY" value={shipmentEditor.destination} onChange={(event) => setShipmentEditor((current) => ({ ...current, destination: event.target.value }))} />
+              <input
+                ref={(node) => {
+                  editFieldRefs.current.destination = node;
+                }}
+                className="field-input"
+                placeholder="New York, NY"
+                value={shipmentEditor.destination}
+                onChange={(event) => setShipmentEditor((current) => ({ ...current, destination: event.target.value }))}
+              />
             </label>
             <label className="block">
               <span className={fieldLabelClass}>Pallets</span>
-              <input className="field-input" inputMode="numeric" placeholder="5" value={shipmentEditor.pallets} onChange={(event) => setShipmentEditor((current) => ({ ...current, pallets: event.target.value }))} />
+              <input
+                ref={(node) => {
+                  editFieldRefs.current.pallets = node;
+                }}
+                className="field-input"
+                inputMode="numeric"
+                placeholder="5"
+                value={shipmentEditor.pallets}
+                onChange={(event) => setShipmentEditor((current) => ({ ...current, pallets: event.target.value }))}
+              />
             </label>
             <label className="block">
               <span className={fieldLabelClass}>Weight (lb)</span>
-              <input className="field-input" inputMode="decimal" placeholder="10000" value={shipmentEditor.weight_lb} onChange={(event) => setShipmentEditor((current) => ({ ...current, weight_lb: event.target.value }))} />
+              <input
+                ref={(node) => {
+                  editFieldRefs.current.weight_lb = node;
+                }}
+                className="field-input"
+                inputMode="decimal"
+                placeholder="10000"
+                value={shipmentEditor.weight_lb}
+                onChange={(event) => setShipmentEditor((current) => ({ ...current, weight_lb: event.target.value }))}
+              />
             </label>
             <label className="block sm:col-span-2">
               <span className={fieldLabelClass}>Ready time</span>
-              <input type="datetime-local" className="field-input" value={shipmentEditor.ready_at} onChange={(event) => setShipmentEditor((current) => ({ ...current, ready_at: event.target.value }))} />
+              <DateTimePickerField
+                value={shipmentEditor.ready_at}
+                placeholder="Choose pickup-ready time"
+                autoOpenSignal={readyPickerOpenSignal}
+                onChange={(nextValue) => setShipmentEditor((current) => ({ ...current, ready_at: nextValue }))}
+              />
             </label>
+            {shipmentShowsDeliveryTime(selectedShipment) && (
+              <label className="block sm:col-span-2">
+                <span className={fieldLabelClass}>Delivery time</span>
+                <DateTimePickerField
+                  value={shipmentEditor.delivery_at}
+                  placeholder="Choose delivery time"
+                  autoOpenSignal={deliveryPickerOpenSignal}
+                  onChange={(nextValue) => setShipmentEditor((current) => ({ ...current, delivery_at: nextValue }))}
+                />
+              </label>
+            )}
             <label className="block sm:col-span-2">
               <span className={fieldLabelClass}>Operator notes</span>
-              <textarea className="field-input min-h-[140px] resize-none" placeholder="Shipment notes, handling requirements, clarification details..." value={shipmentEditor.notes} onChange={(event) => setShipmentEditor((current) => ({ ...current, notes: event.target.value }))} />
+              <textarea
+                ref={(node) => {
+                  editFieldRefs.current.notes = node;
+                }}
+                className="field-input min-h-[140px] resize-none"
+                placeholder="Shipment notes, handling requirements, clarification details..."
+                value={shipmentEditor.notes}
+                onChange={(event) => setShipmentEditor((current) => ({ ...current, notes: event.target.value }))}
+              />
             </label>
           </div>
         </div>
@@ -1789,10 +1981,21 @@ export function FreightDashboardWorkspace() {
                 </p>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
-                {editableMetricCard("Pallets", String(selectedShipment.pallets ?? "--"), enterEditMode)}
-                {editableMetricCard("Weight", `${selectedShipment.weight_lb ?? "--"} lb`, enterEditMode)}
-                {editableMetricCard("Equipment", selectedShipment.equipment_type || "--", enterEditMode)}
-                {editableMetricCard("Ready", formatDate(selectedShipment.ready_at), enterEditMode)}
+                {editableMetricCard("Pallets", String(selectedShipment.pallets ?? "--"), () => enterEditMode("pallets"))}
+                {editableMetricCard("Weight", `${selectedShipment.weight_lb ?? "--"} lb`, () => enterEditMode("weight_lb"))}
+                {editableMetricCard("Equipment", selectedShipment.equipment_type || "--", () => enterEditMode("equipment_type"))}
+                {editableMetricCard(
+                  "Ready",
+                  formatShipmentSchedule(selectedShipment.ready_at_display, selectedShipment.ready_at_local),
+                  () => enterEditMode("ready_at"),
+                  {
+                    label: "Auto-fill from thread",
+                    onClick: () => void runMagicFill("ready_at_local"),
+                    loading: magicFillingField === "ready_at_local",
+                  },
+                )}
+                {shipmentShowsDeliveryTime(selectedShipment) &&
+                  editableMetricCard("Delivery", formatShipmentSchedule(selectedShipment.delivery_at_display, selectedShipment.delivery_at_local), () => enterEditMode("delivery_at"))}
               </div>
             </div>
             <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
@@ -1815,7 +2018,7 @@ export function FreightDashboardWorkspace() {
                   </button>
                 ) : (
                   <button
-                    onClick={enterEditMode}
+                    onClick={() => enterEditMode()}
                     disabled={submitting !== null}
                     className="action-button w-full bg-white/10 text-white hover:bg-white/15 disabled:opacity-50"
                   >
@@ -2546,7 +2749,7 @@ export function FreightDashboardWorkspace() {
                                   </div>
                                   <p className="mt-1.5 line-clamp-2 text-[13px] font-medium leading-4.5 text-white">{formatRoute(shipment)}</p>
                                   <div className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] leading-4 text-[var(--text-muted)]">
-                                    <p className="min-w-0 whitespace-normal">{shipment.ready_at ? formatDate(shipment.ready_at) : "TBD"}</p>
+                                    <p className="min-w-0 whitespace-normal">{formatShipmentSchedule(shipment.ready_at_display, shipment.ready_at_local || null) || "TBD"}</p>
                                     <p className="min-w-0 text-right whitespace-normal">Weight: {shipment.weight_lb ?? "--"} lb</p>
                                     <p className="min-w-0 whitespace-normal">Token: {shipment.quote_token || "--"}</p>
                                     <p className="min-w-0 text-right whitespace-normal">Pallets: {shipment.pallets ?? "--"}</p>
@@ -2821,7 +3024,7 @@ export function FreightDashboardWorkspace() {
         {!initialLoading && tab === "shipments" && (
           <>
             <div
-              className={`fixed inset-0 z-40 mt-0 bg-slate-950/45 backdrop-blur-sm transition ${drawerOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}
+              className={`fixed inset-0 z-40 !mt-0 bg-slate-950/45 backdrop-blur-sm transition ${drawerOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}
               onClick={closeDrawer}
             />
             {renderThreadRail()}
@@ -2916,7 +3119,7 @@ export function FreightDashboardWorkspace() {
                       </>
                     ) : (
                       <button
-                        onClick={enterEditMode}
+                        onClick={() => enterEditMode()}
                         disabled={!selectedShipment}
                         className="action-button bg-white/10 px-3 py-1.5 text-sm text-white hover:bg-white/15 disabled:opacity-50"
                       >

@@ -1,11 +1,11 @@
-# --- Backend Deployment ---
+# Set image tags per release: issist/logistic-copilot-backend:TAG and issist/logistic-copilot-frontend:TAG
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend
   namespace: ai-agent
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: backend
@@ -16,7 +16,8 @@ spec:
     spec:
       containers:
         - name: backend
-          image: registry.digitalocean.com/YOUR_REGISTRY/ai-agent-backend:latest
+          image: issist/logistic-copilot-backend:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8000
           envFrom:
@@ -56,14 +57,13 @@ spec:
     - port: 8000
       targetPort: 8000
 ---
-# --- Frontend Deployment ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
   namespace: ai-agent
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: frontend
@@ -74,18 +74,19 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: registry.digitalocean.com/YOUR_REGISTRY/ai-agent-frontend:latest
+          image: issist/logistic-copilot-frontend:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 3000
           env:
             - name: NEXT_PUBLIC_API_URL
-              value: "https://api.your-domain.com"
+              value: "https://api.logisticopilot.com"
           resources:
             requests:
-              memory: "128Mi"
+              memory: "256Mi"
               cpu: "100m"
             limits:
-              memory: "256Mi"
+              memory: "512Mi"
               cpu: "500m"
 ---
 apiVersion: v1

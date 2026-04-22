@@ -51,6 +51,44 @@ SECTIONS: list[tuple[str, list[str]]] = [
         ["clean", "clean-docker"],
     ),
     (
+        "Kubernetes — деплой (production)",
+        [
+            "k8s-vars",
+            "k8s-context",
+            "k8s-buildx-backend",
+            "k8s-buildx-frontend",
+            "k8s-buildx-all",
+            "k8s-release",
+            "k8s-apply-namespace",
+            "k8s-apply-secrets",
+            "k8s-apply-config",
+            "k8s-apply-databases",
+            "k8s-apply-app",
+            "k8s-apply-ingress",
+            "k8s-apply-letsencrypt-issuer",
+            "k8s-apply-base",
+            "k8s-apply-full",
+            "k8s-apply-dry-run",
+            "k8s-secret-from-env",
+            "k8s-rollout-restart",
+            "k8s-rollout-restart-backend",
+            "k8s-rollout-restart-frontend",
+            "k8s-status",
+            "k8s-get",
+            "k8s-logs-backend",
+            "k8s-logs-frontend",
+            "k8s-describe-backend",
+            "k8s-events",
+            "k8s-certificates",
+            "k8s-port-forward-backend",
+            "k8s-do-kubeconfig",
+            "k8s-helm-cert-manager",
+            "k8s-helm-ingress-nginx",
+            "k8s-bootstrap-infra",
+            "k8s-ship-images",
+        ],
+    ),
+    (
         "Справка",
         ["help"],
     ),
@@ -103,6 +141,7 @@ def print_footer() -> None:
     print(f"    {CYAN}PYTHON=…{RESET}    интерпретатор (если есть — {DIM}backend/.venv/bin/python{RESET})")
     print(f"    {CYAN}COMPOSE=…{RESET}    команда compose, если не {DIM}docker compose{RESET}")
     print(f"    {CYAN}V=1{RESET}          показывать команды shell в рецептах")
+    print(f"    {CYAN}K8S_NS{RESET} / {CYAN}TAG{RESET} / {CYAN}PLATFORM{RESET}  см. {DIM}make k8s-vars{RESET}")
     print()
 
 

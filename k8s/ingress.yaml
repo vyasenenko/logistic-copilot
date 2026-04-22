@@ -7,17 +7,17 @@ metadata:
     cert-manager.io/cluster-issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-    # SSE support
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
 spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - your-domain.com
-        - api.your-domain.com
+        - logisticopilot.com
+        - www.logisticopilot.com
+        - api.logisticopilot.com
       secretName: agent-tls
   rules:
-    - host: your-domain.com
+    - host: logisticopilot.com
       http:
         paths:
           - path: /
@@ -27,7 +27,17 @@ spec:
                 name: frontend
                 port:
                   number: 3000
-    - host: api.your-domain.com
+    - host: www.logisticopilot.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000
+    - host: api.logisticopilot.com
       http:
         paths:
           - path: /

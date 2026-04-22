@@ -4,17 +4,59 @@ metadata:
   name: agent-config
   namespace: ai-agent
 data:
+  # LLM (non-secret; keys live in Secret)
   PRIMARY_MODEL: "claude-sonnet-4-20250514"
   FALLBACK_MODEL: "gpt-4o-mini"
+  LLM_PROVIDER_ORDER: "deepseek,openai,anthropic"
+  OPENAI_MODEL: "gpt-4o-mini"
+  ANTHROPIC_MODEL: "claude-sonnet-4-20250514"
+  LLM_TEMPERATURE: "0.1"
+  LLM_PRIMARY_MAX_TOKENS: "8192"
+  LLM_FALLBACK_MAX_TOKENS: "4096"
+  DOCUMENT_OCR_PROVIDER_ORDER: "openai,anthropic"
+  DOCUMENT_OCR_TIMEOUT_SECONDS: "45"
+  DOCUMENT_MIN_OCR_CONFIDENCE: "0.55"
+  DOCUMENT_MIN_FIELD_CONFIDENCE: "0.6"
+
   QDRANT_HOST: "qdrant"
   QDRANT_PORT: "6333"
   QDRANT_COLLECTION: "agent_memory"
-  POSTGRES_HOST: "postgres"
-  POSTGRES_PORT: "5432"
-  POSTGRES_DB: "agent_db"
-  POSTGRES_USER: "agent"
+
+  POSTGRES_HOST: "db-postgresql-nyc3-41741-do-user-17472991-0.m.db.ondigitalocean.com"
+  POSTGRES_PORT: "25061"
+  POSTGRES_DB: "LogistiCopilot"
+  POSTGRES_USER: "doadmin"
+  POSTGRES_SSL: "true"
+  # DO managed Postgres: verify often needs their CA file; until mounted, skip_verify keeps TLS on.
+  POSTGRES_SSL_SKIP_VERIFY: "true"
+
   BACKEND_HOST: "0.0.0.0"
   BACKEND_PORT: "8000"
-  BACKEND_CORS_ORIGINS: "https://your-domain.com"
+  BACKEND_CORS_ORIGINS: "https://logisticopilot.com,https://www.logisticopilot.com"
+  CORS_ALLOW_CHROME_EXTENSIONS: "false"
+
   LANGCHAIN_TRACING_V2: "true"
-  LANGCHAIN_PROJECT: "ai-agent"
+  LANGCHAIN_PROJECT: "logistic-copilot"
+
+  # DigitalOcean Spaces (S3 API vs public object URLs)
+  S3_ENDPOINT_URL: "https://sfo3.digitaloceanspaces.com"
+  S3_BUCKET: "logisticopilot"
+  S3_PUBLIC_URL: "https://logisticopilot.sfo3.digitaloceanspaces.com"
+
+  MICROSOFT_TENANT_ID: "d6381e9d-dd41-487d-b3c7-37aa1deac51c"
+  MICROSOFT_CLIENT_ID: "40d87d89-ff56-4d00-9e4f-10c365fb33cc"
+  MICROSOFT_MAILBOX: "vyasenenko@logisticopilot.com"
+  MICROSOFT_GRAPH_BASE_URL: "https://graph.microsoft.com/v1.0"
+  MICROSOFT_WEBHOOK_PUBLIC_BASE_URL: "https://api.logisticopilot.com"
+  MICROSOFT_WEBHOOK_CLIENT_STATE: "logistic-copilot-outlook-webhook"
+  MICROSOFT_WEBHOOK_STARTUP_DELAY_SECONDS: "8"
+
+  TMS_BASE_URL: "REPLACE_TMS_BASE_URL"
+  TMS_TIMEOUT_SECONDS: "30"
+  TMS_RETRY_ATTEMPTS: "2"
+
+  QUOTE_WAIT_MINUTES_DEFAULT: "20"
+  PROFIT_MARGIN_PERCENT_DEFAULT: "15"
+  PROFIT_MARGIN_FLOOR_DEFAULT: "0"
+  STATUS_SLA_HOURS_DEFAULT: "24"
+  DOCUMENT_BOOKING_POLICY_DEFAULT: "review_required"

@@ -33,8 +33,8 @@ def _build_outreach_body(shipment: Shipment, custom_message: str | None = None) 
         f"Weight (lb): {shipment.weight_lb if shipment.weight_lb is not None else 'TBD'}",
         f"Equipment: {shipment.equipment_type or 'TBD'}",
         (
-            f"Ready at: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
-            if shipment.ready_at
+            f"Ready at: {format_ready_at_wall_display(shipment.ready_at_local, shipment.ready_at_timezone)}"
+            if shipment.ready_at_local
             else "Ready at: TBD"
         ),
     ]

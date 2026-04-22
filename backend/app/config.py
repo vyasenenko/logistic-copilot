@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     postgres_db: str = "agent_db"
     postgres_user: str = "agent"
     postgres_password: str = "changeme_in_production"
+    # Managed Postgres (e.g. DigitalOcean) often requires TLS; set POSTGRES_SSL=true in K8s/production.
+    postgres_ssl: bool = False
+    # Optional path to CA bundle (e.g. DO managed DB "CA certificate" file mounted in the container).
+    postgres_ssl_ca_file: str = ""
+    # If true with postgres_ssl: use TLS but skip certificate verification (encrypts only).
+    # Prefer postgres_ssl_ca_file with DO's CA cert in production when possible.
+    postgres_ssl_skip_verify: bool = False
 
     # Backend
     backend_host: str = "0.0.0.0"

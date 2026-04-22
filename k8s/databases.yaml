@@ -1,67 +1,5 @@
-# --- PostgreSQL ---
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: postgres
-  namespace: ai-agent
-spec:
-  serviceName: postgres
-  replicas: 1
-  selector:
-    matchLabels:
-      app: postgres
-  template:
-    metadata:
-      labels:
-        app: postgres
-    spec:
-      containers:
-        - name: postgres
-          image: postgres:16-alpine
-          ports:
-            - containerPort: 5432
-          env:
-            - name: POSTGRES_DB
-              value: agent_db
-            - name: POSTGRES_USER
-              value: agent
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: agent-secrets
-                  key: POSTGRES_PASSWORD
-          volumeMounts:
-            - name: postgres-data
-              mountPath: /var/lib/postgresql/data
-          resources:
-            requests:
-              memory: "256Mi"
-              cpu: "250m"
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
-  volumeClaimTemplates:
-    - metadata:
-        name: postgres-data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 5Gi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: postgres
-  namespace: ai-agent
-spec:
-  selector:
-    app: postgres
-  ports:
-    - port: 5432
-      targetPort: 5432
----
-# --- Qdrant ---
+# Qdrant runs in-cluster. PostgreSQL is expected to be a managed / external database;
+# set POSTGRES_HOST and credentials in k8s/configmap.yaml and k8s/secrets.yaml.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -89,8 +27,8 @@ spec:
               mountPath: /qdrant/storage
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "250m"
+              memory: "128Mi"
+              cpu: "100m"
             limits:
               memory: "1Gi"
               cpu: "500m"

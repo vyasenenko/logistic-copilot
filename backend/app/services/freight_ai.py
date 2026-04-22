@@ -2,30 +2,36 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from json import JSONDecodeError, loads
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from typing import TypeVar
+from typing import Any, TypeVar, get_origin
 
 from app.agent.llm import try_get_primary_llm
-from app.services.location_timezone import infer_shipment_timezone
+from app.services.location_timezone import (
+    infer_delivery_timezone,
+    infer_shipment_timezone,
+    normalize_route_datetime_fields,
+)
 from app.schemas import (
     CarrierBidExtractionResult,
     CarrierStatusUpdateExtractionResult,
     IntentResult,
+    ShipmentFieldExtractionResult,
     ShipmentExtractionResult,
     StatusRequestExtractionResult,
 )
 
-TStructured = TypeVar("TStructured", IntentResult, ShipmentExtractionResult, CarrierBidExtractionResult, StatusRequestExtractionResult, CarrierStatusUpdateExtractionResult)
+TStructured = TypeVar("TStructured", IntentResult, ShipmentExtractionResult, ShipmentFieldExtractionResult, CarrierBidExtractionResult, StatusRequestExtractionResult, CarrierStatusUpdateExtractionResult)
+logger = logging.getLogger(__name__)
 
 ROUTE_FROM_TO_PATTERN = re.compile(
-    r"(?:from\s+(?P<origin>.+?)\s+to\s+(?P<destination>.+?))(?:\s|$|,|\.)",
+    r"(?:from\s+(?P<origin>[A-Za-z][A-Za-z .,-]{1,60}?)\s+to\s+(?P<destination>[A-Za-z][A-Za-z .,-]{1,60}?))(?=(?:\s+(?:today|tomorrow|tmrw|tmr|on|at|by|for|weight|equipment|ready|pickup|delivery|please|quote|pallets?|lbs?|lb|kg|kgs)\b)|$|\n|\.)",
     re.IGNORECASE,
 )
 ROUTE_ARROW_PATTERN = re.compile(
-    r"(?P<origin>[A-Za-z][A-Za-z .-]{1,40}?)\s*(?:->|to)\s*(?P<destination>[A-Za-z][A-Za-z .-]{1,40})(?:\s|$|,|\.)",
+    r"(?P<origin>[A-Za-z][A-Za-z .,-]{1,60}?)\s*(?:->|to)\s*(?P<destination>[A-Za-z][A-Za-z .,-]{1,60}?)(?=(?:\s+(?:today|tomorrow|tmrw|tmr|on|at|by|for|weight|equipment|ready|pickup|delivery|please|quote|pallets?|lbs?|lb|kg|kgs)\b)|$|\n|\.)",
     re.IGNORECASE,
 )
 PALLETS_PATTERN = re.compile(r"(\d{1,3})\s*(?:pallets?|plts?)", re.IGNORECASE)
@@ -136,6 +142,22 @@ def _extract_json_object(raw_text: str) -> dict:
     return parsed
 
 
+def _normalize_payload_for_schema(schema: type[TStructured], payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    for field_name, field_info in schema.model_fields.items():
+        if field_name not in normalized:
+            continue
+        if normalized[field_name] is not None:
+            continue
+        annotation = field_info.annotation
+        origin = get_origin(annotation)
+        if origin is list:
+            normalized[field_name] = []
+        elif origin is dict:
+            normalized[field_name] = {}
+    return normalized
+
+
 async def _invoke_structured_with_fallback(
     *,
     llm,
@@ -165,7 +187,7 @@ async def _invoke_structured_with_fallback(
         "Use null for unknown scalar fields, [] for unknown list fields, and preserve the requested schema keys."
     )
     message = await llm.ainvoke(fallback_prompt)
-    payload = _extract_json_object(_extract_message_text(message))
+    payload = _normalize_payload_for_schema(schema, _extract_json_object(_extract_message_text(message)))
     return schema.model_validate(payload)
 
 
@@ -207,9 +229,7 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
             schema=IntentResult,
             prompt=prompt,
         )
-        if result.confidence < heuristics.confidence:
-            return heuristics
-        return result
+        return _merge_intent_results(result, heuristics)
     except Exception:
         return heuristics
 
@@ -225,9 +245,10 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
         prompt = (
             "Extract structured freight shipment data from the email. "
             "Use intent new_quote_request. Populate origin, destination, pallets, "
-            "weight_lb, equipment_type, ready_at, notes, missing_fields, ambiguity_reasons and confidence. "
-            "For ready_at output a local pickup-ready date/time without timezone suffix (naive civil time); "
-            "do not apply UTC offsets or Z in ready_at — timezone is inferred later from origin/destination. "
+            "weight_lb, equipment_type, ready_at, ready_at_local_text, delivery_at, delivery_at_local_text, notes, missing_fields, ambiguity_reasons and confidence. "
+            "Use ready_at_local_text for pickup-ready local civil time and delivery_at_local_text for delivery appointment/dropoff local civil time when present. "
+            "If you already know a precise absolute timestamp, you may also populate ready_at or delivery_at. "
+            "Prefer concise datetime strings like YYYY-MM-DDTHH:MM:SS for local text fields when possible. "
             "If a field is absent, leave it null and include it in missing_fields when critical. "
             "If the email suggests multiple routes, conflicting details, or attachment-only details, add ambiguity_reasons.\n\n"
             f"{_context_blob(email_context)}"
@@ -240,6 +261,60 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
         return _merge_shipment_results(result, heuristics)
     except Exception:
         return heuristics
+
+
+async def extract_shipment_field_from_thread(field: str, thread_context: dict) -> ShipmentFieldExtractionResult:
+    """Extract one shipment field from a filtered customer-facing thread transcript."""
+    llm = _choose_llm()
+    fallback = ShipmentFieldExtractionResult(field=field, value_local_text=None, confidence=0.0)
+    if llm is None:
+        logger.warning("magic_fill.ai.no_llm field=%s", field)
+        return fallback
+
+    transcript = thread_context.get("thread_transcript", "")
+    if not isinstance(transcript, str) or not transcript.strip():
+        logger.warning("magic_fill.ai.empty_transcript field=%s", field)
+        return fallback
+
+    try:
+        logger.info(
+            "magic_fill.ai.start field=%s customer_email=%s transcript_chars=%s",
+            field,
+            thread_context.get("customer_email", ""),
+            len(transcript),
+        )
+        prompt = (
+            "You extract one freight shipment field from a customer email thread. "
+            "Return only the requested field. "
+            "For field ready_at_local, find the customer-confirmed pickup-ready time. "
+            "Prefer the latest clear customer-provided pickup-ready time. "
+            "Return value_local_text as a strict local datetime string in YYYY-MM-DDTHH:MM format when possible. "
+            "If the thread is ambiguous, conflicting, or the time is not clear enough, keep value_local_text null and explain ambiguity_reasons. "
+            "Do not infer a timezone. Do not return UTC. Do not return extra fields outside the schema.\n\n"
+            f"field: {field}\n"
+            f"origin: {thread_context.get('origin', '')}\n"
+            f"destination: {thread_context.get('destination', '')}\n"
+            f"quote_token: {thread_context.get('quote_token', '')}\n"
+            f"thread_subject: {thread_context.get('thread_subject', '')}\n"
+            f"customer_email: {thread_context.get('customer_email', '')}\n"
+            f"thread_transcript:\n{transcript}"
+        )
+        result = await _invoke_structured_with_fallback(
+            llm=llm,
+            schema=ShipmentFieldExtractionResult,
+            prompt=prompt,
+        )
+        logger.info(
+            "magic_fill.ai.result field=%s confidence=%s value_local_text=%s ambiguity_reasons=%s",
+            field,
+            result.confidence,
+            result.value_local_text,
+            result.ambiguity_reasons,
+        )
+        return result
+    except Exception:
+        logger.exception("magic_fill.ai.failed field=%s", field)
+        return fallback
 
 
 async def extract_carrier_bid(email_context: dict) -> CarrierBidExtractionResult:
@@ -286,9 +361,7 @@ async def extract_status_request(email_context: dict) -> StatusRequestExtraction
             schema=StatusRequestExtractionResult,
             prompt=prompt,
         )
-        if result.confidence < heuristics.confidence:
-            return heuristics
-        return result
+        return _merge_status_request_results(result, heuristics)
     except Exception:
         return heuristics
 
@@ -355,6 +428,7 @@ def _extract_shipment_with_heuristics(email_context: dict) -> ShipmentExtraction
     weight_value = _extract_weight_lb(text)
     equipment_value = _extract_equipment(text)
     ready_at = _extract_ready_at(text)
+    delivery_at = _extract_delivery_at(text)
     missing_fields: list[str] = []
     ambiguity_reasons = _shipment_ambiguity_reasons(text, origin, destination)
 
@@ -382,7 +456,8 @@ def _extract_shipment_with_heuristics(email_context: dict) -> ShipmentExtraction
         weight_lb=weight_value,
         equipment_type=equipment_value,
         ready_at=ready_at,
-        notes=email_context.get("body_preview", ""),
+        delivery_at=delivery_at,
+        notes="",
         missing_fields=missing_fields,
         ambiguity_reasons=ambiguity_reasons,
         confidence=max(0.2, min(confidence - min(len(ambiguity_reasons) * 0.08, 0.25), 0.9)),
@@ -424,6 +499,14 @@ def _merge_shipment_results(
         primary.weight_lb = fallback.weight_lb
     if primary.equipment_type is None:
         primary.equipment_type = fallback.equipment_type
+    if primary.ready_at is None:
+        primary.ready_at = fallback.ready_at
+    if primary.delivery_at is None:
+        primary.delivery_at = fallback.delivery_at
+    if not primary.ready_at_local_text:
+        primary.ready_at_local_text = fallback.ready_at_local_text
+    if not primary.delivery_at_local_text:
+        primary.delivery_at_local_text = fallback.delivery_at_local_text
     if not primary.notes:
         primary.notes = fallback.notes
     primary.missing_fields = list(dict.fromkeys(primary.missing_fields + fallback.missing_fields))
@@ -435,20 +518,77 @@ def _merge_shipment_results(
     primary.destination = _normalize_location(primary.destination)
     primary.equipment_type = _normalize_equipment(primary.equipment_type)
     primary.weight_lb = _normalize_weight_lb(primary.weight_lb)
-    inferred_timezone = infer_shipment_timezone(primary.origin, primary.destination)
-    if primary.ready_at:
-        if primary.ready_at.tzinfo is not None:
-            if inferred_timezone:
-                primary.ready_at = primary.ready_at.astimezone(
-                    ZoneInfo(inferred_timezone)
-                ).replace(tzinfo=None)
-            else:
-                primary.ready_at = primary.ready_at.astimezone(timezone.utc).replace(tzinfo=None)
-                if "ready_at_timezone_unresolved" not in primary.ambiguity_reasons:
-                    primary.ambiguity_reasons.append("ready_at_timezone_unresolved")
-        elif inferred_timezone is None:
-            if "ready_at_timezone_unresolved" not in primary.ambiguity_reasons:
-                primary.ambiguity_reasons.append("ready_at_timezone_unresolved")
+    primary.notes = _normalize_shipment_notes(primary.notes)
+    primary.ready_at = _normalize_schedule_candidate(
+        utc_value=primary.ready_at,
+        local_text=primary.ready_at_local_text,
+        timezone_name=infer_shipment_timezone(primary.origin, primary.destination),
+        ambiguity_reasons=primary.ambiguity_reasons,
+        ambiguity_key="ready_at_timezone_unresolved",
+    )
+    primary.delivery_at = _normalize_schedule_candidate(
+        utc_value=primary.delivery_at,
+        local_text=primary.delivery_at_local_text,
+        timezone_name=infer_delivery_timezone(primary.origin, primary.destination),
+        ambiguity_reasons=primary.ambiguity_reasons,
+        ambiguity_key="delivery_at_timezone_unresolved",
+    )
+    return primary
+
+
+def _merge_intent_results(
+    primary: IntentResult,
+    fallback: IntentResult,
+) -> IntentResult:
+    primary_intent = (primary.intent or "").strip()
+    fallback_intent = (fallback.intent or "").strip()
+    if not primary_intent:
+        primary.intent = fallback_intent or "noise_or_unhandled"
+        primary.confidence = fallback.confidence
+        return primary
+    # AI remains source of truth. Heuristics only rescue obviously weak/noisy outputs.
+    if (
+        primary_intent == "noise_or_unhandled"
+        and fallback_intent
+        and fallback_intent != "noise_or_unhandled"
+        and primary.confidence < 0.45
+        and fallback.confidence >= 0.6
+    ):
+        return fallback
+    primary.confidence = max(primary.confidence, min(fallback.confidence, 0.74))
+    return primary
+
+
+def _normalize_shipment_notes(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"\r\n?", "\n", value).strip()
+    if not cleaned:
+        return None
+
+    lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
+    lowered = cleaned.lower()
+    if len(lines) > 4:
+        return None
+    if len(cleaned) > 180:
+        return None
+    if any(token in lowered for token in ("thanks", "thank you", "best,", "regards,", "sincerely,", "hi ", "hello ")):
+        return None
+
+    return cleaned
+
+
+def _merge_status_request_results(
+    primary: StatusRequestExtractionResult,
+    fallback: StatusRequestExtractionResult,
+) -> StatusRequestExtractionResult:
+    if not primary.request_type:
+        primary.request_type = fallback.request_type
+    if not primary.requested_fields:
+        primary.requested_fields = fallback.requested_fields
+    if not primary.notes:
+        primary.notes = fallback.notes
+    primary.confidence = max(primary.confidence, min(fallback.confidence, 0.72))
     return primary
 
 
@@ -562,6 +702,11 @@ def _normalize_location(value: str | None) -> str | None:
         return alias
     if len(cleaned) <= 2:
         return None
+    state_match = re.match(r"^(?P<city>.+?),\s*(?P<state>[A-Za-z]{2})$", cleaned)
+    if state_match:
+        city = state_match.group("city").title()
+        state = state_match.group("state").upper()
+        return f"{city}, {state}"
     return cleaned.title()
 
 
@@ -611,6 +756,90 @@ def _extract_ready_at(text: str) -> datetime | None:
     ready = _apply_day_token(base, day_token)
     hour, minute = _parse_time_token(time_token)
     return ready.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _extract_delivery_at(text: str) -> datetime | None:
+    delivery_match = re.search(
+        r"(?:delivery|deliver|drop(?:off)?|appointment|appt)[^.\n]{0,80}",
+        text,
+        re.IGNORECASE,
+    )
+    if not delivery_match:
+        return None
+    return _parse_local_datetime_candidate(delivery_match.group(0))
+
+
+def _parse_local_datetime_candidate(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    month_match = re.search(
+        r"\b(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+"
+        r"(?P<day>\d{1,2})(?:,?\s*(?P<year>\d{4}))?(?:[^0-9A-Za-z]+(?:at\s+)?)?(?P<time>\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?",
+        text,
+        re.IGNORECASE,
+    )
+    if month_match:
+        months = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        month_key = month_match.group("month")[:3].lower()
+        month = months[month_key]
+        day = int(month_match.group("day"))
+        year = int(month_match.group("year") or datetime.now(timezone.utc).year)
+        hour, minute = _parse_time_token((month_match.group("time") or "").strip())
+        try:
+            return datetime(year, month, day, hour, minute)
+        except ValueError:
+            return None
+
+    relative_match = re.search(
+        r"\b(today|tomorrow|tmrw|tmr|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+at|\s+by)?\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?",
+        text,
+        re.IGNORECASE,
+    )
+    if relative_match:
+        base = datetime.utcnow().replace(tzinfo=None)
+        target = _apply_day_token(base, relative_match.group(1).lower())
+        hour, minute = _parse_time_token((relative_match.group(2) or "").strip())
+        return target.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    return None
+
+
+def _normalize_schedule_candidate(
+    *,
+    utc_value: datetime | None,
+    local_text: str | None,
+    timezone_name: str | None,
+    ambiguity_reasons: list[str],
+    ambiguity_key: str,
+) -> datetime | None:
+    local_candidate = _parse_local_datetime_candidate(local_text)
+    effective_local = (
+        local_candidate
+        if local_candidate is not None
+        else (utc_value if utc_value is not None and utc_value.tzinfo is None else None)
+    )
+    effective_utc = utc_value if utc_value is not None and utc_value.tzinfo is not None else None
+    normalized_utc, normalized_local, _, _ = normalize_route_datetime_fields(
+        utc_value=effective_utc,
+        local_value=effective_local,
+        timezone_name=timezone_name,
+    )
+    if normalized_local is not None and normalized_utc is None and timezone_name is None:
+        if ambiguity_key not in ambiguity_reasons:
+            ambiguity_reasons.append(ambiguity_key)
+    return normalized_utc or normalized_local
 
 
 def _apply_day_token(base: datetime, token: str) -> datetime:

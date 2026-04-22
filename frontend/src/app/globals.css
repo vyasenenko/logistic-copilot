@@ -121,6 +121,17 @@ body {
     opacity: 1;
   }
 
+  .datetime-native-input::-webkit-calendar-picker-indicator {
+    filter: invert(1) brightness(1.6) contrast(1.15);
+    opacity: 1;
+  }
+
+  .datetime-native-input::-webkit-clear-button,
+  .datetime-native-input::-webkit-inner-spin-button {
+    filter: invert(1) brightness(1.4);
+    opacity: 1;
+  }
+
   .action-button {
     @apply inline-flex items-center justify-center rounded-2xl px-4 py-3 text-sm font-medium transition;
   }

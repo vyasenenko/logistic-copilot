@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 import html
+import logging
 import re
 from uuid import UUID
 
@@ -66,6 +67,9 @@ from app.schemas import (
     ShipmentOperatorActionRequest,
     ShipmentOperatorActionResponse,
     ShipmentDocumentRecord,
+    ShipmentMagicField,
+    ShipmentMagicFillRequest,
+    ShipmentMagicFillResponse,
     TmsHandoffRequest,
     TmsHandoffResponse,
     TmsStatusIngestRequest,
@@ -96,12 +100,12 @@ from app.services.freight_inbox_agent import (
     evaluate_expired_quote_windows,
     run_freight_inbox_orchestrator,
 )
-from app.services.freight_ai import extract_carrier_status_update
+from app.services.freight_ai import extract_carrier_status_update, extract_shipment_field_from_thread
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import (
-    apply_shipment_ready_at_wall_fields,
-    infer_shipment_timezone,
-    offset_minutes_for_local_naive,
+    format_route_datetime_display,
+    normalize_delivery_datetime_fields,
+    normalize_pickup_datetime_fields,
 )
 from app.services.workflow_event_codec import workflow_event_to_record
 from app.services.freight_outreach import create_carrier_outreach
@@ -110,6 +114,7 @@ from app.services.outlook import OutlookGraphClient
 from app.services.freight_read import build_freight_overview, is_status_stale as _is_status_stale
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _shipment_matches_month_filter(
@@ -119,7 +124,7 @@ def _shipment_matches_month_filter(
 ) -> bool:
     if not month:
         return True
-    reference = shipment.ready_at or shipment.created_at
+    reference = shipment.ready_at_local or shipment.created_at
     if reference is None:
         return False
     return reference.strftime("%Y-%m") == month
@@ -171,6 +176,51 @@ def _serialize_thread_message(message: EmailMessage) -> ShipmentThreadMessageRec
         display_body=_message_display_body(message),
         has_raw_payload=bool(message.raw_payload_json),
     )
+
+
+def _parse_magic_local_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.replace(tzinfo=None)
+    return parsed
+
+
+def _message_touches_email(message: EmailMessage, email: str) -> bool:
+    email_lc = email.strip().lower()
+    if not email_lc:
+        return False
+    if (message.sender or "").strip().lower() == email_lc:
+        return True
+    recipients = [str(recipient).strip().lower() for recipient in (message.recipients_json or [])]
+    return email_lc in recipients
+
+
+def _build_magic_thread_transcript(messages: list[EmailMessage]) -> str:
+    lines: list[str] = []
+    for message in messages:
+        display_body = _message_display_body(message) or (message.body_preview or "")
+        direction = (message.direction or "unknown").upper()
+        timestamp = message.received_at.isoformat() if message.received_at else ""
+        recipients = ", ".join(message.recipients_json or [])
+        lines.extend(
+            [
+                f"[{direction}] {timestamp}",
+                f"From: {message.sender}",
+                f"To: {recipients}",
+                f"Subject: {message.subject}",
+                display_body.strip(),
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
 
 
 def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
@@ -348,16 +398,17 @@ def _serialize_carrier(carrier: Carrier) -> CarrierRecord:
 
 def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> ShipmentRecord:
     ai_payload = ai_payload or {}
-    inferred_timezone = infer_shipment_timezone(shipment.origin, shipment.destination)
-    timezone_name = shipment.ready_at_timezone or inferred_timezone
-    ready_offset = (
-        shipment.ready_at_offset_minutes
-        if shipment.ready_at_offset_minutes is not None
-        else (
-            offset_minutes_for_local_naive(timezone_name, shipment.ready_at)
-            if timezone_name and shipment.ready_at is not None
-            else None
-        )
+    ready_at, ready_at_local, ready_timezone_name, ready_offset = normalize_pickup_datetime_fields(
+        ready_at=shipment.ready_at,
+        ready_at_local=shipment.ready_at_local,
+        origin=shipment.origin,
+        destination=shipment.destination,
+    )
+    delivery_at, delivery_at_local, delivery_timezone_name, delivery_offset = normalize_delivery_datetime_fields(
+        delivery_at=shipment.delivery_at,
+        delivery_at_local=shipment.delivery_at_local,
+        origin=shipment.origin,
+        destination=shipment.destination,
     )
     ai_missing_fields = list(ai_payload.get("missing_fields", []) or [])
     ai_ambiguity_reasons = list(ai_payload.get("ambiguity_reasons", []) or [])
@@ -386,9 +437,16 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         pallets=shipment.pallets,
         weight_lb=shipment.weight_lb,
         equipment_type=shipment.equipment_type,
-        ready_at=shipment.ready_at,
-        ready_at_timezone=timezone_name,
+        ready_at=ready_at,
+        ready_at_local=ready_at_local,
+        ready_at_display=format_route_datetime_display(ready_at_local, ready_timezone_name) if ready_at_local else None,
+        ready_at_timezone=ready_timezone_name,
         ready_at_offset_minutes=ready_offset,
+        delivery_at=delivery_at,
+        delivery_at_local=delivery_at_local,
+        delivery_at_display=format_route_datetime_display(delivery_at_local, delivery_timezone_name) if delivery_at_local else None,
+        delivery_at_timezone=delivery_timezone_name,
+        delivery_at_offset_minutes=delivery_offset,
         margin_policy=dict(shipment.margin_policy_json or {}),
         notes=shipment.notes,
         ai_intent=ai_payload.get("intent"),
@@ -521,16 +579,28 @@ def _derive_attention_projection(
     return ("none", None, "normal")
 
 
-def _normalize_shipment_ready_at_timezone_fields(shipment: Shipment) -> None:
-    """Persist naive local ready_at plus IANA zone and offset metadata (no shifting wall-clock time)."""
-    wall, tz, off = apply_shipment_ready_at_wall_fields(
+def _normalize_shipment_schedule_fields(shipment: Shipment) -> None:
+    """Persist canonical UTC + local schedule fields for pickup and delivery."""
+    ready_at, ready_at_local, ready_tz, ready_off = normalize_pickup_datetime_fields(
         ready_at=shipment.ready_at,
+        ready_at_local=shipment.ready_at_local,
         origin=shipment.origin,
         destination=shipment.destination,
     )
-    shipment.ready_at = wall
-    shipment.ready_at_timezone = tz
-    shipment.ready_at_offset_minutes = off
+    shipment.ready_at = ready_at
+    shipment.ready_at_local = ready_at_local
+    shipment.ready_at_timezone = ready_tz
+    shipment.ready_at_offset_minutes = ready_off
+    delivery_at, delivery_at_local, delivery_tz, delivery_off = normalize_delivery_datetime_fields(
+        delivery_at=shipment.delivery_at,
+        delivery_at_local=shipment.delivery_at_local,
+        origin=shipment.origin,
+        destination=shipment.destination,
+    )
+    shipment.delivery_at = delivery_at
+    shipment.delivery_at_local = delivery_at_local
+    shipment.delivery_at_timezone = delivery_tz
+    shipment.delivery_at_offset_minutes = delivery_off
 
 
 async def _archive_shipment_and_optionally_suppress_source(
@@ -1835,11 +1905,14 @@ async def create_shipment(
         pallets=request.pallets,
         weight_lb=request.weight_lb,
         equipment_type=request.equipment_type,
-        ready_at=request.ready_at,
+        ready_at=request.ready_at if request.ready_at and request.ready_at.tzinfo else None,
+        ready_at_local=request.ready_at_local or (request.ready_at if request.ready_at and request.ready_at.tzinfo is None else None),
+        delivery_at=request.delivery_at if request.delivery_at and request.delivery_at.tzinfo else None,
+        delivery_at_local=request.delivery_at_local or (request.delivery_at if request.delivery_at and request.delivery_at.tzinfo is None else None),
         margin_policy_json=(request.margin_policy.model_dump() if request.margin_policy else {}),
         notes=request.notes,
     )
-    _normalize_shipment_ready_at_timezone_fields(shipment)
+    _normalize_shipment_schedule_fields(shipment)
     session.add(shipment)
     await session.commit()
     await session.refresh(shipment)
@@ -1946,6 +2019,153 @@ async def get_shipment_thread(
     )
 
 
+@router.post("/freight/shipments/{shipment_id}/magic-fill", response_model=ShipmentMagicFillResponse)
+async def magic_fill_shipment_field(
+    shipment_id: UUID,
+    request: ShipmentMagicFillRequest,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentMagicFillResponse:
+    """Use AI to recover one shipment field from the linked customer thread."""
+    logger.info("magic_fill.request shipment_id=%s field=%s apply_value=%s", shipment_id, request.field.value, request.apply_value)
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        logger.warning("magic_fill.shipment_not_found shipment_id=%s", shipment_id)
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    if shipment.email_thread_id is None:
+        logger.warning("magic_fill.no_thread shipment_id=%s", shipment_id)
+        raise HTTPException(status_code=400, detail="Shipment has no linked email thread.")
+    if shipment.client_id is None:
+        logger.warning("magic_fill.no_client shipment_id=%s", shipment_id)
+        raise HTTPException(status_code=400, detail="Shipment has no linked customer.")
+
+    client = await session.get(Client, shipment.client_id)
+    if client is None:
+        logger.warning("magic_fill.linked_client_not_found shipment_id=%s client_id=%s", shipment_id, shipment.client_id)
+        raise HTTPException(status_code=404, detail="Linked customer not found.")
+
+    result = await session.execute(
+        select(EmailMessage)
+        .where(EmailMessage.thread_id == shipment.email_thread_id)
+        .order_by(EmailMessage.received_at.asc())
+    )
+    all_messages = result.scalars().all()
+    customer_messages = [message for message in all_messages if _message_touches_email(message, client.email)]
+    logger.info(
+        "magic_fill.thread_loaded shipment_id=%s total_messages=%s customer_messages=%s customer_email=%s",
+        shipment_id,
+        len(all_messages),
+        len(customer_messages),
+        client.email,
+    )
+    if not customer_messages:
+        logger.warning("magic_fill.no_customer_messages shipment_id=%s thread_id=%s", shipment_id, shipment.email_thread_id)
+        raise HTTPException(status_code=400, detail="No customer-facing messages found in the linked thread.")
+
+    transcript = _build_magic_thread_transcript(customer_messages[-12:])
+    logger.info(
+        "magic_fill.transcript_ready shipment_id=%s transcript_messages=%s transcript_chars=%s",
+        shipment_id,
+        min(len(customer_messages), 12),
+        len(transcript),
+    )
+    extraction = await extract_shipment_field_from_thread(
+        request.field.value,
+        {
+            "origin": shipment.origin or "",
+            "destination": shipment.destination or "",
+            "quote_token": shipment.quote_token or "",
+            "thread_subject": all_messages[-1].subject if all_messages else "",
+            "customer_email": client.email,
+            "thread_transcript": transcript,
+        },
+    )
+    logger.info(
+        "magic_fill.extraction shipment_id=%s field=%s confidence=%s value_local_text=%s ambiguity_reasons=%s",
+        shipment_id,
+        request.field.value,
+        extraction.confidence,
+        extraction.value_local_text,
+        extraction.ambiguity_reasons,
+    )
+
+    suggested_local = _parse_magic_local_datetime(extraction.value_local_text)
+    logger.info(
+        "magic_fill.normalized shipment_id=%s field=%s suggested_local=%s",
+        shipment_id,
+        request.field.value,
+        suggested_local.isoformat() if suggested_local else None,
+    )
+    if request.field == ShipmentMagicField.READY_AT_LOCAL and request.apply_value and suggested_local is not None:
+        shipment.ready_at_local = suggested_local
+        shipment.ready_at = None
+        shipment.updated_at = datetime.now(timezone.utc)
+        _normalize_shipment_schedule_fields(shipment)
+        logger.info(
+            "magic_fill.applying shipment_id=%s ready_at_local=%s ready_at_utc=%s timezone=%s",
+            shipment_id,
+            shipment.ready_at_local.isoformat() if shipment.ready_at_local else None,
+            shipment.ready_at.isoformat() if shipment.ready_at else None,
+            shipment.ready_at_timezone,
+        )
+
+        evt = WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
+            stage=shipment.status,
+            payload_json={
+                "changed_fields": ["ready_at", "ready_at_local", "ready_at_timezone", "ready_at_offset_minutes"],
+                "edited_by": "magic_fill",
+                "source": "customer_thread_ai",
+                "field": request.field.value,
+                "confidence": extraction.confidence,
+                "suggested_value": extraction.value_local_text,
+                "source_messages": len(customer_messages),
+                "ambiguity_reasons": extraction.ambiguity_reasons,
+            },
+        )
+        session.add(evt)
+        await session.commit()
+        await session.refresh(shipment)
+        await freight_realtime_hub.notify_workflow_event(evt)
+        logger.info("magic_fill.applied shipment_id=%s field=%s", shipment_id, request.field.value)
+        return ShipmentMagicFillResponse(
+            shipment_id=str(shipment.id),
+            field=request.field,
+            status="applied",
+            message="Pickup-ready time extracted from customer thread and applied to shipment.",
+            confidence=extraction.confidence,
+            suggested_value=extraction.value_local_text,
+            ambiguity_reasons=extraction.ambiguity_reasons,
+            source_messages=len(customer_messages),
+            shipment=_serialize_shipment(shipment),
+        )
+
+    status = "no_value"
+    message = "AI could not confidently recover a pickup-ready time from the customer thread."
+    if suggested_local is not None and not request.apply_value:
+        status = "suggested"
+        message = "Pickup-ready time extracted from customer thread."
+    logger.warning(
+        "magic_fill.no_apply shipment_id=%s field=%s status=%s value_local_text=%s",
+        shipment_id,
+        request.field.value,
+        status,
+        extraction.value_local_text,
+    )
+
+    return ShipmentMagicFillResponse(
+        shipment_id=str(shipment.id),
+        field=request.field,
+        status=status,
+        message=message,
+        confidence=extraction.confidence,
+        suggested_value=extraction.value_local_text,
+        ambiguity_reasons=extraction.ambiguity_reasons,
+        source_messages=len(customer_messages),
+        shipment=None,
+    )
+
+
 @router.patch("/freight/shipments/{shipment_id}", response_model=ShipmentRecord)
 async def update_shipment(
     shipment_id: UUID,
@@ -1973,6 +2193,9 @@ async def update_shipment(
         "weight_lb": shipment.weight_lb,
         "equipment_type": shipment.equipment_type,
         "ready_at": shipment.ready_at.isoformat() if shipment.ready_at else None,
+        "ready_at_local": shipment.ready_at_local.isoformat() if shipment.ready_at_local else None,
+        "delivery_at": shipment.delivery_at.isoformat() if shipment.delivery_at else None,
+        "delivery_at_local": shipment.delivery_at_local.isoformat() if shipment.delivery_at_local else None,
         "notes": shipment.notes,
     }
 
@@ -1983,11 +2206,14 @@ async def update_shipment(
     shipment.pallets = request.pallets
     shipment.weight_lb = request.weight_lb
     shipment.equipment_type = request.equipment_type
-    shipment.ready_at = request.ready_at
+    shipment.ready_at = request.ready_at if request.ready_at and request.ready_at.tzinfo else None
+    shipment.ready_at_local = request.ready_at_local or (request.ready_at if request.ready_at and request.ready_at.tzinfo is None else None)
+    shipment.delivery_at = request.delivery_at if request.delivery_at and request.delivery_at.tzinfo else None
+    shipment.delivery_at_local = request.delivery_at_local or (request.delivery_at if request.delivery_at and request.delivery_at.tzinfo is None else None)
     shipment.margin_policy_json = request.margin_policy.model_dump() if request.margin_policy else {}
     shipment.notes = request.notes
     shipment.updated_at = datetime.now(timezone.utc)
-    _normalize_shipment_ready_at_timezone_fields(shipment)
+    _normalize_shipment_schedule_fields(shipment)
 
     current_values = {
         "client_id": str(shipment.client_id) if shipment.client_id else None,
@@ -1998,6 +2224,9 @@ async def update_shipment(
         "weight_lb": shipment.weight_lb,
         "equipment_type": shipment.equipment_type,
         "ready_at": shipment.ready_at.isoformat() if shipment.ready_at else None,
+        "ready_at_local": shipment.ready_at_local.isoformat() if shipment.ready_at_local else None,
+        "delivery_at": shipment.delivery_at.isoformat() if shipment.delivery_at else None,
+        "delivery_at_local": shipment.delivery_at_local.isoformat() if shipment.delivery_at_local else None,
         "notes": shipment.notes,
     }
     changed_fields = [

@@ -38,7 +38,7 @@ from app.services.freight_execution import (
     send_customer_quote,
 )
 from app.services.freight_realtime import freight_realtime_hub
-from app.services.location_timezone import apply_shipment_ready_at_wall_fields
+from app.services.location_timezone import normalize_delivery_datetime_fields, normalize_pickup_datetime_fields
 from app.services.freight_outreach import create_carrier_outreach
 
 CRITICAL_SHIPMENT_FIELDS = {"origin", "destination"}
@@ -336,7 +336,7 @@ async def continue_phase1_workflow(
             ("pallets", shipment.pallets),
             ("weight_lb", shipment.weight_lb),
             ("equipment_type", shipment.equipment_type),
-            ("ready_at", shipment.ready_at),
+            ("ready_at", shipment.ready_at_local or shipment.ready_at),
         )
         if value in (None, "")
     ]
@@ -1067,15 +1067,44 @@ def _apply_shipment_extraction(shipment: Shipment, extraction: ShipmentExtractio
     shipment.pallets = extraction.pallets if extraction.pallets is not None else shipment.pallets
     shipment.weight_lb = extraction.weight_lb if extraction.weight_lb is not None else shipment.weight_lb
     shipment.equipment_type = extraction.equipment_type or shipment.equipment_type
-    shipment.ready_at = extraction.ready_at or shipment.ready_at
-    wall, tz, off = apply_shipment_ready_at_wall_fields(
-        ready_at=shipment.ready_at,
+    extraction_ready_at = extraction.ready_at
+    extraction_delivery_at = extraction.delivery_at
+    pickup_utc, pickup_local, pickup_tz, pickup_off = normalize_pickup_datetime_fields(
+        ready_at=(
+            extraction_ready_at
+            if extraction_ready_at is not None and extraction_ready_at.tzinfo is not None
+            else shipment.ready_at
+        ),
+        ready_at_local=(
+            extraction_ready_at
+            if extraction_ready_at is not None and extraction_ready_at.tzinfo is None
+            else shipment.ready_at_local
+        ),
         origin=shipment.origin,
         destination=shipment.destination,
     )
-    shipment.ready_at = wall
-    shipment.ready_at_timezone = tz
-    shipment.ready_at_offset_minutes = off
+    shipment.ready_at = pickup_utc
+    shipment.ready_at_local = pickup_local
+    shipment.ready_at_timezone = pickup_tz
+    shipment.ready_at_offset_minutes = pickup_off
+    delivery_utc, delivery_local, delivery_tz, delivery_off = normalize_delivery_datetime_fields(
+        delivery_at=(
+            extraction_delivery_at
+            if extraction_delivery_at is not None and extraction_delivery_at.tzinfo is not None
+            else shipment.delivery_at
+        ),
+        delivery_at_local=(
+            extraction_delivery_at
+            if extraction_delivery_at is not None and extraction_delivery_at.tzinfo is None
+            else shipment.delivery_at_local
+        ),
+        origin=shipment.origin,
+        destination=shipment.destination,
+    )
+    shipment.delivery_at = delivery_utc
+    shipment.delivery_at_local = delivery_local
+    shipment.delivery_at_timezone = delivery_tz
+    shipment.delivery_at_offset_minutes = delivery_off
     if extraction.notes:
         shipment.notes = extraction.notes
 

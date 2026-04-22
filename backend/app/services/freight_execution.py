@@ -555,16 +555,27 @@ def _detect_document_conflicts(attachments: list[dict], shipment: Shipment) -> l
                 values.append(str(extracted_fields[field_name]))
         if len(set(values)) > 1:
             conflicts.append(field_name)
-    if shipment.ready_at:
+    if shipment.ready_at_local:
         for attachment in attachments:
             extracted_fields = dict(attachment.get("extracted_fields", {}) or {})
             pickup_date_text = extracted_fields.get("pickup_date_text")
             if isinstance(pickup_date_text, str):
                 ready_date = local_date_iso_in_zone(
-                    shipment.ready_at, shipment.ready_at_timezone
+                    shipment.ready_at_local, shipment.ready_at_timezone
                 )
                 if ready_date not in pickup_date_text:
                     conflicts.append("pickup_date_text")
+                    break
+    if shipment.delivery_at_local:
+        for attachment in attachments:
+            extracted_fields = dict(attachment.get("extracted_fields", {}) or {})
+            delivery_date_text = extracted_fields.get("delivery_date_text")
+            if isinstance(delivery_date_text, str):
+                delivery_date = local_date_iso_in_zone(
+                    shipment.delivery_at_local, shipment.delivery_at_timezone
+                )
+                if delivery_date not in delivery_date_text:
+                    conflicts.append("delivery_date_text")
                     break
     return list(dict.fromkeys(conflicts))
 
@@ -870,9 +881,9 @@ async def send_client_acknowledgement(
         f"Pallets: {shipment.pallets if shipment.pallets is not None else 'TBD'}",
         f"Weight (lb): {shipment.weight_lb if shipment.weight_lb is not None else 'TBD'}",
     ]
-    if shipment.ready_at:
+    if shipment.ready_at_local:
         body_lines.append(
-            f"Requested ready time: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
+            f"Requested ready time: {format_ready_at_wall_display(shipment.ready_at_local, shipment.ready_at_timezone)}"
         )
     if custom_message:
         body_lines.extend(["", custom_message.strip()])
@@ -931,7 +942,11 @@ async def evaluate_shipment_bids(session: AsyncSession, shipment_id: UUID) -> Sh
     result = await session.execute(
         select(CarrierBid, Carrier)
         .join(Carrier, Carrier.id == CarrierBid.carrier_id)
-        .where(CarrierBid.shipment_id == shipment.id, CarrierBid.amount.is_not(None))
+        .where(
+            CarrierBid.shipment_id == shipment.id,
+            CarrierBid.amount.is_not(None),
+            CarrierBid.amount > 0,
+        )
     )
     rows = result.all()
     if not rows:
@@ -1037,6 +1052,8 @@ async def send_customer_quote(
 
     bid, _carrier = await _get_selected_bid(session, shipment, bid_id)
     base_amount = float(bid.amount or 0)
+    if base_amount <= 0:
+        raise RuntimeError("Cannot send customer quote without a positive carrier cost")
     margin_amount = _margin_amount(base_amount, dict(shipment.margin_policy_json or {}))
     final_amount = round(base_amount + margin_amount, 2)
     subject = attach_quote_token(
@@ -1045,13 +1062,11 @@ async def send_customer_quote(
     )
     body_lines = [
         f"We can cover this load for ${final_amount:.2f}.",
-        f"Base carrier cost: ${base_amount:.2f}",
-        f"Margin applied: ${margin_amount:.2f}",
         f"Route: {shipment.origin or 'TBD'} to {shipment.destination or 'TBD'}",
     ]
-    if shipment.ready_at:
+    if shipment.ready_at_local:
         body_lines.append(
-            f"Ready at: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
+            f"Ready at: {format_ready_at_wall_display(shipment.ready_at_local, shipment.ready_at_timezone)}"
         )
     if custom_message:
         body_lines.extend(["", custom_message.strip()])
@@ -1164,9 +1179,9 @@ async def handoff_to_tms(
             "weight_lb": shipment.weight_lb,
             "equipment_type": shipment.equipment_type,
             "ready_at": format_ready_at_wall_display(
-                shipment.ready_at, shipment.ready_at_timezone
+                shipment.ready_at_local, shipment.ready_at_timezone
             )
-            if shipment.ready_at
+            if shipment.ready_at_local
             else None,
         },
         "bid": {
@@ -1346,9 +1361,9 @@ async def send_booking_confirmation(
         f"Pallets: {shipment.pallets if shipment.pallets is not None else 'TBD'}",
         f"Weight (lb): {shipment.weight_lb if shipment.weight_lb is not None else 'TBD'}",
     ]
-    if shipment.ready_at:
+    if shipment.ready_at_local:
         body_lines.append(
-            f"Scheduled ready time: {format_ready_at_wall_display(shipment.ready_at, shipment.ready_at_timezone)}"
+            f"Scheduled ready time: {format_ready_at_wall_display(shipment.ready_at_local, shipment.ready_at_timezone)}"
         )
     if custom_message:
         body_lines.extend(["", custom_message.strip()])

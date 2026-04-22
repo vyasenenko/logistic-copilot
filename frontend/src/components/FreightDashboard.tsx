@@ -3,6 +3,7 @@
 import { startTransition, useEffect, useMemo, useState } from "react";
 
 import { useFreightSocket } from "@/hooks/useFreightSocket";
+import { DateTimePickerField } from "@/components/DateTimePickerField";
 import {
   AlertTriangle,
   ArrowRight,
@@ -93,6 +94,13 @@ interface ShipmentRecord {
   weight_lb: number | null;
   equipment_type: string | null;
   ready_at: string | null;
+  ready_at_local: string | null;
+  ready_at_display: string | null;
+  delivery_at: string | null;
+  delivery_at_local: string | null;
+  delivery_at_display: string | null;
+  delivery_at_timezone: string | null;
+  delivery_at_offset_minutes: number | null;
   margin_policy: Record<string, number>;
   notes: string;
   ai_intent: string | null;
@@ -466,6 +474,12 @@ function formatDate(value: string | null) {
   }).format(new Date(value));
 }
 
+function formatShipmentSchedule(displayValue: string | null, localValue: string | null) {
+  if (displayValue) return displayValue;
+  if (!localValue) return "Not scheduled";
+  return localValue.replace("T", " ").slice(0, 16);
+}
+
 function formatAge(value: string | null) {
   if (!value) return "No status activity yet";
   const diffMs = Date.now() - new Date(value).getTime();
@@ -569,6 +583,7 @@ interface ShipmentEditorState {
   weight_lb: string;
   equipment_type: string;
   ready_at: string;
+  delivery_at: string;
   notes: string;
 }
 
@@ -618,6 +633,7 @@ function buildShipmentEditor(shipment: ShipmentRecord | null): ShipmentEditorSta
       weight_lb: "",
       equipment_type: "",
       ready_at: "",
+      delivery_at: "",
       notes: "",
     };
   }
@@ -628,7 +644,8 @@ function buildShipmentEditor(shipment: ShipmentRecord | null): ShipmentEditorSta
     pallets: shipment.pallets?.toString() || "",
     weight_lb: shipment.weight_lb?.toString() || "",
     equipment_type: shipment.equipment_type || "",
-    ready_at: toDateTimeLocal(shipment.ready_at),
+    ready_at: toDateTimeLocal(shipment.ready_at_local),
+    delivery_at: toDateTimeLocal(shipment.delivery_at_local),
     notes: shipment.notes || "",
   };
 }
@@ -652,6 +669,11 @@ function shipmentNeedsAttention(shipment: ShipmentRecord) {
       shipment.status_review_required ||
       shipment.booking_review_required,
   );
+}
+
+function shipmentShowsDeliveryTime(shipment: ShipmentRecord | null) {
+  if (!shipment) return false;
+  return ["booking_in_progress", "booking_failed", "booked"].includes(shipment.status);
 }
 
 function shipmentBlockingBadge(shipment: ShipmentRecord) {
@@ -852,6 +874,7 @@ function LegacyFreightDashboard() {
     weight_lb: "10000",
     equipment_type: "Dry Van",
     ready_at: "",
+    delivery_at: "",
     margin_percent: "15",
     margin_floor: "0",
     notes: "Need pickup tomorrow 08:00.",
@@ -1145,7 +1168,8 @@ function LegacyFreightDashboard() {
           pallets: Number(shipmentForm.pallets || 0),
           weight_lb: Number(shipmentForm.weight_lb || 0),
           equipment_type: shipmentForm.equipment_type,
-          ready_at: shipmentForm.ready_at ? new Date(shipmentForm.ready_at).toISOString() : null,
+          ready_at_local: shipmentForm.ready_at || null,
+          delivery_at_local: shipmentForm.delivery_at || null,
           margin_policy: {
             percent: Number(shipmentForm.margin_percent || 0),
             floor_amount: Number(shipmentForm.margin_floor || 0),
@@ -1661,7 +1685,7 @@ function LegacyFreightDashboard() {
                           <div className="mt-5 grid gap-3 sm:grid-cols-3">
                             <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Pallets</p><p className="mt-1 text-base font-medium text-white">{shipment.pallets ?? "--"}</p></div>
                             <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Weight</p><p className="mt-1 text-base font-medium text-white">{shipment.weight_lb ?? "--"} lb</p></div>
-                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Ready</p><p className="mt-1 text-base font-medium text-white">{formatDate(shipment.ready_at)}</p></div>
+                            <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Ready</p><p className="mt-1 text-base font-medium text-white">{formatShipmentSchedule(shipment.ready_at_display, shipment.ready_at_local)}</p></div>
                           </div>
                           {(shipment.status_stale || shipment.status_review_required) && (
                             <div className="mt-4 flex flex-wrap gap-2">
@@ -1810,7 +1834,11 @@ function LegacyFreightDashboard() {
                     <input className="field-input" placeholder="Weight lb" value={shipmentForm.weight_lb} onChange={(event) => setShipmentForm((current) => ({ ...current, weight_lb: event.target.value }))} />
                   </div>
                   <input className="field-input" placeholder="Equipment" value={shipmentForm.equipment_type} onChange={(event) => setShipmentForm((current) => ({ ...current, equipment_type: event.target.value }))} />
-                  <input type="datetime-local" className="field-input" value={shipmentForm.ready_at} onChange={(event) => setShipmentForm((current) => ({ ...current, ready_at: event.target.value }))} />
+                  <DateTimePickerField
+                    value={shipmentForm.ready_at}
+                    placeholder="Choose pickup-ready time"
+                    onChange={(nextValue) => setShipmentForm((current) => ({ ...current, ready_at: nextValue }))}
+                  />
                   <div className="grid grid-cols-2 gap-3">
                     <input className="field-input" placeholder="Margin %" value={shipmentForm.margin_percent} onChange={(event) => setShipmentForm((current) => ({ ...current, margin_percent: event.target.value }))} />
                     <input className="field-input" placeholder="Margin floor" value={shipmentForm.margin_floor} onChange={(event) => setShipmentForm((current) => ({ ...current, margin_floor: event.target.value }))} />
@@ -1901,7 +1929,8 @@ function LegacyFreightDashboard() {
 
                   <div className="grid grid-cols-2 gap-3 text-sm text-[var(--text-muted)]">
                     <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.18em]">Equipment</p><p className="mt-2 text-base text-white">{selectedShipment.equipment_type || "TBD"}</p></div>
-                    <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.18em]">Ready time</p><p className="mt-2 text-base text-white">{formatDate(selectedShipment.ready_at)}</p></div>
+                    <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.18em]">Ready time</p><p className="mt-2 text-base text-white">{formatShipmentSchedule(selectedShipment.ready_at_display, selectedShipment.ready_at_local)}</p></div>
+                    {shipmentShowsDeliveryTime(selectedShipment) && <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.18em]">Delivery time</p><p className="mt-2 text-base text-white">{formatShipmentSchedule(selectedShipment.delivery_at_display, selectedShipment.delivery_at_local)}</p></div>}
                   </div>
 
                   <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
