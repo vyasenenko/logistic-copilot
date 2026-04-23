@@ -2,6 +2,7 @@
 
 from langchain_core.tools import BaseTool
 
+from app.tools.browser_tools import get_browser_tools
 from app.tools.builtin import calculate, current_datetime, http_request, web_search
 from app.tools.memory_tools import save_to_memory, search_memory
 from app.tools.freight_tools import get_freight_tools
@@ -16,5 +17,6 @@ def get_all_tools() -> list[BaseTool]:
         current_datetime,
         save_to_memory,
         search_memory,
+        *get_browser_tools(),
         *get_freight_tools(),
     ]

@@ -47,6 +47,20 @@
     </header>
 
     <main class="thread" id="messages" role="log" aria-live="polite">
+      <section class="page-context-card" id="pageContextCard" aria-live="polite">
+        <div class="page-context-copy">
+          <p class="page-context-kicker">Current page</p>
+          <p class="page-context-title" id="pageContextTitle">Connecting current tab…</p>
+          <p class="page-context-meta" id="pageContextMeta">Page context will stay available as optional agent context.</p>
+        </div>
+        <div class="page-context-actions">
+          <label class="page-context-toggle">
+            <input type="checkbox" id="usePageContextToggle" checked />
+            <span>Use in chat</span>
+          </label>
+          <button type="button" class="page-context-refresh" id="refreshPageContextBtn">Refresh</button>
+        </div>
+      </section>
       <article class="turn turn--assistant">
         <div class="assistant-flow">
           <div class="markdown-body welcome">

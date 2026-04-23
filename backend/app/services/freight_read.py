@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import html
+import re
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -23,6 +25,10 @@ from app.schemas import (
     FreightOverviewResponse,
     FreightSlaSummary,
     FreightStatusMetrics,
+    NotificationFeedItem,
+    NotificationFeedResponse,
+    ShipmentThreadMessageRecord,
+    ShipmentThreadResponse,
     ShipmentStage,
     WorkflowEventType,
 )
@@ -32,6 +38,75 @@ STATUS_ACTIVE_SHIPMENT_STATES = {
     ShipmentStage.BOOKING_IN_PROGRESS.value,
     ShipmentStage.AWAITING_CONFIRMATION.value,
 }
+
+NOTIFICATION_EVENT_TYPES = {
+    WorkflowEventType.EMAIL_RECEIVED.value,
+    WorkflowEventType.SHIPMENT_PARSED.value,
+    WorkflowEventType.PARSING_COMPLETED.value,
+    WorkflowEventType.BID_RECEIVED.value,
+    WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+    WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+    WorkflowEventType.TMS_STATUS_INGESTED.value,
+    WorkflowEventType.TMS_STATUS_UPDATED.value,
+    WorkflowEventType.SHIPMENT_ARCHIVED.value,
+    WorkflowEventType.EXCEPTION_RAISED.value,
+}
+
+
+def _clean_message_excerpt(value: str | None) -> str:
+    text = html.unescape(value or "")
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _message_display_body(message: EmailMessage) -> str:
+    payload = dict(message.raw_payload_json or {})
+    body = payload.get("body")
+    if isinstance(body, dict):
+        content = body.get("content")
+        if isinstance(content, str) and content.strip():
+            return _clean_message_excerpt(content)
+    unique_body = payload.get("uniqueBody")
+    if isinstance(unique_body, dict):
+        content = unique_body.get("content")
+        if isinstance(content, str) and content.strip():
+            return _clean_message_excerpt(content)
+    for key in ("bodyPreview", "content", "textBody"):
+        candidate = payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return _clean_message_excerpt(candidate)
+    return _clean_message_excerpt(message.body_preview)
+
+
+def _serialize_thread_message(message: EmailMessage) -> ShipmentThreadMessageRecord:
+    return ShipmentThreadMessageRecord(
+        id=str(message.id),
+        thread_id=str(message.thread_id),
+        provider_message_id=message.provider_message_id,
+        direction=message.direction,
+        sender=message.sender,
+        recipients=list(message.recipients_json or []),
+        subject=message.subject,
+        received_at=message.received_at,
+        body_preview=message.body_preview or "",
+        display_body=_message_display_body(message),
+        has_raw_payload=bool(message.raw_payload_json),
+    )
+
+
+def _is_system_thread_message(message: EmailMessage) -> bool:
+    sender = (message.sender or "").lower()
+    recipients = " ".join(str(item).lower() for item in (message.recipients_json or []))
+    combined = f"{sender} {recipients}"
+    return any(
+        marker in combined
+        for marker in ("mailer-daemon", "postmaster", "microsoftexchange", "delivery")
+    )
 
 
 def _status_event_cutoff(*, now: datetime) -> datetime:
@@ -132,6 +207,43 @@ async def build_freight_overview(session: AsyncSession) -> FreightOverviewRespon
     )
 
 
+async def list_notification_feed(
+    session: AsyncSession,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+) -> NotificationFeedResponse:
+    """Build a paginated notification feed from persisted workflow events."""
+    safe_limit = max(1, min(limit, 100))
+    safe_offset = max(0, offset)
+
+    base_stmt = (
+        select(WorkflowEvent, Shipment)
+        .join(Shipment, Shipment.id == WorkflowEvent.shipment_id, isouter=True)
+        .where(WorkflowEvent.event_type.in_(NOTIFICATION_EVENT_TYPES))
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    total = await session.scalar(
+        select(func.count()).select_from(WorkflowEvent).where(WorkflowEvent.event_type.in_(NOTIFICATION_EVENT_TYPES))
+    ) or 0
+    result = await session.execute(base_stmt.offset(safe_offset).limit(safe_limit + 1))
+
+    rows = result.all()
+    items: list[NotificationFeedItem] = []
+    for event, shipment in rows[:safe_limit]:
+        item = _notification_from_event(event, shipment)
+        if item is not None:
+            items.append(item)
+
+    return NotificationFeedResponse(
+        items=items,
+        total=total,
+        limit=safe_limit,
+        offset=safe_offset,
+        has_more=len(rows) > safe_limit,
+    )
+
+
 async def list_shipments_brief(session: AsyncSession, *, limit: int = 80) -> list[dict]:
     """Lightweight shipment rows for agents (no enrichment join fan-out)."""
     lim = max(1, min(limit, 200))
@@ -189,6 +301,62 @@ def _shipment_brief_row(shipment: Shipment) -> dict:
         "created_at": shipment.created_at.isoformat() if shipment.created_at else None,
         "updated_at": shipment.updated_at.isoformat() if shipment.updated_at else None,
     }
+
+
+def _notification_from_event(event: WorkflowEvent, shipment: Shipment | None) -> NotificationFeedItem | None:
+    payload = dict(event.payload_json or {})
+    route = f"{shipment.origin or 'Origin TBD'} -> {shipment.destination or 'Destination TBD'}" if shipment else "Shipment"
+    quote_token = shipment.quote_token if shipment else None
+    sender = str(payload.get("sender") or "").strip() or None
+
+    kind = "system"
+    title = "Workflow event"
+    detail = quote_token and f"{route} · {quote_token}" or route
+
+    if event.event_type == WorkflowEventType.EMAIL_RECEIVED.value:
+        kind = "email"
+        title = f"New email from {sender}" if sender else "New inbound email"
+    elif event.event_type in {WorkflowEventType.SHIPMENT_PARSED.value, WorkflowEventType.PARSING_COMPLETED.value}:
+        kind = "shipment"
+        title = "Shipment captured from inbox"
+    elif event.event_type == WorkflowEventType.BID_RECEIVED.value:
+        kind = "bid"
+        title = "Carrier bid received"
+    elif event.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value:
+        kind = "review"
+        title = "Needs operator review"
+        detail = str(payload.get("reason") or route)
+    elif event.event_type in {
+        WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+        WorkflowEventType.TMS_STATUS_INGESTED.value,
+        WorkflowEventType.TMS_STATUS_UPDATED.value,
+    }:
+        kind = "status"
+        title = "Status update available"
+    elif event.event_type == WorkflowEventType.SHIPMENT_ARCHIVED.value:
+        kind = "archive"
+        title = "Shipment archived"
+    elif event.event_type == WorkflowEventType.EXCEPTION_RAISED.value:
+        kind = "system"
+        title = "Workflow exception raised"
+        detail = str(payload.get("reason") or route)
+    else:
+        return None
+
+    return NotificationFeedItem(
+        id=str(event.id),
+        shipment_id=str(shipment.id) if shipment else str(event.shipment_id),
+        quote_token=quote_token,
+        route=route,
+        status=shipment.status if shipment else None,
+        event_type=event.event_type,
+        stage=event.stage,
+        kind=kind,
+        title=title,
+        detail=detail,
+        archived=bool(shipment.is_archived) if shipment else False,
+        created_at=event.created_at,
+    )
 
 
 async def get_shipment_brief(session: AsyncSession, shipment_id: UUID) -> dict | None:
@@ -369,6 +537,243 @@ async def summarize_shipment_case(session: AsyncSession, quote_token: str) -> di
             for event in events_result.scalars().all()
         ],
     }
+
+
+async def get_shipment_thread_transcript(
+    session: AsyncSession,
+    shipment_id: UUID,
+    *,
+    limit: int = 24,
+) -> dict | None:
+    """Return active shipment thread transcript in chronological order."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None or shipment.is_archived:
+        return None
+    if not shipment.email_thread_id:
+        return {
+            "shipment_id": str(shipment.id),
+            "quote_token": shipment.quote_token,
+            "route": f"{shipment.origin or 'Origin TBD'} -> {shipment.destination or 'Destination TBD'}",
+            "status": shipment.status,
+            "thread_id": None,
+            "thread_subject": None,
+            "messages": [],
+        }
+
+    thread = await session.get(EmailThread, shipment.email_thread_id)
+    result = await session.execute(
+        select(EmailMessage)
+        .where(EmailMessage.thread_id == shipment.email_thread_id)
+        .order_by(EmailMessage.received_at.desc())
+        .limit(max(1, min(limit, 100)))
+    )
+    messages = list(reversed(result.scalars().all()))
+    return {
+        "shipment_id": str(shipment.id),
+        "quote_token": shipment.quote_token,
+        "route": f"{shipment.origin or 'Origin TBD'} -> {shipment.destination or 'Destination TBD'}",
+        "status": shipment.status,
+        "thread_id": str(shipment.email_thread_id),
+        "thread_subject": thread.subject if thread else None,
+        "messages": [_serialize_thread_message(message).model_dump(mode="json") for message in messages],
+    }
+
+
+async def get_shipment_thread_transcript_by_token(
+    session: AsyncSession,
+    quote_token: str,
+    *,
+    limit: int = 24,
+) -> dict | None:
+    """Return active shipment transcript by quote token."""
+    normalized = quote_token.strip().upper()
+    if not normalized:
+        return None
+    shipment = await session.scalar(
+        select(Shipment).where(
+            Shipment.is_archived.is_(False),
+            func.upper(Shipment.quote_token) == normalized,
+        )
+    )
+    if shipment is None:
+        return None
+    return await get_shipment_thread_transcript(session, shipment.id, limit=limit)
+
+
+async def diagnose_shipment_issue(
+    session: AsyncSession,
+    shipment_id: UUID,
+    *,
+    thread_limit: int = 12,
+    event_limit: int = 12,
+) -> dict | None:
+    """Deterministic shipment diagnosis summary for agent troubleshooting."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None or shipment.is_archived:
+        return None
+
+    transcript = await get_shipment_thread_transcript(session, shipment_id, limit=thread_limit)
+    events_result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.shipment_id == shipment.id)
+        .order_by(WorkflowEvent.created_at.desc())
+        .limit(max(1, min(event_limit, 30)))
+    )
+    events = events_result.scalars().all()
+    bids_result = await session.execute(
+        select(CarrierBid, Carrier)
+        .join(Carrier, Carrier.id == CarrierBid.carrier_id)
+        .where(CarrierBid.shipment_id == shipment.id)
+        .order_by(CarrierBid.amount.asc().nullslast(), CarrierBid.received_at.desc())
+    )
+    bid_rows = bids_result.all()
+
+    client = await session.get(Client, shipment.client_id) if shipment.client_id else None
+    message_rows_result = await session.execute(
+        select(EmailMessage)
+        .where(EmailMessage.thread_id == shipment.email_thread_id)
+        .order_by(EmailMessage.received_at.desc())
+        .limit(max(1, min(thread_limit, 30)))
+    ) if shipment.email_thread_id else None
+    thread_messages = message_rows_result.scalars().all() if message_rows_result is not None else []
+
+    customer_signal = None
+    carrier_signal = None
+    for message in thread_messages:
+        if _is_system_thread_message(message):
+            continue
+        sender = (message.sender or "").strip().lower()
+        if customer_signal is None and client and sender == (client.email or "").strip().lower():
+            customer_signal = {
+                "sender": message.sender,
+                "received_at": message.received_at.isoformat() if message.received_at else None,
+                "subject": message.subject,
+                "excerpt": _message_display_body(message)[:500],
+            }
+            continue
+        if carrier_signal is None and message.direction == "inbound":
+            carrier_signal = {
+                "sender": message.sender,
+                "received_at": message.received_at.isoformat() if message.received_at else None,
+                "subject": message.subject,
+                "excerpt": _message_display_body(message)[:500],
+            }
+
+    current_blockers: list[str] = []
+    if shipment.status in {ShipmentStage.RECEIVED.value, ShipmentStage.PARSING.value}:
+        current_blockers.append("Shipment is still in intake/parsing stage.")
+    if shipment.status == ShipmentStage.WAITING_CUSTOMER_DETAILS.value:
+        current_blockers.append("Customer details are still missing.")
+    if shipment.status in {ShipmentStage.OUTREACHING.value, ShipmentStage.WAITING_BIDS.value} and not bid_rows:
+        current_blockers.append("Carrier bids have not been collected yet.")
+    if shipment.status == ShipmentStage.EVALUATING.value:
+        current_blockers.append("Bid evaluation is pending.")
+    if shipment.status == ShipmentStage.AWAITING_CONFIRMATION.value:
+        current_blockers.append("Waiting for customer booking confirmation.")
+    if shipment.status == ShipmentStage.BOOKING_FAILED.value:
+        current_blockers.append("Booking failed and needs operator follow-up.")
+
+    likely_root_causes: list[str] = []
+    recommended_next_steps: list[str] = []
+    supporting_evidence: list[dict] = []
+
+    for event in events:
+        payload = dict(event.payload_json or {})
+        if event.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value:
+            reason = str(payload.get("reason") or "Manual review required.")
+            if reason not in likely_root_causes:
+                likely_root_causes.append(reason)
+        if event.event_type == WorkflowEventType.SHIPMENT_PARSE_FAILED.value:
+            reason = str(payload.get("reason") or "Shipment parsing failed.")
+            if reason not in likely_root_causes:
+                likely_root_causes.append(reason)
+        if event.event_type == WorkflowEventType.BID_PARSE_FAILED.value:
+            reason = str(payload.get("reason") or "Carrier bid parsing failed.")
+            if reason not in likely_root_causes:
+                likely_root_causes.append(reason)
+        if event.event_type == WorkflowEventType.EXCEPTION_RAISED.value:
+            reason = str(payload.get("reason") or "Workflow exception raised.")
+            if reason not in likely_root_causes:
+                likely_root_causes.append(reason)
+        if len(supporting_evidence) < 6:
+            supporting_evidence.append(
+                {
+                    "event_type": event.event_type,
+                    "stage": event.stage,
+                    "created_at": event.created_at.isoformat() if event.created_at else None,
+                    "summary": payload.get("reason")
+                    or payload.get("message")
+                    or payload.get("next_action")
+                    or payload.get("intent")
+                    or payload,
+                }
+            )
+
+    if not likely_root_causes and current_blockers:
+        likely_root_causes.extend(current_blockers[:3])
+
+    if shipment.status in {ShipmentStage.RECEIVED.value, ShipmentStage.PARSING.value, ShipmentStage.WAITING_CUSTOMER_DETAILS.value}:
+        recommended_next_steps.append("Review parsed shipment fields and missing details from the linked email thread.")
+    if shipment.status in {ShipmentStage.OUTREACHING.value, ShipmentStage.WAITING_BIDS.value}:
+        recommended_next_steps.append("Check carrier outreach and inbound carrier replies for missing or failed bid intake.")
+    if shipment.status == ShipmentStage.EVALUATING.value:
+        recommended_next_steps.append("Inspect collected bids and rerun evaluation if enough bids exist.")
+    if shipment.status == ShipmentStage.AWAITING_CONFIRMATION.value:
+        recommended_next_steps.append("Check whether the customer replied with booking confirmation or clarification.")
+    if shipment.status == ShipmentStage.BOOKING_FAILED.value:
+        recommended_next_steps.append("Review booking handoff errors and retry only after resolving the blocking issue.")
+    if not recommended_next_steps:
+        recommended_next_steps.append("Inspect the latest workflow events and email thread for the next blocked step.")
+
+    priced_bids = [bid for bid, _carrier in bid_rows if bid.amount is not None]
+    best_bid = priced_bids[0] if priced_bids else None
+
+    problem_summary = current_blockers[0] if current_blockers else likely_root_causes[0] if likely_root_causes else "No clear blocker detected from current shipment state."
+    return {
+        "shipment_id": str(shipment.id),
+        "quote_token": shipment.quote_token,
+        "route": f"{shipment.origin or 'Origin TBD'} -> {shipment.destination or 'Destination TBD'}",
+        "status": shipment.status,
+        "problem_summary": problem_summary,
+        "current_blockers": current_blockers,
+        "likely_root_causes": likely_root_causes,
+        "latest_customer_signal": customer_signal,
+        "latest_carrier_signal": carrier_signal,
+        "recommended_operator_next_steps": recommended_next_steps,
+        "supporting_evidence": supporting_evidence,
+        "thread_excerpt": transcript,
+        "bid_snapshot": {
+            "count": len(bid_rows),
+            "priced_count": len(priced_bids),
+            "best_bid": {
+                "amount": best_bid.amount,
+                "currency": best_bid.currency,
+                "received_at": best_bid.received_at.isoformat() if best_bid and best_bid.received_at else None,
+            } if best_bid else None,
+        },
+    }
+
+
+async def diagnose_shipment_issue_by_token(
+    session: AsyncSession,
+    quote_token: str,
+    *,
+    thread_limit: int = 12,
+    event_limit: int = 12,
+) -> dict | None:
+    """Deterministic shipment diagnosis summary by quote token."""
+    normalized = quote_token.strip().upper()
+    if not normalized:
+        return None
+    shipment = await session.scalar(
+        select(Shipment).where(
+            Shipment.is_archived.is_(False),
+            func.upper(Shipment.quote_token) == normalized,
+        )
+    )
+    if shipment is None:
+        return None
+    return await diagnose_shipment_issue(session, shipment.id, thread_limit=thread_limit, event_limit=event_limit)
 
 
 async def search_archived_shipments_brief(

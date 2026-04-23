@@ -1,6 +1,7 @@
 """Chat endpoint — handles user messages and streams agent responses."""
 
 import json
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.graph import run_agent_stream
 from app.memory.database import Conversation, Message, get_session
 from app.schemas import MessageRequest
+from app.services.browser_context import browser_context_hint_text, get_browser_context, save_browser_context
 
 router = APIRouter()
 
@@ -58,6 +60,9 @@ async def chat(
     """Send a message to the agent and receive a streaming response (SSE)."""
     conv = await _get_or_create_conversation(request.conversation_id, session)
     history = await _load_history(conv.id, session)
+    browser_context = await save_browser_context(session, conv, request.browser_context)
+    if browser_context is None:
+        browser_context = get_browser_context(conv)
 
     # Save user message
     user_msg = Message(
@@ -71,12 +76,18 @@ async def chat(
     # Update conversation title from first message
     if len(history) == 0:
         conv.title = request.content[:100]
+        conv.updated_at = datetime.now(timezone.utc)
         await session.commit()
+
+    runtime_user_message = request.content
+    hint = browser_context_hint_text(browser_context)
+    if hint:
+        runtime_user_message = f"{request.content}\n\n[Browser context hint]\n{hint}"
 
     async def event_stream():
         full_response = []
         async for event in run_agent_stream(
-            user_message=request.content,
+            user_message=runtime_user_message,
             conversation_history=history,
             conversation_id=conv.id,
         ):

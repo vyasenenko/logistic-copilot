@@ -53,6 +53,7 @@ from app.schemas import (
     OperatorAction,
     FreightOverviewResponse,
     MarginPolicy,
+    NotificationFeedResponse,
     ShipmentEvaluationResponse,
     ShipmentRecord,
     ShipmentThreadMessageRecord,
@@ -118,7 +119,7 @@ from app.services.outlook_mail_actions import (
     move_shipment_thread_messages_to_archive,
     outlook_categories_for_ai_decision,
 )
-from app.services.freight_read import build_freight_overview, is_status_stale as _is_status_stale
+from app.services.freight_read import build_freight_overview, is_status_stale as _is_status_stale, list_notification_feed
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -131,7 +132,7 @@ def _shipment_matches_month_filter(
 ) -> bool:
     if not month:
         return True
-    reference = shipment.ready_at_local or shipment.created_at
+    reference = shipment.created_at
     if reference is None:
         return False
     return reference.strftime("%Y-%m") == month
@@ -608,6 +609,15 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         created_at=shipment.created_at,
         updated_at=shipment.updated_at,
     )
+
+
+def _shipment_board_sort_key(record: ShipmentRecord) -> tuple[int, float, float]:
+    needs_attention = record.attention_state != "none" or record.has_active_review
+    updated_at = record.updated_at or record.created_at
+    created_at = record.created_at
+    updated_ts = updated_at.timestamp() if updated_at else float("-inf")
+    created_ts = created_at.timestamp() if created_at else float("-inf")
+    return (0 if needs_attention else 1, -updated_ts, -created_ts)
 
 
 def _board_stage_from_status(status: str | None) -> str:
@@ -1951,7 +1961,7 @@ async def list_shipments(
 ) -> list[ShipmentRecord]:
     """List all tracked shipments."""
     result = await session.execute(
-        select(Shipment).where(Shipment.is_archived.is_(False)).order_by(Shipment.created_at.desc())
+        select(Shipment).where(Shipment.is_archived.is_(False)).order_by(Shipment.updated_at.desc(), Shipment.created_at.desc())
     )
     shipments = [
         shipment
@@ -1968,7 +1978,7 @@ async def list_shipments(
     attachment_counts = await _attachment_counts(session, shipments)
     document_summaries = await _document_booking_summaries(session, shipments, document_action_payloads)
     now = datetime.now(timezone.utc)
-    return [
+    records = [
         _serialize_shipment(
             shipment,
             {
@@ -2006,6 +2016,7 @@ async def list_shipments(
         )
         for shipment in shipments
     ]
+    return sorted(records, key=_shipment_board_sort_key)
 
 
 @router.post("/freight/shipments", response_model=ShipmentRecord)
@@ -2482,6 +2493,16 @@ async def list_shipment_events(
         .order_by(WorkflowEvent.created_at.desc())
     )
     return [_serialize_workflow_event(event) for event in result.scalars().all()]
+
+
+@router.get("/freight/notifications", response_model=NotificationFeedResponse)
+async def freight_notifications(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> NotificationFeedResponse:
+    """Paginated notification feed projected from workflow events."""
+    return await list_notification_feed(session, limit=limit, offset=offset)
 
 
 @router.get("/freight/reviews", response_model=list[ReviewQueueItem])

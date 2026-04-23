@@ -33,9 +33,13 @@ from app.services.freight_execution import (
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.freight_read import (
     build_freight_overview,
+    diagnose_shipment_issue,
+    diagnose_shipment_issue_by_token,
     get_archived_shipment_brief_by_token,
     get_shipment_brief,
     get_shipment_brief_by_token,
+    get_shipment_thread_transcript,
+    get_shipment_thread_transcript_by_token,
     list_shipments_by_city_brief,
     list_shipments_brief,
     list_today_shipments_brief,
@@ -44,12 +48,201 @@ from app.services.freight_read import (
     summarize_archived_shipment_case,
     summarize_shipment_case,
 )
+from app.services.freight_realtime import freight_realtime_hub
+from app.services.location_timezone import (
+    normalize_delivery_datetime_fields,
+    normalize_pickup_datetime_fields,
+)
 from app.services.outlook_mail_actions import move_shipment_thread_messages_to_archive
 from app.services.workflow_event_codec import workflow_event_to_record
 
 
 def _json(obj) -> str:
     return json.dumps(obj, indent=2, default=str, ensure_ascii=False)
+
+
+def _parse_tool_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        return None
+    return parsed
+
+
+async def _update_shipment_details_impl(
+    *,
+    shipment: Shipment,
+    session,
+    client_id: str | None = None,
+    origin: str | None = None,
+    destination: str | None = None,
+    pallets: int | None = None,
+    weight_lb: float | None = None,
+    equipment_type: str | None = None,
+    ready_at_local: str | None = None,
+    delivery_at_local: str | None = None,
+    notes: str | None = None,
+    clear_ready_at: bool = False,
+    clear_delivery_at: bool = False,
+    clear_notes: bool = False,
+) -> dict:
+    if shipment.is_archived:
+        return {"updated": False, "error": "Shipment is archived and cannot be edited."}
+
+    previous_values = {
+        "client_id": str(shipment.client_id) if shipment.client_id else None,
+        "origin": shipment.origin,
+        "destination": shipment.destination,
+        "pallets": shipment.pallets,
+        "weight_lb": shipment.weight_lb,
+        "equipment_type": shipment.equipment_type,
+        "ready_at": shipment.ready_at.isoformat() if shipment.ready_at else None,
+        "ready_at_local": shipment.ready_at_local.isoformat() if shipment.ready_at_local else None,
+        "delivery_at": shipment.delivery_at.isoformat() if shipment.delivery_at else None,
+        "delivery_at_local": shipment.delivery_at_local.isoformat() if shipment.delivery_at_local else None,
+        "notes": shipment.notes,
+    }
+
+    if client_id is not None:
+        normalized_client_id = client_id.strip()
+        if not normalized_client_id:
+            shipment.client_id = None
+        else:
+            try:
+                cid = UUID(normalized_client_id)
+            except ValueError:
+                return {"updated": False, "error": "client_id must be a valid UUID."}
+            client = await session.get(Client, cid)
+            if client is None:
+                return {"updated": False, "error": f"Client not found: {client_id}"}
+            shipment.client_id = cid
+
+    if origin is not None:
+        shipment.origin = origin.strip() or None
+    if destination is not None:
+        shipment.destination = destination.strip() or None
+    if pallets is not None:
+        if pallets < 0:
+            return {"updated": False, "error": "pallets must be >= 0."}
+        shipment.pallets = pallets
+    if weight_lb is not None:
+        if weight_lb < 0:
+            return {"updated": False, "error": "weight_lb must be >= 0."}
+        shipment.weight_lb = weight_lb
+    if equipment_type is not None:
+        shipment.equipment_type = equipment_type.strip() or None
+
+    if clear_ready_at:
+        shipment.ready_at = None
+        shipment.ready_at_local = None
+        shipment.ready_at_timezone = None
+        shipment.ready_at_offset_minutes = None
+    elif ready_at_local is not None:
+        parsed_ready = _parse_tool_datetime(ready_at_local)
+        if parsed_ready is None:
+            return {
+                "updated": False,
+                "error": "ready_at_local must be a local ISO datetime without timezone, like 2026-04-25T07:30 or 2026-04-25T07:30:00.",
+            }
+        shipment.ready_at = None
+        shipment.ready_at_local = parsed_ready
+
+    if clear_delivery_at:
+        shipment.delivery_at = None
+        shipment.delivery_at_local = None
+        shipment.delivery_at_timezone = None
+        shipment.delivery_at_offset_minutes = None
+    elif delivery_at_local is not None:
+        parsed_delivery = _parse_tool_datetime(delivery_at_local)
+        if parsed_delivery is None:
+            return {
+                "updated": False,
+                "error": "delivery_at_local must be a local ISO datetime without timezone, like 2026-04-26T09:00 or 2026-04-26T09:00:00.",
+            }
+        shipment.delivery_at = None
+        shipment.delivery_at_local = parsed_delivery
+
+    if clear_notes:
+        shipment.notes = ""
+    elif notes is not None:
+        shipment.notes = notes
+
+    (
+        shipment.ready_at,
+        shipment.ready_at_local,
+        shipment.ready_at_timezone,
+        shipment.ready_at_offset_minutes,
+    ) = normalize_pickup_datetime_fields(
+        ready_at=shipment.ready_at,
+        ready_at_local=shipment.ready_at_local,
+        origin=shipment.origin,
+        destination=shipment.destination,
+    )
+    (
+        shipment.delivery_at,
+        shipment.delivery_at_local,
+        shipment.delivery_at_timezone,
+        shipment.delivery_at_offset_minutes,
+    ) = normalize_delivery_datetime_fields(
+        delivery_at=shipment.delivery_at,
+        delivery_at_local=shipment.delivery_at_local,
+        origin=shipment.origin,
+        destination=shipment.destination,
+    )
+    shipment.updated_at = datetime.now(timezone.utc)
+
+    current_values = {
+        "client_id": str(shipment.client_id) if shipment.client_id else None,
+        "origin": shipment.origin,
+        "destination": shipment.destination,
+        "pallets": shipment.pallets,
+        "weight_lb": shipment.weight_lb,
+        "equipment_type": shipment.equipment_type,
+        "ready_at": shipment.ready_at.isoformat() if shipment.ready_at else None,
+        "ready_at_local": shipment.ready_at_local.isoformat() if shipment.ready_at_local else None,
+        "delivery_at": shipment.delivery_at.isoformat() if shipment.delivery_at else None,
+        "delivery_at_local": shipment.delivery_at_local.isoformat() if shipment.delivery_at_local else None,
+        "notes": shipment.notes,
+    }
+    changed_fields = [
+        field for field, value in current_values.items() if previous_values.get(field) != value
+    ]
+    if not changed_fields:
+        return {
+            "updated": False,
+            "message": "No shipment fields changed.",
+            "shipment_id": str(shipment.id),
+            "quote_token": shipment.quote_token,
+        }
+
+    evt = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
+        stage=shipment.status,
+        payload_json={
+            "changed_fields": changed_fields,
+            "manual_review_required": False,
+            "edited_by": "agent_tool",
+        },
+    )
+    session.add(evt)
+    await session.commit()
+    await freight_realtime_hub.notify_workflow_event(evt)
+    updated = await get_shipment_brief(session, shipment.id)
+    return {
+        "updated": True,
+        "shipment_id": str(shipment.id),
+        "quote_token": shipment.quote_token,
+        "changed_fields": changed_fields,
+        "shipment": updated,
+    }
 
 
 @tool
@@ -126,6 +319,97 @@ async def freight_get_shipment_by_token(quote_token: str) -> str:
 
 
 @tool
+async def freight_update_shipment_details(
+    shipment_id: str,
+    client_id: str | None = None,
+    origin: str | None = None,
+    destination: str | None = None,
+    pallets: int | None = None,
+    weight_lb: float | None = None,
+    equipment_type: str | None = None,
+    ready_at_local: str | None = None,
+    delivery_at_local: str | None = None,
+    notes: str | None = None,
+    clear_ready_at: bool = False,
+    clear_delivery_at: bool = False,
+    clear_notes: bool = False,
+) -> str:
+    """Update active shipment details by UUID. Date fields accept local wall time only; UTC/timezone are derived automatically from route."""
+    try:
+        sid = UUID(shipment_id.strip())
+    except ValueError:
+        return "Error: shipment_id must be a valid UUID."
+    async with async_session() as session:
+        shipment = await session.get(Shipment, sid)
+        if shipment is None or shipment.is_archived:
+            return f"Error: active shipment not found: {shipment_id}"
+        result = await _update_shipment_details_impl(
+            shipment=shipment,
+            session=session,
+            client_id=client_id,
+            origin=origin,
+            destination=destination,
+            pallets=pallets,
+            weight_lb=weight_lb,
+            equipment_type=equipment_type,
+            ready_at_local=ready_at_local,
+            delivery_at_local=delivery_at_local,
+            notes=notes,
+            clear_ready_at=clear_ready_at,
+            clear_delivery_at=clear_delivery_at,
+            clear_notes=clear_notes,
+        )
+        if result.get("error"):
+            return f"Error: {result['error']}"
+        return _json(result)
+
+
+@tool
+async def freight_update_shipment_details_by_token(
+    quote_token: str,
+    client_id: str | None = None,
+    origin: str | None = None,
+    destination: str | None = None,
+    pallets: int | None = None,
+    weight_lb: float | None = None,
+    equipment_type: str | None = None,
+    ready_at_local: str | None = None,
+    delivery_at_local: str | None = None,
+    notes: str | None = None,
+    clear_ready_at: bool = False,
+    clear_delivery_at: bool = False,
+    clear_notes: bool = False,
+) -> str:
+    """Update active shipment details by quote token like Q-87845634. Date fields accept local wall time only; UTC/timezone are derived automatically from route."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(Shipment).where(Shipment.quote_token == quote_token.strip(), Shipment.is_archived.is_(False))
+        )
+        shipment = result.scalar_one_or_none()
+        if shipment is None:
+            return f"Error: active shipment not found for quote token: {quote_token}"
+        outcome = await _update_shipment_details_impl(
+            shipment=shipment,
+            session=session,
+            client_id=client_id,
+            origin=origin,
+            destination=destination,
+            pallets=pallets,
+            weight_lb=weight_lb,
+            equipment_type=equipment_type,
+            ready_at_local=ready_at_local,
+            delivery_at_local=delivery_at_local,
+            notes=notes,
+            clear_ready_at=clear_ready_at,
+            clear_delivery_at=clear_delivery_at,
+            clear_notes=clear_notes,
+        )
+        if outcome.get("error"):
+            return f"Error: {outcome['error']}"
+        return _json(outcome)
+
+
+@tool
 async def freight_search_shipments(query: str, status: str | None = None, limit: int = 50) -> str:
     """Search active shipments by token, route/city, equipment, notes, or status."""
     async with async_session() as session:
@@ -157,6 +441,54 @@ async def freight_summarize_shipment_case(quote_token: str) -> str:
         if summary is None:
             return f"Error: shipment not found for quote token: {quote_token}"
         return _json(summary)
+
+
+@tool
+async def freight_get_shipment_thread(shipment_id: str, limit: int = 24) -> str:
+    """Get the linked email thread transcript for one active shipment by UUID."""
+    try:
+        sid = UUID(shipment_id.strip())
+    except ValueError:
+        return "Error: shipment_id must be a valid UUID."
+    async with async_session() as session:
+        row = await get_shipment_thread_transcript(session, sid, limit=limit)
+        if row is None:
+            return f"Error: active shipment thread not found: {shipment_id}"
+        return _json(row)
+
+
+@tool
+async def freight_get_shipment_thread_by_token(quote_token: str, limit: int = 24) -> str:
+    """Get the linked email thread transcript for one active shipment by quote token."""
+    async with async_session() as session:
+        row = await get_shipment_thread_transcript_by_token(session, quote_token, limit=limit)
+        if row is None:
+            return f"Error: active shipment thread not found for quote token: {quote_token}"
+        return _json(row)
+
+
+@tool
+async def freight_diagnose_shipment_issue(shipment_id: str) -> str:
+    """Return a deterministic diagnosis summary for one active shipment by UUID."""
+    try:
+        sid = UUID(shipment_id.strip())
+    except ValueError:
+        return "Error: shipment_id must be a valid UUID."
+    async with async_session() as session:
+        row = await diagnose_shipment_issue(session, sid)
+        if row is None:
+            return f"Error: active shipment diagnosis not available: {shipment_id}"
+        return _json(row)
+
+
+@tool
+async def freight_diagnose_shipment_issue_by_token(quote_token: str) -> str:
+    """Return a deterministic diagnosis summary for one active shipment by quote token."""
+    async with async_session() as session:
+        row = await diagnose_shipment_issue_by_token(session, quote_token)
+        if row is None:
+            return f"Error: active shipment diagnosis not available for quote token: {quote_token}"
+        return _json(row)
 
 
 @tool
@@ -477,10 +809,16 @@ def get_freight_tools():
         freight_list_shipments,
         freight_get_shipment,
         freight_get_shipment_by_token,
+        freight_update_shipment_details,
+        freight_update_shipment_details_by_token,
+        freight_get_shipment_thread,
+        freight_get_shipment_thread_by_token,
         freight_search_shipments,
         freight_list_shipments_by_city,
         freight_list_today_shipments,
         freight_summarize_shipment_case,
+        freight_diagnose_shipment_issue,
+        freight_diagnose_shipment_issue_by_token,
         freight_search_archived_shipments,
         freight_get_archived_shipment_by_token,
         freight_summarize_archived_shipment,

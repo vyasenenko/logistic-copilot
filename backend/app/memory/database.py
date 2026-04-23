@@ -41,6 +41,7 @@ class Conversation(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     title = Column(String(500), default="New conversation")
+    metadata_json = Column(JSON, default=dict, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -219,6 +220,9 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Lightweight schema patching for existing dev databases (no migration framework yet).
+        await conn.execute(
+            text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS metadata_json JSON DEFAULT '{}'::json NOT NULL")
+        )
         await conn.execute(
             text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ready_at_timezone VARCHAR(64)")
         )

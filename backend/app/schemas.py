@@ -77,6 +77,7 @@ class MessageRequest(BaseModel):
 
     content: str = Field(..., min_length=1, max_length=50_000)
     conversation_id: UUID | None = None
+    browser_context: dict | None = None
 
 
 class ToolCall(BaseModel):
@@ -260,6 +261,29 @@ class WorkflowEventRecord(BaseModel):
     stage: str
     payload: dict = Field(default_factory=dict)
     created_at: datetime
+
+
+class NotificationFeedItem(BaseModel):
+    id: str
+    shipment_id: str | None = None
+    quote_token: str | None = None
+    route: str | None = None
+    status: str | None = None
+    event_type: str
+    stage: str
+    kind: str
+    title: str
+    detail: str
+    archived: bool = False
+    created_at: datetime
+
+
+class NotificationFeedResponse(BaseModel):
+    items: list[NotificationFeedItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+    has_more: bool = False
 
 
 class ShipmentDocumentRecord(BaseModel):

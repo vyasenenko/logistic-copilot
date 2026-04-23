@@ -5,12 +5,18 @@ const clearBtn = document.getElementById('clearBtn');
 const apiBaseInput = document.getElementById('apiBaseInput');
 const saveApiBtn = document.getElementById('saveApiBtn');
 const themeBtn = document.getElementById('themeBtn');
+const pageContextTitleEl = document.getElementById('pageContextTitle');
+const pageContextMetaEl = document.getElementById('pageContextMeta');
+const refreshPageContextBtn = document.getElementById('refreshPageContextBtn');
+const usePageContextToggle = document.getElementById('usePageContextToggle');
 
 const STORAGE_MESSAGES = 'assistant_messages';
 const STORAGE_API_BASE = 'api_base_url';
 const STORAGE_CONVERSATION = 'conversation_id';
 const STORAGE_THEME = 'ui_theme';
+const STORAGE_USE_PAGE_CONTEXT = 'use_page_context';
 const DEFAULT_API_BASE = 'https://api.logisticopilot.com';
+let currentPageContext = null;
 
 (function configureMarked() {
   if (typeof marked === 'undefined') return;
@@ -113,6 +119,16 @@ function loadMessages(callback) {
   });
 }
 
+function loadUsePageContext(callback) {
+  chrome.storage.local.get([STORAGE_USE_PAGE_CONTEXT], (result) => {
+    callback(result[STORAGE_USE_PAGE_CONTEXT] !== false);
+  });
+}
+
+function saveUsePageContext(enabled) {
+  chrome.storage.local.set({ [STORAGE_USE_PAGE_CONTEXT]: Boolean(enabled) });
+}
+
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -121,6 +137,80 @@ function escapeHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function pageContextSummary(snapshot) {
+  if (!snapshot || snapshot.available === false) {
+    return {
+      title: 'Current tab is unavailable',
+      meta: snapshot?.unavailable_reason || 'This tab cannot be read right now. Refresh after switching to a normal webpage.',
+    };
+  }
+  const title = snapshot?.title || snapshot?.url || 'Current page connected';
+  let domain = '';
+  try {
+    domain = snapshot?.url ? new URL(snapshot.url).hostname : '';
+  } catch {
+    domain = snapshot?.origin || '';
+  }
+  const captured = snapshot?.captured_at ? new Date(snapshot.captured_at) : null;
+  const capturedLabel =
+    captured && !Number.isNaN(captured.getTime())
+      ? `Updated ${captured.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+      : 'Waiting for page snapshot';
+  const pageHint = snapshot?.page_type_hint ? ` · ${snapshot.page_type_hint.replace(/_/g, ' ')}` : '';
+  return {
+    title,
+    meta: `${domain || 'No domain'} · ${capturedLabel}${pageHint}`,
+  };
+}
+
+function renderPageContext(snapshot) {
+  currentPageContext = snapshot || null;
+  const summary = pageContextSummary(snapshot);
+  if (pageContextTitleEl) pageContextTitleEl.textContent = summary.title;
+  if (pageContextMetaEl) pageContextMetaEl.textContent = summary.meta;
+}
+
+function shouldAttachPageHint(text) {
+  const haystack = String(text || '').toLowerCase();
+  return /(this page|current page|current tab|open page|open tab|that page|screen|form|what is on the page|look at the page|analyze the page|работай с текущей страницей|текущая страница|текущая вкладка|страниц[аеу]|вкладк[аеу]|что на странице|посмотри страницу|проанализируй страницу|заполни по странице)/i.test(
+    haystack
+  );
+}
+
+async function requestCurrentPageContext(forceRefresh) {
+  const message = { type: forceRefresh ? 'CAPTURE_CURRENT_PAGE' : 'GET_CURRENT_PAGE_CONTEXT' };
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({
+          available: false,
+          unavailable_reason: chrome.runtime.lastError.message || 'Failed to load current page context.',
+        });
+        return;
+      }
+      const payload = response?.payload || null;
+      if (payload) {
+        resolve(payload);
+        return;
+      }
+      if (!forceRefresh) {
+        chrome.runtime.sendMessage({ type: 'CAPTURE_CURRENT_PAGE' }, (captureResponse) => {
+          if (chrome.runtime.lastError) {
+            resolve({
+              available: false,
+              unavailable_reason: chrome.runtime.lastError.message || 'Failed to capture current page context.',
+            });
+            return;
+          }
+          resolve(captureResponse?.payload || null);
+        });
+        return;
+      }
+      resolve(null);
+    });
+  });
 }
 
 function stringifySafe(obj) {
@@ -331,12 +421,20 @@ function showTyping() {
 
 async function streamChat(apiBase, conversationId, userText, onToken, onEvent) {
   const url = `${apiBase}/api/chat`;
+  const browserContextPayload =
+    usePageContextToggle?.checked && currentPageContext
+      ? {
+          page_snapshot: currentPageContext,
+          attach_hint: shouldAttachPageHint(userText),
+        }
+      : undefined;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       content: userText,
       conversation_id: conversationId || undefined,
+      browser_context: browserContextPayload,
     }),
   });
 
@@ -450,6 +548,15 @@ async function sendMessage() {
       r();
     });
   });
+
+  if (usePageContextToggle?.checked) {
+    try {
+      const freshSnapshot = await requestCurrentPageContext(true);
+      renderPageContext(freshSnapshot);
+    } catch (err) {
+      console.warn('Failed to refresh page context before sending message', err);
+    }
+  }
 
   let pendingText = '';
   /** @type {{ tool: string, status: string, toolInput?: object, toolOutput?: string }[]} */
@@ -731,8 +838,26 @@ saveApiBtn.addEventListener('click', () => {
   });
 });
 
+refreshPageContextBtn?.addEventListener('click', async () => {
+  refreshPageContextBtn.disabled = true;
+  const previous = refreshPageContextBtn.textContent;
+  refreshPageContextBtn.textContent = 'Refreshing…';
+  const snapshot = await requestCurrentPageContext(true);
+  renderPageContext(snapshot);
+  refreshPageContextBtn.textContent = previous || 'Refresh';
+  refreshPageContextBtn.disabled = false;
+});
+
+usePageContextToggle?.addEventListener('change', () => {
+  saveUsePageContext(usePageContextToggle.checked);
+});
+
 loadApiBase((base) => {
   apiBaseInput.value = base;
+});
+
+loadUsePageContext((enabled) => {
+  if (usePageContextToggle) usePageContextToggle.checked = enabled;
 });
 
 loadMessages((saved) => {
@@ -748,4 +873,14 @@ loadMessages((saved) => {
 
 loadConversationId((cid) => {
   conversationId = cid;
+});
+
+requestCurrentPageContext(false).then((snapshot) => {
+  renderPageContext(snapshot);
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === 'PAGE_CONTEXT_UPDATED') {
+    renderPageContext(message.payload || null);
+  }
 });

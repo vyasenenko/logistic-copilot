@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   Archive,
   ArrowRight,
+  Bell,
   Building2,
   Calendar,
   CheckCircle2,
@@ -34,6 +35,7 @@ import {
   Sparkles,
   Truck,
   Users,
+  X,
 } from "lucide-react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -305,6 +307,36 @@ interface ShipmentThreadResponse {
   thread_subject: string | null;
   quote_token: string | null;
   messages: ShipmentThreadMessageRecord[];
+}
+
+type NotificationKind = "email" | "shipment" | "bid" | "review" | "status" | "archive" | "system";
+
+interface NotificationItem {
+  id: string;
+  kind: NotificationKind;
+  title: string;
+  detail: string;
+  created_at: string;
+  shipment_id: string | null;
+  quote_token: string | null;
+  unread: boolean;
+  toast_visible: boolean;
+  archived: boolean;
+}
+
+interface NotificationFeedResponse {
+  items: Array<
+    Omit<NotificationItem, "unread" | "toast_visible"> & {
+      event_type: string;
+      stage: string;
+      route: string | null;
+      status: string | null;
+    }
+  >;
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 }
 
 function threadMessageVisual(message: ShipmentThreadMessageRecord) {
@@ -743,6 +775,120 @@ function reviewPriorityClasses(priority: string) {
   return "bg-white/10 text-white border-white/10";
 }
 
+function notificationAccent(kind: NotificationKind) {
+  if (kind === "email") return "border-cyan-300/18 bg-cyan-300/10 text-cyan-100";
+  if (kind === "shipment") return "border-emerald-300/18 bg-emerald-300/10 text-emerald-100";
+  if (kind === "bid") return "border-orange-300/18 bg-orange-300/10 text-orange-100";
+  if (kind === "review") return "border-amber-300/18 bg-amber-300/10 text-amber-100";
+  if (kind === "status") return "border-violet-300/18 bg-violet-300/10 text-violet-100";
+  if (kind === "archive") return "border-rose-300/18 bg-rose-300/10 text-rose-100";
+  return "border-white/10 bg-white/10 text-white";
+}
+
+function notificationBadgeLabel(kind: NotificationKind) {
+  if (kind === "email") return "Email";
+  if (kind === "shipment") return "Shipment";
+  if (kind === "bid") return "Bid";
+  if (kind === "review") return "Review";
+  if (kind === "status") return "Status";
+  if (kind === "archive") return "Archive";
+  return "System";
+}
+
+function buildNotificationFromWorkflowEvent(
+  event: WorkflowEventRecord,
+  shipment: ShipmentRecord | null,
+): NotificationItem | null {
+  const route = shipment ? formatRoute(shipment) : "Shipment";
+  const quoteToken = shipment?.quote_token || (typeof event.payload?.quote_token === "string" ? event.payload.quote_token : null);
+  const sender = typeof event.payload?.sender === "string" ? event.payload.sender : null;
+  switch (event.event_type) {
+    case "email_received":
+      return {
+        id: event.id,
+        kind: "email",
+        title: sender ? `New email from ${sender}` : "New inbound email",
+        detail: quoteToken ? `${route} · ${quoteToken}` : route,
+        created_at: event.created_at,
+        shipment_id: event.shipment_id,
+        quote_token: quoteToken,
+        unread: true,
+        toast_visible: true,
+        archived: false,
+      };
+    case "shipment_parsed":
+    case "parsing_completed":
+      return {
+        id: event.id,
+        kind: "shipment",
+        title: "Shipment captured from inbox",
+        detail: quoteToken ? `${route} · ${quoteToken}` : route,
+        created_at: event.created_at,
+        shipment_id: event.shipment_id,
+        quote_token: quoteToken,
+        unread: true,
+        toast_visible: true,
+        archived: false,
+      };
+    case "bid_received":
+      return {
+        id: event.id,
+        kind: "bid",
+        title: "Carrier bid received",
+        detail: quoteToken ? `${route} · ${quoteToken}` : route,
+        created_at: event.created_at,
+        shipment_id: event.shipment_id,
+        quote_token: quoteToken,
+        unread: true,
+        toast_visible: true,
+        archived: false,
+      };
+    case "manual_review_required":
+      return {
+        id: event.id,
+        kind: "review",
+        title: "Needs operator review",
+        detail: typeof event.payload?.reason === "string" ? event.payload.reason : route,
+        created_at: event.created_at,
+        shipment_id: event.shipment_id,
+        quote_token: quoteToken,
+        unread: true,
+        toast_visible: true,
+        archived: false,
+      };
+    case "customer_status_sent":
+    case "tms_status_ingested":
+    case "tms_status_updated":
+      return {
+        id: event.id,
+        kind: "status",
+        title: event.event_type === "customer_status_sent" ? "Status reply updated" : "Status feed updated",
+        detail: quoteToken ? `${route} · ${quoteToken}` : route,
+        created_at: event.created_at,
+        shipment_id: event.shipment_id,
+        quote_token: quoteToken,
+        unread: true,
+        toast_visible: true,
+        archived: false,
+      };
+    case "shipment_archived":
+      return {
+        id: event.id,
+        kind: "archive",
+        title: "Shipment archived",
+        detail: quoteToken ? `${route} · ${quoteToken}` : route,
+        created_at: event.created_at,
+        shipment_id: event.shipment_id,
+        quote_token: quoteToken,
+        unread: true,
+        toast_visible: true,
+        archived: true,
+      };
+    default:
+      return null;
+  }
+}
+
 function ShipmentStatusPill({ status }: { status: string }) {
   return (
     <span className={`inline-flex h-6 shrink-0 items-center whitespace-nowrap rounded-full border px-2.5 text-[10px] font-medium capitalize leading-none ${statusPillClass(status)}`}>
@@ -784,6 +930,12 @@ export function FreightDashboardWorkspace() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [lastSyncSummary, setLastSyncSummary] = useState<OutlookSyncResponse | null>(null);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
+  const [notificationLoading, setNotificationLoading] = useState(false);
+  const [notificationHasMore, setNotificationHasMore] = useState(false);
+  const [notificationOffset, setNotificationOffset] = useState(0);
+  const [notificationTotal, setNotificationTotal] = useState(0);
   const [selectedShipmentId, setSelectedShipmentId] = useState<string | null>(null);
   const [selectedStatusTaskId, setSelectedStatusTaskId] = useState<string | null>(null);
   const [statusQueueScope, setStatusQueueScope] = useState<"active" | "resolved">("active");
@@ -814,8 +966,11 @@ export function FreightDashboardWorkspace() {
   const drawerScrollRef = useRef<HTMLDivElement | null>(null);
   const monthPickerRef = useRef<HTMLDivElement | null>(null);
   const overviewRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const notificationTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const resolvingQuoteTokenRef = useRef<string | null>(null);
   const editFieldRefs = useRef<Partial<Record<EditFocusTarget, HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null>>>({});
+  const shipmentsRef = useRef<ShipmentRecord[]>([]);
+  const archivedShipmentsRef = useRef<ShipmentRecord[]>([]);
   const [shipmentCreateForm, setShipmentCreateForm] = useState({
     client_id: "",
     origin: "Chicago, IL",
@@ -954,6 +1109,14 @@ export function FreightDashboardWorkspace() {
     });
     return groups;
   }, [boardShipments]);
+  const unreadNotificationCount = useMemo(
+    () => notifications.reduce((total, item) => total + (item.unread ? 1 : 0), 0),
+    [notifications],
+  );
+  const visibleToasts = useMemo(
+    () => notifications.filter((item) => item.toast_visible).slice(0, 4),
+    [notifications],
+  );
 
   function mergeShipmentIntoState(shipment: ShipmentRecord) {
     setShipments((current) => {
@@ -965,6 +1128,72 @@ export function FreightDashboardWorkspace() {
       next[index] = shipment;
       return next;
     });
+  }
+
+  function appendNotification(item: NotificationItem) {
+    setNotifications((current) => {
+      const alreadyExists = current.some((existing) => existing.id === item.id);
+      if (!alreadyExists) {
+        setNotificationTotal((total) => total + 1);
+      }
+      const deduped = current.filter((existing) => existing.id !== item.id);
+      return [item, ...deduped].slice(0, 40);
+    });
+  }
+
+  function markNotificationRead(id: string) {
+    setNotifications((current) => current.map((item) => (item.id === id ? { ...item, unread: false, toast_visible: false } : item)));
+  }
+
+  function hideNotificationToast(id: string) {
+    setNotifications((current) => current.map((item) => (item.id === id ? { ...item, toast_visible: false } : item)));
+  }
+
+  function markAllNotificationsRead() {
+    setNotifications((current) => current.map((item) => ({ ...item, unread: false, toast_visible: false })));
+  }
+
+  function createSystemNotification(title: string, detail: string): NotificationItem {
+    return {
+      id: `system-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: "system",
+      title,
+      detail,
+      created_at: new Date().toISOString(),
+      shipment_id: null,
+      quote_token: null,
+      unread: true,
+      toast_visible: true,
+      archived: false,
+    };
+  }
+
+  async function loadNotifications(options?: { reset?: boolean }) {
+    const reset = options?.reset ?? false;
+    const nextOffset = reset ? 0 : notificationOffset;
+    setNotificationLoading(true);
+    try {
+      const response = await fetchJson<NotificationFeedResponse>(
+        `/api/freight/notifications?limit=20&offset=${encodeURIComponent(String(nextOffset))}`,
+      );
+      const incoming = response.items.map((item) => ({
+        ...item,
+        unread: false,
+        toast_visible: false,
+      }));
+      setNotifications((current) => {
+        const mergedBase = reset ? [] : current;
+        const deduped = mergedBase.filter((existing) => !incoming.some((item) => item.id === existing.id));
+        return [...deduped, ...incoming].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      });
+      setNotificationHasMore(response.has_more);
+      setNotificationOffset(response.offset + response.items.length);
+      setNotificationTotal(response.total);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Failed to load notifications.");
+    } finally {
+      setNotificationLoading(false);
+    }
   }
 
   function currentQuoteParam() {
@@ -1208,6 +1437,34 @@ export function FreightDashboardWorkspace() {
     return true;
   }
 
+  function openNotification(item: NotificationItem) {
+    markNotificationRead(item.id);
+    if (!item.shipment_id) {
+      setNotificationCenterOpen(false);
+      return;
+    }
+    const archivedShipment = archivedShipmentsRef.current.find((shipment) => shipment.id === item.shipment_id);
+    if (archivedShipment) {
+      setTab("archive");
+      setSelectedShipmentId(item.shipment_id);
+      setDrawerOpen(true);
+      setDrawerMode("overview");
+      setQuoteParam(null);
+      setNotificationCenterOpen(false);
+      return;
+    }
+    setTab("shipments");
+    const existingShipment = shipmentsRef.current.find((shipment) => shipment.id === item.shipment_id);
+    if (!existingShipment && item.quote_token) {
+      void openShipmentByQuoteToken(item.quote_token);
+      setNotificationCenterOpen(false);
+      return;
+    }
+    if (selectShipment(item.shipment_id, { openDrawer: true })) {
+      setNotificationCenterOpen(false);
+    }
+  }
+
   const refetchShipmentDetailTypes = useMemo(
     () =>
       new Set([
@@ -1333,7 +1590,37 @@ export function FreightDashboardWorkspace() {
       if (overviewRefreshTimerRef.current) {
         clearTimeout(overviewRefreshTimerRef.current);
       }
+      Object.values(notificationTimersRef.current).forEach((timer) => clearTimeout(timer));
     };
+  }, []);
+
+  useEffect(() => {
+    shipmentsRef.current = shipments;
+  }, [shipments]);
+
+  useEffect(() => {
+    archivedShipmentsRef.current = archivedShipments;
+  }, [archivedShipments]);
+
+  useEffect(() => {
+    const activeTimers = notificationTimersRef.current;
+    visibleToasts.forEach((item) => {
+      if (activeTimers[item.id]) return;
+      activeTimers[item.id] = setTimeout(() => {
+        hideNotificationToast(item.id);
+        delete activeTimers[item.id];
+      }, 6500);
+    });
+    Object.keys(activeTimers).forEach((id) => {
+      if (!visibleToasts.some((item) => item.id === id)) {
+        clearTimeout(activeTimers[id]);
+        delete activeTimers[id];
+      }
+    });
+  }, [visibleToasts]);
+
+  useEffect(() => {
+    void loadNotifications({ reset: true });
   }, []);
 
   useFreightSocket({
@@ -1351,6 +1638,14 @@ export function FreightDashboardWorkspace() {
       }
     },
     onWorkflowEvent: ({ shipment_id, event }) => {
+      const shipmentSnapshot =
+        shipmentsRef.current.find((shipment) => shipment.id === shipment_id) ||
+        archivedShipmentsRef.current.find((shipment) => shipment.id === shipment_id) ||
+        null;
+      const notification = buildNotificationFromWorkflowEvent(event as WorkflowEventRecord, shipmentSnapshot);
+      if (notification) {
+        appendNotification(notification);
+      }
       if (shipment_id === selectedShipmentId) {
         setEvents((prev) =>
           prev.some((e) => e.id === event.id) ? prev : [event as WorkflowEventRecord, ...prev],
@@ -1778,6 +2073,12 @@ export function FreightDashboardWorkspace() {
       });
       setLastSyncSummary(response);
       setNotice(`Sync imported ${response.imported} messages and flagged ${response.manual_reviews} review items.`);
+      appendNotification(
+        createSystemNotification(
+          "Outlook sync completed",
+          `Imported ${response.imported} messages, parsed ${response.parsed_shipments} shipments, flagged ${response.manual_reviews} review items.`,
+        ),
+      );
       await hardRefreshDashboard();
       if (selectedShipmentId) {
         await refreshSelectedShipmentContext(selectedShipmentId);
@@ -2684,6 +2985,16 @@ export function FreightDashboardWorkspace() {
     );
   };
 
+  const renderNotificationIcon = (kind: NotificationKind) => {
+    if (kind === "email") return <Mail size={16} />;
+    if (kind === "shipment") return <Package2 size={16} />;
+    if (kind === "bid") return <CircleDollarSign size={16} />;
+    if (kind === "review") return <AlertTriangle size={16} />;
+    if (kind === "status") return <RadioTower size={16} />;
+    if (kind === "archive") return <Archive size={16} />;
+    return <Bell size={16} />;
+  };
+
   return (
     <main className="min-h-screen px-4 py-5 text-[var(--text-main)] sm:px-6 lg:px-8">
       <div className="mx-auto max-w-[1540px] space-y-4">
@@ -2692,7 +3003,7 @@ export function FreightDashboardWorkspace() {
           <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
           <div className="pointer-events-none absolute inset-y-0 right-[26%] w-px bg-cyan-200/8" />
 
-          <div className="relative grid gap-4 xl:grid-cols-[minmax(0,1.2fr),minmax(420px,0.8fr)] xl:items-center">
+          <div className="relative grid gap-4 xl:grid-cols-[minmax(0,1fr),minmax(680px,1.12fr)] xl:items-center">
             <div className="min-w-0 space-y-3">
               <div className="flex flex-wrap items-center gap-3">
                 <div className="inline-flex h-9 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[11px] uppercase tracking-[0.24em] text-cyan-100">
@@ -2712,31 +3023,50 @@ export function FreightDashboardWorkspace() {
               </div>
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
-              {metrics.map((metric) => (
-                <div key={metric.label} className="min-h-[74px] rounded-[14px] border border-cyan-200/10 bg-slate-950/26 px-3 py-2.5 backdrop-blur">
-                  <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/48">{metric.label}</p>
-                  <div className="mt-1.5 space-y-1">
-                    <span className="block text-[1.6rem] font-semibold leading-none text-white">{metric.value}</span>
-                    <span className="block text-[11px] leading-4 text-slate-300 break-words">{metric.detail}</span>
+            <div className="grid gap-1.5 sm:grid-cols-2 xl:grid-cols-6">
+                {metrics.map((metric) => (
+                  <div key={metric.label} className="min-h-[68px] rounded-[13px] border border-cyan-200/10 bg-slate-950/26 px-2.5 py-2 backdrop-blur">
+                    <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/48">{metric.label}</p>
+                    <div className="mt-1 space-y-0.5">
+                      <span className="block text-[1.45rem] font-semibold leading-none text-white">{metric.value}</span>
+                      <span className="block text-[10px] leading-4 text-slate-300 break-words">{metric.detail}</span>
+                    </div>
                   </div>
-                </div>
-              ))}
-              <button
-                onClick={() => void handleOutlookSync()}
-                disabled={submitting !== null}
-                className="min-h-[74px] rounded-[14px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-3 py-2.5 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
-              >
-                <div className="flex flex-col">
-                  <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Outlook</p>
-                  <div className="mt-2">
-                    <span className="inline-flex items-center gap-2 text-base font-semibold text-white">
-                      <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync"}
-                    </span>
-                    <p className="mt-1 text-[11px] text-cyan-100/70">last 10 mails</p>
+                ))}
+                <button
+                  onClick={() => setNotificationCenterOpen((open) => !open)}
+                  className="relative min-h-[68px] overflow-hidden rounded-[13px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] px-2.5 py-2 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-cyan-200/24 hover:bg-cyan-200/10"
+                >
+                  <span className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-[64px] font-black leading-none tracking-[-0.05em] text-cyan-100/[0.08]">
+                    {unreadNotificationCount}
+                  </span>
+                  <div className="relative z-[1] flex items-center justify-between gap-2">
+                    <div className="min-w-0 pr-4">
+                      <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Signals</p>
+                      <span className="mt-0.5 inline-flex items-center gap-1.5 text-[15px] font-semibold text-white">
+                        <Bell size={16} /> Alerts
+                      </span>
+                      <p className="mt-0.5 truncate text-[10px] text-cyan-100/70">
+                        {notifications[0]?.title || "Email, shipment, bid, review"}
+                      </p>
+                    </div>
                   </div>
-                </div>
-              </button>
+                </button>
+                <button
+                  onClick={() => void handleOutlookSync()}
+                  disabled={submitting !== null}
+                  className="min-h-[68px] rounded-[13px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-2.5 py-2 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Outlook</p>
+                      <span className="mt-0.5 inline-flex items-center gap-1.5 text-[15px] font-semibold text-white">
+                        <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync"}
+                      </span>
+                      <p className="mt-0.5 text-[10px] text-cyan-100/70">last 10 mails</p>
+                    </div>
+                  </div>
+                </button>
             </div>
           </div>
 
@@ -2782,7 +3112,7 @@ export function FreightDashboardWorkspace() {
                   <div>
                     <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Board controls</p>
                     <p className="mt-1 text-sm text-slate-300">
-                      Search shipments, switch operational month, and control the live board from one surface.
+                      Search shipments, switch created month, and control the live board from one surface.
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -2827,7 +3157,7 @@ export function FreightDashboardWorkspace() {
                                   <Calendar size={16} />
                                 </span>
                                 <span className="min-w-0">
-                                  <span className="block text-[10px] uppercase tracking-[0.18em] text-cyan-200/55">Operational month</span>
+                                  <span className="block text-[10px] uppercase tracking-[0.18em] text-cyan-200/55">Created month</span>
                                   <span className="block truncate text-sm font-medium text-white">{formatMonthLabel(selectedBoardMonth)}</span>
                                 </span>
                               </span>
@@ -3124,6 +3454,158 @@ export function FreightDashboardWorkspace() {
             </div>
           </section>
         )}
+
+        {visibleToasts.length > 0 && (
+          <div className="pointer-events-none fixed right-6 top-6 z-[85] flex w-[min(360px,calc(100vw-2rem))] flex-col gap-3">
+            {visibleToasts.map((item) => (
+              <div
+                key={item.id}
+                className="pointer-events-auto overflow-hidden rounded-[20px] border border-cyan-200/14 bg-[linear-gradient(180deg,rgba(12,20,31,0.96),rgba(10,16,26,0.95))] p-4 shadow-[0_24px_80px_rgba(2,8,23,0.42)] backdrop-blur"
+              >
+                <div className="flex items-start gap-3">
+                  <div className={`mt-0.5 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border ${notificationAccent(item.kind)}`}>
+                    {renderNotificationIcon(item.kind)}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200/52">{notificationBadgeLabel(item.kind)}</p>
+                        <p className="mt-1 text-sm font-medium text-white">{item.title}</p>
+                      </div>
+                      <button
+                        onClick={() => hideNotificationToast(item.id)}
+                        className="rounded-full p-1 text-slate-400 transition hover:bg-white/8 hover:text-white"
+                        aria-label="Dismiss notification"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                    <p className="mt-2 text-sm leading-6 text-slate-300">{item.detail}</p>
+                    <div className="mt-3 flex items-center justify-between gap-3">
+                      <span className="text-[11px] text-slate-400">{formatAge(item.created_at)}</span>
+                      <button
+                        onClick={() => openNotification(item)}
+                        className="rounded-[12px] border border-cyan-200/12 bg-cyan-200/8 px-3 py-1.5 text-xs font-medium text-cyan-50 transition hover:border-cyan-200/24 hover:bg-cyan-200/14"
+                      >
+                        Open
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div
+          className={`fixed inset-0 z-[88] bg-slate-950/30 backdrop-blur-[2px] transition ${
+            notificationCenterOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+          }`}
+          onClick={() => setNotificationCenterOpen(false)}
+        />
+        <aside
+          className={`fixed right-6 top-6 z-[89] flex h-[min(82vh,760px)] w-[min(390px,calc(100vw-2rem))] flex-col overflow-hidden rounded-[28px] border border-cyan-200/14 bg-[linear-gradient(180deg,rgba(12,20,31,0.97),rgba(9,15,25,0.96))] shadow-[0_28px_120px_rgba(2,8,23,0.56)] backdrop-blur transition-all duration-300 ${
+            notificationCenterOpen ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-4 opacity-0"
+          }`}
+        >
+          <div className="border-b border-cyan-200/10 px-5 py-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/52">Notification center</p>
+                <h3 className="mt-1 text-lg font-semibold text-white">Live ops signals</h3>
+                <p className="mt-1 text-sm text-slate-300">Inbound email, shipment creation, bids, reviews, and status updates land here.</p>
+              </div>
+              <button
+                onClick={() => setNotificationCenterOpen(false)}
+                className="rounded-full p-2 text-slate-400 transition hover:bg-white/8 hover:text-white"
+                aria-label="Close notification center"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="mt-4 flex items-center gap-2">
+              <span className="rounded-full border border-cyan-200/12 bg-cyan-200/8 px-3 py-1 text-xs text-cyan-50">
+                {unreadNotificationCount} unread
+              </span>
+              <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300">
+                {notificationTotal} total
+              </span>
+              <button
+                onClick={markAllNotificationsRead}
+                className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs text-slate-300 transition hover:border-cyan-200/18 hover:bg-cyan-200/8 hover:text-white"
+              >
+                Mark all read
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
+            {notificationLoading && notifications.length === 0 ? (
+              <div className="rounded-[22px] border border-white/10 bg-white/[0.03] px-4 py-6 text-sm text-slate-400">
+                <Loader2 className="mr-2 inline animate-spin" size={16} /> Loading notifications...
+              </div>
+            ) : notifications.length === 0 ? (
+              <div className="rounded-[22px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-sm text-slate-400">
+                No notification history yet. New inbox and workflow activity will land here automatically.
+              </div>
+            ) : (
+              <>
+                {notifications.map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => openNotification(item)}
+                    className={`w-full rounded-[22px] border px-4 py-4 text-left transition ${
+                      item.unread
+                        ? "border-cyan-200/16 bg-cyan-200/[0.06] hover:bg-cyan-200/[0.09]"
+                        : "border-white/10 bg-white/[0.035] hover:bg-white/[0.055]"
+                    }`}
+                  >
+                    <div className="flex items-start gap-3">
+                      <div className={`mt-0.5 inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] border ${notificationAccent(item.kind)}`}>
+                        {renderNotificationIcon(item.kind)}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-[10px] uppercase tracking-[0.18em] text-cyan-200/52">{notificationBadgeLabel(item.kind)}</span>
+                              {item.unread && <span className="inline-flex h-2 w-2 rounded-full bg-cyan-200" />}
+                            </div>
+                            <p className="mt-1 text-sm font-medium text-white">{item.title}</p>
+                          </div>
+                          <span className="shrink-0 text-[11px] text-slate-400">{formatAge(item.created_at)}</span>
+                        </div>
+                        <p className="mt-2 text-sm leading-6 text-slate-300">{item.detail}</p>
+                        {(item.quote_token || item.shipment_id) && (
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {item.quote_token && (
+                              <span className="rounded-full border border-white/10 bg-white/[0.04] px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-300">
+                                {item.quote_token}
+                              </span>
+                            )}
+                            {item.archived && (
+                              <span className="rounded-full border border-amber-300/18 bg-amber-300/10 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-amber-100">
+                                Archive
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+                {notificationHasMore && (
+                  <button
+                    onClick={() => void loadNotifications()}
+                    disabled={notificationLoading}
+                    className="w-full rounded-[18px] border border-white/10 bg-white/[0.04] px-4 py-3 text-sm text-slate-300 transition hover:border-cyan-200/18 hover:bg-cyan-200/8 hover:text-white disabled:opacity-50"
+                  >
+                    {notificationLoading ? "Loading more..." : "Load more"}
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        </aside>
 
         {monthPickerOpen && typeof document !== "undefined"
           ? createPortal(

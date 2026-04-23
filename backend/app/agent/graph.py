@@ -27,6 +27,7 @@ from langgraph.graph import END, StateGraph
 
 from app.agent.llm import get_primary_llm
 from app.agent.prompts import SYSTEM_PROMPT
+from app.agent.runtime import reset_current_conversation_id, set_current_conversation_id
 from app.agent.state import AgentState
 from app.tools.registry import get_all_tools
 
@@ -151,8 +152,12 @@ async def run_agent(
         conversation_id=conversation_id,
     )
 
-    final_state = await agent_graph.ainvoke(initial_state)
-    return final_state
+    token = set_current_conversation_id(conversation_id)
+    try:
+        final_state = await agent_graph.ainvoke(initial_state)
+        return final_state
+    finally:
+        reset_current_conversation_id(token)
 
 
 async def run_agent_stream(
@@ -169,41 +174,45 @@ async def run_agent_stream(
         conversation_id=conversation_id,
     )
 
+    token = set_current_conversation_id(conversation_id)
     try:
-        async for event in agent_graph.astream_events(initial_state, version="v2"):
-            kind = event["event"]
+        try:
+            async for event in agent_graph.astream_events(initial_state, version="v2"):
+                kind = event["event"]
 
-            if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                content = chunk.content
-                if content:
-                    # Claude returns list of content blocks, OpenAI returns str
-                    if isinstance(content, list):
-                        text = "".join(
-                            block.get("text", "") if isinstance(block, dict) else str(block)
-                            for block in content
-                        )
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    content = chunk.content
+                    if content:
+                        # Claude returns list of content blocks, OpenAI returns str
+                        if isinstance(content, list):
+                            text = "".join(
+                                block.get("text", "") if isinstance(block, dict) else str(block)
+                                for block in content
+                            )
+                        else:
+                            text = str(content)
+                        if text:
+                            yield {"event": "token", "data": text}
+
+                elif kind == "on_tool_start":
+                    payload = _tool_start_sse_payload(event)
+                    yield {"event": "tool_start", "data": payload}
+
+                elif kind == "on_tool_end":
+                    raw = event.get("data", {})
+                    if hasattr(raw, "content"):
+                        text = str(raw.content)
+                    elif isinstance(raw, dict):
+                        out = raw.get("output")
+                        text = json.dumps(out, default=str) if out is not None else str(raw)
                     else:
-                        text = str(content)
-                    if text:
-                        yield {"event": "token", "data": text}
+                        text = str(raw)
+                    yield {"event": "tool_end", "data": _tool_end_sse_payload(event, text)}
 
-            elif kind == "on_tool_start":
-                payload = _tool_start_sse_payload(event)
-                yield {"event": "tool_start", "data": payload}
-
-            elif kind == "on_tool_end":
-                raw = event.get("data", {})
-                if hasattr(raw, "content"):
-                    text = str(raw.content)
-                elif isinstance(raw, dict):
-                    out = raw.get("output")
-                    text = json.dumps(out, default=str) if out is not None else str(raw)
-                else:
-                    text = str(raw)
-                yield {"event": "tool_end", "data": _tool_end_sse_payload(event, text)}
-
-        yield {"event": "done", "data": ""}
-    except Exception as exc:
-        yield {"event": "error", "data": str(exc)}
-        yield {"event": "done", "data": ""}
+            yield {"event": "done", "data": ""}
+        except Exception as exc:
+            yield {"event": "error", "data": str(exc)}
+            yield {"event": "done", "data": ""}
+    finally:
+        reset_current_conversation_id(token)
