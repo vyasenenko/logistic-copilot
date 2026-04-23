@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Logistic Copilot</title>
+  <title>LogistiCopilot</title>
   <link rel="stylesheet" href="sidepanel.css" />
   <!-- Bundled locally: CDN can be blocked; without libs markdown falls back to escaped plain text -->
   <script src="vendor/marked.min.js"></script>
@@ -13,36 +13,99 @@
   <div class="app">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true"></div>
-        <div class="brand-text">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7" rx="1"></rect>
+            <rect x="14" y="3" width="7" height="7" rx="1"></rect>
+            <rect x="3" y="14" width="7" height="7" rx="1"></rect>
+            <rect x="14" y="14" width="7" height="7" rx="1"></rect>
+          </svg>
+        </span>
+        <span class="brand-text">
           <span class="brand-name">Logistic Copilot</span>
-          <span class="brand-sub">Agent</span>
-        </div>
+          <span class="brand-agent">Agent</span>
+        </span>
       </div>
       <div class="topbar-actions">
-        <button type="button" class="icon-btn" id="themeBtn" title="Toggle color theme" aria-label="Toggle color theme"></button>
-        <details class="popover">
-          <summary class="icon-btn" title="API settings" aria-label="Settings">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M4 7h16M4 12h10M4 17h16"/><circle cx="16" cy="12" r="2"/>
+        <details class="topbar-menu" id="topbarMenu">
+          <summary class="icon-btn topbar-menu__trigger" id="topbarMenuTrigger" title="Menu" aria-label="Open menu" aria-haspopup="menu">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" class="topbar-menu__dots" aria-hidden="true">
+              <circle cx="12" cy="5" r="1.85"></circle>
+              <circle cx="12" cy="12" r="1.85"></circle>
+              <circle cx="12" cy="19" r="1.85"></circle>
             </svg>
           </summary>
-          <div class="popover-panel">
-            <label class="field-label" for="apiBaseInput">Backend URL</label>
-            <input type="url" id="apiBaseInput" class="field-input" placeholder="https://api.logisticopilot.com" list="apiBaseSuggestions" />
-            <datalist id="apiBaseSuggestions">
-              <option value="https://api.logisticopilot.com"></option>
-              <option value="http://localhost:8000"></option>
-            </datalist>
-            <button type="button" id="saveApiBtn" class="btn-primary">Save</button>
-            <p class="field-hint">CORS: <code>CORS_ALLOW_CHROME_EXTENSIONS=true</code> or add <code>chrome-extension://…</code> to <code>BACKEND_CORS_ORIGINS</code>.</p>
+          <div class="topbar-menu__panel" role="menu">
+            <button type="button" class="topbar-menu__item" id="menuNewChatBtn" role="menuitem">
+              <span class="topbar-menu__item-leading" aria-hidden="true">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 5v14M5 12h14"></path>
+                </svg>
+              </span>
+              <span class="topbar-menu__item-text">
+                <span class="topbar-menu__item-label">New chat</span>
+                <span class="topbar-menu__item-desc">Empty thread; next message starts a new conversation</span>
+              </span>
+            </button>
+            <button type="button" class="topbar-menu__item" id="menuChatsBtn" role="menuitem">
+              <span class="topbar-menu__item-leading" aria-hidden="true">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </span>
+              <span class="topbar-menu__item-text">
+                <span class="topbar-menu__item-label">Conversations</span>
+                <span class="topbar-menu__item-desc">Open the side drawer</span>
+              </span>
+              <span class="topbar-menu__item-chevron" aria-hidden="true">›</span>
+            </button>
+            <button type="button" class="topbar-menu__item" id="menuThemeBtn" role="menuitem">
+              <span class="topbar-menu__item-leading" id="menuThemeIconWrap" aria-hidden="true"></span>
+              <span class="topbar-menu__item-text">
+                <span class="topbar-menu__item-label" id="menuThemeLabel">Appearance</span>
+                <span class="topbar-menu__item-desc" id="menuThemeDesc">Switch light / dark</span>
+              </span>
+            </button>
+            <details class="topbar-menu__settings">
+              <summary class="topbar-menu__item topbar-menu__item--summary">
+                <span class="topbar-menu__item-leading" aria-hidden="true">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M4 7h16M4 12h10M4 17h16"></path>
+                    <circle cx="16" cy="12" r="2"></circle>
+                  </svg>
+                </span>
+                <span class="topbar-menu__item-text">
+                  <span class="topbar-menu__item-label">Backend URL</span>
+                  <span class="topbar-menu__item-desc">API base for this panel</span>
+                </span>
+                <span class="topbar-menu__item-chevron topbar-menu__item-chevron--settings" aria-hidden="true">›</span>
+              </summary>
+              <div class="topbar-menu__settings-body">
+                <label class="field-label" for="apiBaseInput">Backend URL</label>
+                <input type="url" id="apiBaseInput" class="field-input" placeholder="https://api.logisticopilot.com" list="apiBaseSuggestions" />
+                <datalist id="apiBaseSuggestions">
+                  <option value="https://api.logisticopilot.com"></option>
+                  <option value="http://localhost:8000"></option>
+                </datalist>
+                <button type="button" id="saveApiBtn" class="btn-primary">Save</button>
+                <p class="field-hint">CORS: <code>CORS_ALLOW_CHROME_EXTENSIONS=true</code> or add <code>chrome-extension://…</code> to <code>BACKEND_CORS_ORIGINS</code>.</p>
+              </div>
+            </details>
+            <div class="topbar-menu__delete-block" role="none">
+              <button type="button" class="topbar-menu__delete-btn" id="menuClearBtn" role="menuitem">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6l-1 14H6L5 6"></path>
+                  <path d="M10 11v6"></path>
+                  <path d="M14 11v6"></path>
+                  <path d="M9 6V4h6v2"></path>
+                </svg>
+                <span>Delete chat</span>
+              </button>
+              <p class="topbar-menu__delete-hint">Server + panel if linked.</p>
+            </div>
           </div>
         </details>
-        <button type="button" class="icon-btn danger" id="clearBtn" title="Clear chat">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/>
-          </svg>
-        </button>
       </div>
     </header>
 
@@ -72,21 +135,60 @@
     </main>
 
     <footer class="composer">
-      <div class="composer-inner">
-        <textarea
-          id="userInput"
-          placeholder="Message…"
-          rows="1"
-          maxlength="50000"
-          aria-label="Message"
-        ></textarea>
-        <button type="button" id="sendBtn" class="send-fab" title="Send">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-            <path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>
-          </svg>
-        </button>
+      <div class="composer-inner" id="composerInner">
+        <div class="composer-input-wrap">
+          <div id="composerPlaceholderGhost" class="composer-placeholder-ghost" aria-hidden="true"></div>
+          <textarea
+            id="userInput"
+            placeholder=""
+            rows="1"
+            maxlength="50000"
+            aria-label="Chat message"
+            title="Double-click or hold to use the rotating example as your message"
+          ></textarea>
+        </div>
+        <div class="composer-actions">
+          <button type="button" id="micBtn" class="composer-fab composer-fab--mic" title="Start voice dictation" aria-label="Start voice dictation">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" aria-hidden="true">
+              <rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0"></path><path d="M12 18v3"></path><path d="M8 21h8"></path>
+            </svg>
+          </button>
+          <button type="button" id="sendBtn" class="composer-fab send-fab" title="Send" aria-label="Send">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+              <path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>
+            </svg>
+          </button>
+        </div>
       </div>
     </footer>
+
+    <div id="chatPicker" class="chat-picker" hidden>
+      <button type="button" class="chat-picker-backdrop" id="chatPickerBackdrop" aria-label="Close conversations drawer"></button>
+      <aside
+        class="chat-picker-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="chatPickerTitle"
+      >
+        <div class="chat-picker-main">
+          <div class="chat-picker-header">
+            <div class="chat-picker-heading">
+              <p class="chat-picker-kicker">Threads</p>
+              <h2 class="chat-picker-title" id="chatPickerTitle">Conversations</h2>
+              <p class="chat-picker-subtitle">Esc or backdrop to close</p>
+            </div>
+            <button type="button" class="icon-btn" id="chatPickerClose" title="Close drawer" aria-label="Close conversations drawer">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M18 6L6 18M6 6l12 12"></path>
+              </svg>
+            </button>
+          </div>
+          <button type="button" class="btn-primary chat-picker-new" id="newChatBtn">New chat</button>
+          <div id="chatPickerList" class="chat-picker-list" role="listbox" aria-label="Conversation list"></div>
+          <p id="chatPickerStatus" class="chat-picker-status" hidden></p>
+        </div>
+      </aside>
+    </div>
   </div>
 
   <script src="sidepanel.js"></script>

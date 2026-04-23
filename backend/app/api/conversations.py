@@ -1,7 +1,9 @@
 """Conversations management endpoints."""
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.memory.database import Conversation, Message, get_session
@@ -43,9 +45,14 @@ async def get_messages(
     session: AsyncSession = Depends(get_session),
 ):
     """Get all messages in a conversation."""
+    try:
+        cid = UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid conversation id") from exc
+
     result = await session.execute(
         select(Message)
-        .where(Message.conversation_id == conversation_id)
+        .where(Message.conversation_id == cid)
         .order_by(Message.created_at)
     )
     messages = result.scalars().all()
@@ -58,3 +65,24 @@ async def get_messages(
         }
         for msg in messages
     ]
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+async def delete_conversation(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Delete a conversation and all its messages (browser context lives in conversation row)."""
+    try:
+        cid = UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid conversation id") from exc
+
+    conv = await session.get(Conversation, cid)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    await session.execute(delete(Message).where(Message.conversation_id == cid))
+    await session.execute(delete(Conversation).where(Conversation.id == cid))
+    await session.commit()
+    return Response(status_code=204)
