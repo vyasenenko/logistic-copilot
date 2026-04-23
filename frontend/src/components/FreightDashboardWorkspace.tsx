@@ -43,6 +43,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers" | "archive";
 type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
 type DrawerMode = "overview" | "edit";
+type DrawerMobileTab = "details" | "thread";
 type ThreadTab = "timeline" | "client" | "carrier_quotes" | "system";
 type ArchiveReasonCode = "duplicate" | "cancelled" | "parsed_error" | "fraud" | "test" | "non_delivery_bounce" | "other";
 type EditFocusTarget = "client_id" | "equipment_type" | "origin" | "destination" | "pallets" | "weight_lb" | "ready_at" | "delivery_at" | "notes";
@@ -905,6 +906,7 @@ export function FreightDashboardWorkspace() {
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("overview");
   const [drawerMode, setDrawerMode] = useState<DrawerMode>("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [drawerMobileTab, setDrawerMobileTab] = useState<DrawerMobileTab>("details");
   const [activeBoardFilter, setActiveBoardFilter] = useState<"all" | "today" | "attention">("all");
   const [shipmentSearch, setShipmentSearch] = useState("");
   const [selectedBoardMonth, setSelectedBoardMonth] = useState(currentMonthValue());
@@ -1410,6 +1412,7 @@ export function FreightDashboardWorkspace() {
     setThreadError(null);
     setThreadLoading(false);
     setActiveThreadTab("timeline");
+    setDrawerMobileTab("details");
     if (!shipmentId) return;
     setThreadCache((current) => {
       if (!(shipmentId in current)) return current;
@@ -1692,9 +1695,11 @@ export function FreightDashboardWorkspace() {
       setDocuments([]);
       setDrawerMode("overview");
       setThreadError(null);
+      setDrawerMobileTab("details");
       return;
     }
     setDrawerMode("overview");
+    setDrawerMobileTab("details");
     setEvaluation(null);
     setQuotePreview(null);
     setStatusReplyPreview(null);
@@ -2611,7 +2616,7 @@ export function FreightDashboardWorkspace() {
                     <button
                       key={section}
                       onClick={() => setWorkspaceSection(section)}
-                      className={`rounded-full px-3 py-2 text-xs capitalize transition ${workspaceSection === section ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"}`}
+                      className={`rounded-[14px] px-3 py-2.5 text-xs uppercase tracking-[0.18em] transition ${workspaceSection === section ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"}`}
                     >
                       {section}
                     </button>
@@ -2873,6 +2878,144 @@ export function FreightDashboardWorkspace() {
     );
   };
 
+  const threadTabOptions = [
+    { key: "timeline", label: "Timeline" },
+    { key: "client", label: "Customer" },
+    { key: "carrier_quotes", label: "Carrier Quotes" },
+    { key: "system", label: "System" },
+  ] as const;
+
+  const renderThreadPanel = ({ embedded = false }: { embedded?: boolean } = {}) => {
+    if (!selectedShipment) {
+      return null;
+    }
+
+    return (
+      <div
+        className={`relative flex min-h-0 w-full flex-col overflow-hidden rounded-[28px] border border-cyan-300/14 bg-[linear-gradient(135deg,rgba(7,15,25,0.94),rgba(11,23,37,0.9)_46%,rgba(17,34,52,0.92)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.13),transparent_28%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.11),transparent_24%)] backdrop-blur-xl ${
+          embedded ? "min-h-[420px] shadow-[0_20px_50px_rgba(0,0,0,0.24)]" : "h-full shadow-[-20px_22px_80px_rgba(0,0,0,0.32)]"
+        }`}
+      >
+        <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(120,210,255,0.05)_18%,transparent_38%,transparent_62%,rgba(120,210,255,0.04)_82%,transparent)]" />
+        <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
+        <div className="pointer-events-none absolute inset-y-0 right-[24%] w-px bg-cyan-200/8" />
+
+        <div className="relative border-b border-cyan-200/10 px-4 py-4 sm:px-5">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="inline-flex h-8 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[10px] uppercase tracking-[0.24em] text-cyan-100">
+                Thread context
+              </div>
+              <h3 className="mt-1 break-words text-lg font-semibold text-white">
+                {threadData?.thread_subject || formatRoute(selectedShipment)}
+              </h3>
+              <p className="mt-2 break-all text-sm text-[var(--text-muted)]">
+                {threadData?.quote_token || selectedShipment.quote_token || "No quote token"}
+              </p>
+            </div>
+            <button
+              onClick={() => void loadShipmentThread(selectedShipment.id, true)}
+              disabled={threadLoading}
+              className="action-button shrink-0 border border-cyan-200/16 bg-cyan-200/10 px-3 py-2 text-cyan-50 hover:bg-cyan-200/18 disabled:opacity-50"
+            >
+              {threadLoading ? "Loading..." : "Refresh"}
+            </button>
+          </div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {threadTabOptions.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setActiveThreadTab(tab.key)}
+                className={`rounded-[10px] px-3 py-2 text-[10px] uppercase tracking-[0.18em] transition ${
+                  activeThreadTab === tab.key
+                    ? "bg-cyan-100 text-slate-950"
+                    : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className={`relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-4 sm:px-5 ${embedded ? "max-h-[calc(100dvh-13rem)]" : ""}`}>
+          {threadLoading && !threadData && (
+            <div className="space-y-3">
+              {[1, 2, 3].map((item) => (
+                <div key={item} className="animate-pulse rounded-2xl border border-white/8 bg-white/5 p-4">
+                  <div className="h-4 w-40 rounded bg-white/10" />
+                  <div className="mt-3 h-3 w-full rounded bg-white/10" />
+                  <div className="mt-2 h-3 w-4/5 rounded bg-white/10" />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {!threadLoading && threadError && (
+            <div className="rounded-2xl border border-rose-300/20 bg-rose-300/10 p-4 text-sm text-rose-100">
+              <p>{threadError}</p>
+              <button
+                onClick={() => void loadShipmentThread(selectedShipment.id, true)}
+                className="mt-3 text-sm font-medium text-white underline decoration-white/30 underline-offset-4"
+              >
+                Retry thread load
+              </button>
+            </div>
+          )}
+
+          {!threadLoading && !threadError && (!threadData || threadData.messages.length === 0) && (
+            <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-5 text-sm text-[var(--text-muted)]">
+              No linked email thread.
+            </div>
+          )}
+
+          {!threadLoading && !threadError && threadData && threadData.messages.length > 0 && filteredThreadMessages.length === 0 && (
+            <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-5 text-sm text-[var(--text-muted)]">
+              {activeThreadTab === "client" && "No customer conversation found for this shipment yet."}
+              {activeThreadTab === "carrier_quotes" && "No carrier quote conversation found for this shipment yet."}
+              {activeThreadTab === "system" && "No system or delivery-failure messages found for this shipment."}
+            </div>
+          )}
+
+          {!threadLoading && !threadError && threadData && filteredThreadMessages.length > 0 && (
+            <div className="space-y-4">
+              {filteredThreadMessages.map((message) => {
+                const visual = threadMessageVisual(message);
+                return (
+                  <div key={message.id} className={`min-w-0 overflow-hidden rounded-2xl border p-4 ${visual.card}`}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="break-all text-sm font-medium text-white">{message.sender}</p>
+                          <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-300">
+                            {visual.label}
+                          </span>
+                        </div>
+                        {message.recipients.length > 0 && (
+                          <p className="mt-1 break-all text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
+                            To: {message.recipients.join(", ")}
+                          </p>
+                        )}
+                        <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                          {formatDate(message.received_at)}
+                        </p>
+                      </div>
+                    </div>
+                    <p className="mt-3 break-words text-sm font-medium text-white">{message.subject || "No subject"}</p>
+                    <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-slate-200 [overflow-wrap:anywhere]">
+                      {message.display_body || message.body_preview || "No message text available."}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   const renderThreadRail = () => {
     if (!drawerOpen || !selectedShipment) {
       return null;
@@ -2880,129 +3023,7 @@ export function FreightDashboardWorkspace() {
 
     return (
       <aside className="pointer-events-auto fixed top-6 right-[calc(50vw+160px)] bottom-6 z-[45] hidden w-[475px] overflow-hidden rounded-[30px] border border-cyan-300/14 bg-[linear-gradient(135deg,rgba(7,15,25,0.94),rgba(11,23,37,0.9)_46%,rgba(17,34,52,0.92)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.13),transparent_28%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.11),transparent_24%)] shadow-[-20px_22px_80px_rgba(0,0,0,0.32)] backdrop-blur-xl xl:flex">
-        <div className="flex h-full min-h-0 w-full flex-col">
-          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(120,210,255,0.05)_18%,transparent_38%,transparent_62%,rgba(120,210,255,0.04)_82%,transparent)]" />
-          <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
-          <div className="pointer-events-none absolute inset-y-0 right-[24%] w-px bg-cyan-200/8" />
-
-          <div className="relative border-b border-cyan-200/10 px-5 py-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="inline-flex h-8 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[10px] uppercase tracking-[0.24em] text-cyan-100">
-                  Thread context
-                </div>
-                <h3 className="mt-1 break-words text-lg font-semibold text-white">
-                  {threadData?.thread_subject || formatRoute(selectedShipment)}
-                </h3>
-                <p className="mt-2 break-all text-sm text-[var(--text-muted)]">
-                  {threadData?.quote_token || selectedShipment.quote_token || "No quote token"}
-                </p>
-              </div>
-              <button
-                onClick={() => void loadShipmentThread(selectedShipment.id, true)}
-                disabled={threadLoading}
-                className="action-button shrink-0 border border-cyan-200/16 bg-cyan-200/10 px-3 py-2 text-cyan-50 hover:bg-cyan-200/18 disabled:opacity-50"
-              >
-                {threadLoading ? "Loading..." : "Refresh"}
-              </button>
-            </div>
-            <div className="mt-4 flex flex-wrap gap-2">
-              {([
-                { key: "timeline", label: "Timeline" },
-                { key: "client", label: "Customer" },
-                { key: "carrier_quotes", label: "Carrier Quotes" },
-                { key: "system", label: "System" },
-              ] as const).map((tab) => (
-                <button
-                  key={tab.key}
-                  type="button"
-                  onClick={() => setActiveThreadTab(tab.key)}
-                  className={`rounded-[10px] px-3 py-2 text-[10px] uppercase tracking-[0.18em] transition ${
-                    activeThreadTab === tab.key
-                      ? "bg-cyan-100 text-slate-950"
-                      : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-5 py-4">
-            {threadLoading && !threadData && (
-              <div className="space-y-3">
-                {[1, 2, 3].map((item) => (
-                  <div key={item} className="animate-pulse rounded-2xl border border-white/8 bg-white/5 p-4">
-                    <div className="h-4 w-40 rounded bg-white/10" />
-                    <div className="mt-3 h-3 w-full rounded bg-white/10" />
-                    <div className="mt-2 h-3 w-4/5 rounded bg-white/10" />
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {!threadLoading && threadError && (
-              <div className="rounded-2xl border border-rose-300/20 bg-rose-300/10 p-4 text-sm text-rose-100">
-                <p>{threadError}</p>
-                <button
-                  onClick={() => void loadShipmentThread(selectedShipment.id, true)}
-                  className="mt-3 text-sm font-medium text-white underline decoration-white/30 underline-offset-4"
-                >
-                  Retry thread load
-                </button>
-              </div>
-            )}
-
-            {!threadLoading && !threadError && (!threadData || threadData.messages.length === 0) && (
-              <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-5 text-sm text-[var(--text-muted)]">
-                No linked email thread.
-              </div>
-            )}
-
-            {!threadLoading && !threadError && threadData && threadData.messages.length > 0 && filteredThreadMessages.length === 0 && (
-              <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-5 text-sm text-[var(--text-muted)]">
-                {activeThreadTab === "client" && "No customer conversation found for this shipment yet."}
-                {activeThreadTab === "carrier_quotes" && "No carrier quote conversation found for this shipment yet."}
-                {activeThreadTab === "system" && "No system or delivery-failure messages found for this shipment."}
-              </div>
-            )}
-
-            {!threadLoading && !threadError && threadData && filteredThreadMessages.length > 0 && (
-              <div className="space-y-4">
-                {filteredThreadMessages.map((message) => {
-                  const visual = threadMessageVisual(message);
-                  return (
-                    <div key={message.id} className={`min-w-0 overflow-hidden rounded-2xl border p-4 ${visual.card}`}>
-                      <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <p className="break-all text-sm font-medium text-white">{message.sender}</p>
-                            <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-slate-300">
-                              {visual.label}
-                            </span>
-                          </div>
-                          {message.recipients.length > 0 && (
-                            <p className="mt-1 break-all text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
-                              To: {message.recipients.join(", ")}
-                            </p>
-                          )}
-                          <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                            {formatDate(message.received_at)}
-                          </p>
-                        </div>
-                      </div>
-                      <p className="mt-3 break-words text-sm font-medium text-white">{message.subject || "No subject"}</p>
-                      <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-slate-200 [overflow-wrap:anywhere]">
-                        {message.display_body || message.body_preview || "No message text available."}
-                      </p>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </div>
+        {renderThreadPanel()}
       </aside>
     );
   };
@@ -3113,7 +3134,7 @@ export function FreightDashboardWorkspace() {
                   onClick={() => setTab(key as DashboardTab)}
                   className={`flex items-center justify-between rounded-2xl px-4 py-3 text-left transition ${active ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"}`}
                 >
-                  <span className="flex items-center gap-3 font-medium"><Icon size={18} />{label}</span>
+                  <span className="flex items-center gap-3 text-xs font-medium uppercase tracking-[0.18em]"><Icon size={18} />{label}</span>
                   <ArrowRight size={16} />
                 </button>
               );
@@ -3402,8 +3423,8 @@ export function FreightDashboardWorkspace() {
                   <p className="mt-1 text-lg font-medium text-white">Separate customer and carrier reviews</p>
                 </div>
                 <div className="flex gap-2">
-                  <button onClick={() => setStatusQueueScope("active")} className={`rounded-full px-3 py-2 text-xs ${statusQueueScope === "active" ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)]"}`}>Active</button>
-                  <button onClick={() => setStatusQueueScope("resolved")} className={`rounded-full px-3 py-2 text-xs ${statusQueueScope === "resolved" ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)]"}`}>Resolved</button>
+                  <button onClick={() => setStatusQueueScope("active")} className={`rounded-[14px] px-3 py-2.5 text-xs uppercase tracking-[0.18em] ${statusQueueScope === "active" ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)]"}`}>Active</button>
+                  <button onClick={() => setStatusQueueScope("resolved")} className={`rounded-[14px] px-3 py-2.5 text-xs uppercase tracking-[0.18em] ${statusQueueScope === "resolved" ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)]"}`}>Resolved</button>
                 </div>
               </div>
               <div className="space-y-2">
@@ -3989,7 +4010,42 @@ export function FreightDashboardWorkspace() {
                   </div>
                 </div>
                 <div ref={drawerScrollRef} className="flex-1 overflow-y-auto px-5 pb-5 pt-4">
-                  {renderShipmentWorkspace()}
+                  {!selectedShipment ? (
+                    renderShipmentWorkspace()
+                  ) : (
+                    <>
+                      <div className="mb-4 flex gap-2 xl:hidden">
+                        {([
+                          { key: "details", label: "Details" },
+                          { key: "thread", label: "Thread" },
+                        ] as const).map((tab) => (
+                          <button
+                            key={tab.key}
+                            type="button"
+                            onClick={() => setDrawerMobileTab(tab.key)}
+                            className={`flex flex-1 items-center justify-between gap-2 rounded-[14px] px-3 py-2.5 text-xs uppercase tracking-[0.18em] transition ${
+                              drawerMobileTab === tab.key
+                                ? "bg-white text-slate-950"
+                                : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"
+                            }`}
+                          >
+                            <span>{tab.label}</span>
+                            <ArrowRight size={14} className="shrink-0" />
+                          </button>
+                        ))}
+                      </div>
+
+                      <div className="xl:hidden">
+                        {drawerMobileTab === "details" ? renderShipmentWorkspace() : (
+                          <div className="pb-2">{renderThreadPanel({ embedded: true })}</div>
+                        )}
+                      </div>
+
+                      <div className="hidden xl:block">
+                        {renderShipmentWorkspace()}
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             </aside>
