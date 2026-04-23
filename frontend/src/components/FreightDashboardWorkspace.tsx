@@ -2714,18 +2714,18 @@ export function FreightDashboardWorkspace() {
 
             <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
               {metrics.map((metric) => (
-                <div key={metric.label} className="rounded-[14px] border border-cyan-200/10 bg-slate-950/26 px-3 py-2.5 backdrop-blur">
+                <div key={metric.label} className="min-h-[74px] rounded-[14px] border border-cyan-200/10 bg-slate-950/26 px-3 py-2.5 backdrop-blur">
                   <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/48">{metric.label}</p>
-                  <div className="mt-1.5 flex items-end justify-between gap-3">
-                    <span className="text-[1.9rem] font-semibold leading-none text-white">{metric.value}</span>
-                    <span className="text-[11px] text-slate-400">{metric.detail}</span>
+                  <div className="mt-1.5 space-y-1">
+                    <span className="block text-[1.6rem] font-semibold leading-none text-white">{metric.value}</span>
+                    <span className="block text-[11px] leading-4 text-slate-300 break-words">{metric.detail}</span>
                   </div>
                 </div>
               ))}
               <button
                 onClick={() => void handleOutlookSync()}
                 disabled={submitting !== null}
-                className="rounded-[14px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-3 py-2.5 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
+                className="min-h-[74px] rounded-[14px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-3 py-2.5 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
               >
                 <div className="flex flex-col">
                   <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Outlook</p>
@@ -2733,6 +2733,7 @@ export function FreightDashboardWorkspace() {
                     <span className="inline-flex items-center gap-2 text-base font-semibold text-white">
                       <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync"}
                     </span>
+                    <p className="mt-1 text-[11px] text-cyan-100/70">last 10 mails</p>
                   </div>
                 </div>
               </button>
@@ -3373,7 +3374,7 @@ export function FreightDashboardWorkspace() {
           </div>
         )}
 
-        {!initialLoading && tab === "shipments" && (
+        {!initialLoading && (tab === "shipments" || tab === "archive") && (
           <>
             <div
               className={`fixed inset-0 z-40 !mt-0 bg-slate-950/45 backdrop-blur-sm transition ${drawerOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}

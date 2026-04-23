@@ -44,6 +44,7 @@ from app.services.freight_read import (
     summarize_archived_shipment_case,
     summarize_shipment_case,
 )
+from app.services.outlook_mail_actions import move_shipment_thread_messages_to_archive
 from app.services.workflow_event_codec import workflow_event_to_record
 
 
@@ -267,6 +268,11 @@ async def freight_archive_shipment(
                 )
             )
         await session.commit()
+        archive_mail_result = await move_shipment_thread_messages_to_archive(
+            session,
+            shipment=shipment,
+            reason=legacy_reason,
+        )
         return _json(
             {
                 "archived": True,
@@ -276,6 +282,7 @@ async def freight_archive_shipment(
                 "reason_note": note,
                 "suppression_applied": bool(thread is not None and suppress_source_thread),
                 "suppressed_thread_id": str(thread.id) if thread is not None and suppress_source_thread else None,
+                "archive_mail_result": archive_mail_result,
             }
         )
 

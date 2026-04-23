@@ -313,6 +313,252 @@ class OutlookGraphClient:
 
         return self.normalize_message(item)
 
+    async def mark_message_read(self, message_id: str) -> dict:
+        """Mark one Outlook message as read in the configured mailbox."""
+        missing = self.missing_settings()
+        if missing:
+            raise RuntimeError(
+                "Microsoft Graph is not configured. Missing: " + ", ".join(missing)
+            )
+        if not message_id:
+            raise RuntimeError("Outlook message id is required")
+
+        url = f"{self.base_url}/users/{settings.microsoft_mailbox}/messages/{message_id}"
+        async with await self._authorized_client() as client:
+            response = await client.patch(url, json={"isRead": True})
+            _raise_graph_http(response, operation="mark message read")
+
+        return {
+            "provider": "outlook",
+            "message_id": message_id,
+            "is_read": True,
+        }
+
+    async def list_master_categories(self) -> list[dict]:
+        """List Outlook master categories for the configured mailbox."""
+        missing = self.missing_settings()
+        if missing:
+            raise RuntimeError(
+                "Microsoft Graph is not configured. Missing: " + ", ".join(missing)
+            )
+        url = f"{self.base_url}/users/{settings.microsoft_mailbox}/outlook/masterCategories"
+        async with await self._authorized_client() as client:
+            response = await client.get(url)
+            _raise_graph_http(response, operation="list master categories")
+            data = response.json()
+        return [item for item in data.get("value", []) if isinstance(item, dict)]
+
+    async def ensure_master_categories(self, category_colors: dict[str, str]) -> dict:
+        """Create missing Outlook master categories with preset colors."""
+        clean = {
+            name.strip(): color.strip()
+            for name, color in category_colors.items()
+            if name.strip() and color.strip()
+        }
+        if not clean:
+            return {"created": [], "existing": [], "failed": []}
+
+        url = f"{self.base_url}/users/{settings.microsoft_mailbox}/outlook/masterCategories"
+        async with await self._authorized_client() as client:
+            response = await client.get(url)
+            _raise_graph_http(response, operation="list master categories")
+            data = response.json()
+            existing_items = [item for item in data.get("value", []) if isinstance(item, dict)]
+            existing_by_name = {
+                str(item.get("displayName") or "").strip().lower(): item
+                for item in existing_items
+                if str(item.get("displayName") or "").strip()
+            }
+            created: list[dict] = []
+            failed: list[dict] = []
+            for display_name, color in clean.items():
+                if display_name.lower() in existing_by_name:
+                    continue
+                create_response = await client.post(
+                    url,
+                    json={"displayName": display_name, "color": color},
+                )
+                if create_response.is_success:
+                    payload = create_response.json() if create_response.content else {}
+                    created.append(
+                        {
+                            "displayName": display_name,
+                            "color": color,
+                            "id": payload.get("id") if isinstance(payload, dict) else None,
+                        }
+                    )
+                    continue
+                # If another process/user created it concurrently, do not fail message processing.
+                if create_response.status_code == 409:
+                    continue
+                failed.append(
+                    {
+                        "displayName": display_name,
+                        "color": color,
+                        "error": _graph_error_body(create_response),
+                        "status_code": create_response.status_code,
+                    }
+                )
+
+        if failed:
+            logger.warning("Graph master category sync had failures: %s", failed)
+        return {
+            "created": created,
+            "existing": [
+                str(item.get("displayName"))
+                for item in existing_items
+                if str(item.get("displayName") or "").strip().lower() in {name.lower() for name in clean}
+            ],
+            "failed": failed,
+        }
+
+    async def add_message_categories(
+        self,
+        message_id: str,
+        categories: list[str],
+        category_colors: dict[str, str] = None,
+    ) -> dict:
+        """Add Outlook categories to a message without removing existing categories."""
+        missing = self.missing_settings()
+        if missing:
+            raise RuntimeError(
+                "Microsoft Graph is not configured. Missing: " + ", ".join(missing)
+            )
+        if not message_id:
+            raise RuntimeError("Outlook message id is required")
+
+        clean_categories = [category.strip() for category in categories if category.strip()]
+        if not clean_categories:
+            return {
+                "provider": "outlook",
+                "message_id": message_id,
+                "categories": [],
+                "changed": False,
+            }
+
+        url = f"{self.base_url}/users/{settings.microsoft_mailbox}/messages/{message_id}"
+        async with await self._authorized_client() as client:
+            master_category_result: dict | None = None
+            if category_colors:
+                # Use a nested call here would fetch a second token; keep this client and sync inline.
+                master_url = f"{self.base_url}/users/{settings.microsoft_mailbox}/outlook/masterCategories"
+                master_response = await client.get(master_url)
+                if master_response.is_success:
+                    master_data = master_response.json()
+                    existing_items = [item for item in master_data.get("value", []) if isinstance(item, dict)]
+                    existing_names = {
+                        str(item.get("displayName") or "").strip().lower()
+                        for item in existing_items
+                        if str(item.get("displayName") or "").strip()
+                    }
+                    created: list[dict] = []
+                    failed: list[dict] = []
+                    for display_name, color in category_colors.items():
+                        display_name = display_name.strip()
+                        color = color.strip()
+                        if not display_name or not color or display_name.lower() in existing_names:
+                            continue
+                        create_response = await client.post(
+                            master_url,
+                            json={"displayName": display_name, "color": color},
+                        )
+                        if create_response.is_success:
+                            payload = create_response.json() if create_response.content else {}
+                            created.append(
+                                {
+                                    "displayName": display_name,
+                                    "color": color,
+                                    "id": payload.get("id") if isinstance(payload, dict) else None,
+                                }
+                            )
+                            existing_names.add(display_name.lower())
+                        elif create_response.status_code != 409:
+                            failed.append(
+                                {
+                                    "displayName": display_name,
+                                    "color": color,
+                                    "error": _graph_error_body(create_response),
+                                    "status_code": create_response.status_code,
+                                }
+                            )
+                    if failed:
+                        logger.warning("Graph master category sync had failures: %s", failed)
+                    master_category_result = {"created": created, "failed": failed}
+                else:
+                    logger.warning(
+                        "Graph master category sync skipped; plain message categories will still be applied: %s",
+                        _graph_error_body(master_response),
+                    )
+                    master_category_result = {
+                        "created": [],
+                        "failed": [
+                            {
+                                "operation": "list_master_categories",
+                                "status_code": master_response.status_code,
+                                "error": _graph_error_body(master_response),
+                            }
+                        ],
+                        "fallback": "plain_message_categories",
+                    }
+
+            response = await client.get(url, params={"$select": "id,categories"})
+            _raise_graph_http(response, operation="get message categories")
+            current_payload = response.json()
+            existing = current_payload.get("categories") if isinstance(current_payload, dict) else []
+            if not isinstance(existing, list):
+                existing = []
+            merged = list(dict.fromkeys([str(item) for item in existing] + clean_categories))
+            response = await client.patch(url, json={"categories": merged})
+            _raise_graph_http(response, operation="set message categories")
+
+        return {
+            "provider": "outlook",
+            "message_id": message_id,
+            "categories": merged,
+            "added_categories": clean_categories,
+            "master_category_result": master_category_result,
+            "changed": merged != existing,
+        }
+
+    async def _resolve_archive_folder_id(self, client: httpx.AsyncClient) -> str:
+        """Resolve the mailbox Archive folder id, falling back to the well-known name."""
+        url = f"{self.base_url}/users/{settings.microsoft_mailbox}/mailFolders/archive"
+        response = await client.get(url, params={"$select": "id,displayName"})
+        if response.is_success:
+            data = response.json()
+            folder_id = data.get("id") if isinstance(data, dict) else None
+            if folder_id:
+                return str(folder_id)
+        logger.warning(
+            "Graph archive folder lookup failed; falling back to well-known archive folder name: %s",
+            _graph_error_body(response),
+        )
+        return "archive"
+
+    async def move_message_to_archive(self, message_id: str) -> dict:
+        """Move one Outlook message into the configured mailbox Archive folder."""
+        missing = self.missing_settings()
+        if missing:
+            raise RuntimeError(
+                "Microsoft Graph is not configured. Missing: " + ", ".join(missing)
+            )
+        if not message_id:
+            raise RuntimeError("Outlook message id is required")
+
+        async with await self._authorized_client() as client:
+            archive_folder_id = await self._resolve_archive_folder_id(client)
+            url = f"{self.base_url}/users/{settings.microsoft_mailbox}/messages/{message_id}/move"
+            response = await client.post(url, json={"destinationId": archive_folder_id})
+            _raise_graph_http(response, operation="move message to archive")
+            moved = response.json() if response.content else {}
+
+        return {
+            "provider": "outlook",
+            "message_id": message_id,
+            "archive_folder_id": archive_folder_id,
+            "moved_message_id": moved.get("id") if isinstance(moved, dict) else None,
+        }
+
     async def send_mail(
         self,
         *,

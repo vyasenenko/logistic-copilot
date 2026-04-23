@@ -43,6 +43,9 @@ class ArchiveReasonCode(str, Enum):
 
 class WorkflowEventType(str, Enum):
     EMAIL_RECEIVED = "email_received"
+    EMAIL_MARKED_READ = "email_marked_read"
+    EMAIL_CATEGORIZED = "email_categorized"
+    EMAIL_MOVED_TO_ARCHIVE = "email_moved_to_archive"
     PARSING_COMPLETED = "parsing_completed"
     SHIPMENT_PARSED = "shipment_parsed"
     SHIPMENT_FIELDS_UPDATED = "shipment_fields_updated"

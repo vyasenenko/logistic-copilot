@@ -112,6 +112,12 @@ from app.services.workflow_event_codec import workflow_event_to_record
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
+from app.services.outlook_mail_actions import (
+    add_email_message_categories,
+    mark_email_message_read_after_ai_success,
+    move_shipment_thread_messages_to_archive,
+    outlook_categories_for_ai_decision,
+)
 from app.services.freight_read import build_freight_overview, is_status_stale as _is_status_stale
 
 router = APIRouter()
@@ -295,6 +301,23 @@ def _apply_decision(result, decision: WorkflowDecisionResult) -> None:
     result.tms_status_updated = decision.tms_status_updated
 
 
+def _decision_should_mark_email_read(decision: WorkflowDecisionResult) -> bool:
+    if decision.manual_review_required or decision.next_action == "manual_review":
+        return False
+    if decision.shipment_extracted and decision.confidence >= 0.7:
+        return True
+    return bool(
+        decision.bid_intaken
+        or decision.evaluation_triggered
+        or decision.quote_auto_sent
+        or decision.booking_triggered
+        or decision.booking_confirmation_sent
+        or decision.status_lookup_triggered
+        or decision.status_reply_sent
+        or decision.tms_status_updated
+    )
+
+
 def _build_automation_policy(
     *,
     auto_acknowledgement: bool,
@@ -346,6 +369,29 @@ async def _process_outlook_mailbox_message(
                 policy=policy,
             )
             _apply_decision(result, decision)
+            categories = outlook_categories_for_ai_decision(
+                intent=decision.intent,
+                manual_review_required=decision.manual_review_required,
+                bid_intaken=decision.bid_intaken,
+                status_lookup_triggered=decision.status_lookup_triggered,
+                status_reply_sent=decision.status_reply_sent,
+                tms_status_updated=decision.tms_status_updated,
+            )
+            if categories:
+                await add_email_message_categories(
+                    session,
+                    email_message_id=result.email_message_id,
+                    shipment_id=result.shipment_id,
+                    categories=categories,
+                    reason=f"ai_decision:{decision.intent}:{decision.next_action}",
+                )
+            if _decision_should_mark_email_read(decision):
+                await mark_email_message_read_after_ai_success(
+                    session,
+                    email_message_id=result.email_message_id,
+                    shipment_id=result.shipment_id,
+                    reason=f"ai_processed:{decision.intent}:{decision.next_action}",
+                )
         except Exception:
             logger.exception(
                 "freight_inbox_orchestrator.failed email_message_id=%s shipment_id=%s",
@@ -357,6 +403,16 @@ async def _process_outlook_mailbox_message(
             result.intent = "orchestrator_error"
             result.confidence = 0.0
             result.missing_fields = []
+            await add_email_message_categories(
+                session,
+                email_message_id=result.email_message_id,
+                shipment_id=result.shipment_id,
+                categories=outlook_categories_for_ai_decision(
+                    intent="exception_or_issue",
+                    manual_review_required=True,
+                ),
+                reason="orchestrator_error",
+            )
     else:
         result.next_action = "already_ingested"
 
@@ -712,6 +768,11 @@ async def _archive_shipment_and_optionally_suppress_source(
 
     await session.commit()
     await session.refresh(shipment)
+    await move_shipment_thread_messages_to_archive(
+        session,
+        shipment=shipment,
+        reason=archive_reason,
+    )
     await freight_realtime_hub.publish_overview_stale_throttled(reason="shipment_archived")
     await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
     return shipment, thread
