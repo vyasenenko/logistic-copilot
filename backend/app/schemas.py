@@ -31,6 +31,16 @@ class ShipmentStage(str, Enum):
     DECLINED = "declined"
 
 
+class ArchiveReasonCode(str, Enum):
+    DUPLICATE = "duplicate"
+    CANCELLED = "cancelled"
+    PARSED_ERROR = "parsed_error"
+    FRAUD = "fraud"
+    TEST = "test"
+    NON_DELIVERY_BOUNCE = "non_delivery_bounce"
+    OTHER = "other"
+
+
 class WorkflowEventType(str, Enum):
     EMAIL_RECEIVED = "email_received"
     PARSING_COMPLETED = "parsing_completed"
@@ -232,6 +242,8 @@ class ShipmentRecord(BaseModel):
     has_active_booking_warning: bool = False
     next_step_label: str | None = None
     is_archived: bool = False
+    archive_reason_code: ArchiveReasonCode | None = None
+    archive_reason_note: str | None = None
     archived_reason: str | None = None
     archived_at: datetime | None = None
     created_at: datetime
@@ -556,9 +568,7 @@ class ShipmentExtractionResult(BaseModel):
     weight_lb: float | None = Field(None, ge=0)
     equipment_type: str | None = None
     ready_at: datetime | None = None
-    ready_at_local_text: str | None = None
     delivery_at: datetime | None = None
-    delivery_at_local_text: str | None = None
     notes: str = ""
     missing_fields: list[str] = Field(default_factory=list)
     ambiguity_reasons: list[str] = Field(default_factory=list)
@@ -762,11 +772,14 @@ class OperatorAction(str, Enum):
 class ShipmentOperatorActionRequest(BaseModel):
     action: OperatorAction
     reason: str | None = None
+    reason_code: ArchiveReasonCode | None = None
+    reason_note: str | None = None
     suppress_source_thread: bool = True
 
 
 class ShipmentArchiveRequest(BaseModel):
-    reason: str | None = None
+    reason_code: ArchiveReasonCode = ArchiveReasonCode.OTHER
+    reason_note: str | None = None
     suppress_source_thread: bool = True
 
 
@@ -824,6 +837,11 @@ class BidIntakeRequest(BaseModel):
     currency: str = Field("USD", min_length=1, max_length=10)
     eta_text: str | None = None
     raw_email: str = ""
+    sender_email: str | None = None
+    resolved_carrier_email: str | None = None
+    carrier_resolution_mode: str | None = None
+    carrier_resolution_reason: str | None = None
+    identity_mismatch: bool = False
     create_carrier_if_missing: bool = False
 
 

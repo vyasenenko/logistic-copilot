@@ -809,6 +809,11 @@ async def intake_bid(session: AsyncSession, request: BidIntakeRequest) -> BidInt
             "amount": request.amount,
             "currency": request.currency,
             "eta_text": request.eta_text,
+            "sender_email": request.sender_email,
+            "resolved_carrier_email": request.resolved_carrier_email or carrier.email,
+            "carrier_resolution_mode": request.carrier_resolution_mode,
+            "carrier_resolution_reason": request.carrier_resolution_reason,
+            "identity_mismatch": request.identity_mismatch,
         },
     )
     session.add(bid_evt)

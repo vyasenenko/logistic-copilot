@@ -475,9 +475,23 @@ function formatDate(value: string | null) {
 }
 
 function formatShipmentSchedule(displayValue: string | null, localValue: string | null) {
-  if (displayValue) return displayValue;
-  if (!localValue) return "Not scheduled";
-  return localValue.replace("T", " ").slice(0, 16);
+  const rawValue = displayValue
+    ? displayValue.replace(/\s*\([^)]+\)\s*$/, "").trim()
+    : localValue
+      ? localValue.replace("T", " ").trim()
+      : "";
+  if (!rawValue) return "Not scheduled";
+  const normalizedForParse = rawValue.includes("T") ? rawValue : rawValue.replace(" ", "T");
+  const parsed = new Date(normalizedForParse);
+  if (Number.isNaN(parsed.getTime())) return rawValue;
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(parsed);
 }
 
 function formatAge(value: string | null) {

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -46,6 +47,85 @@ RECOMMENDED_SHIPMENT_FIELDS = {"pallets", "weight_lb", "equipment_type", "ready_
 AUTO_INTENT_CONFIDENCE = 0.6
 AUTO_PARSE_CONFIDENCE = 0.65
 AUTO_BID_CONFIDENCE = 0.6
+logger = logging.getLogger(__name__)
+
+
+def _normalize_email(email: str | None) -> str:
+    return (email or "").strip().lower()
+
+
+async def _resolve_exact_carrier(
+    session: AsyncSession,
+    *,
+    sender_email: str,
+) -> Carrier | None:
+    normalized_sender = _normalize_email(sender_email)
+    if not normalized_sender:
+        return None
+    return await session.scalar(
+        select(Carrier).where(func.lower(Carrier.email) == normalized_sender)
+    )
+
+
+async def _resolve_client_by_email(
+    session: AsyncSession,
+    *,
+    sender_email: str,
+) -> Client | None:
+    normalized_sender = _normalize_email(sender_email)
+    if not normalized_sender:
+        return None
+    return await session.scalar(
+        select(Client).where(func.lower(Client.email) == normalized_sender)
+    )
+
+
+async def resolve_carrier_for_inbound_thread_reply(
+    session: AsyncSession,
+    *,
+    shipment: Shipment | None,
+    email_message: EmailMessage,
+) -> tuple[Carrier | None, str, str]:
+    sender_email = _normalize_email(email_message.sender)
+    if not sender_email:
+        return None, "unresolved", "missing_sender_email"
+
+    exact_carrier = await _resolve_exact_carrier(session, sender_email=sender_email)
+    if exact_carrier is not None:
+        return exact_carrier, "exact_email", "exact_sender_match"
+
+    if shipment is None:
+        return None, "unresolved", "shipment_not_linked"
+
+    requested_bids = (
+        await session.execute(
+            select(CarrierBid, EmailMessage)
+            .join(EmailMessage, EmailMessage.id == CarrierBid.email_message_id)
+            .where(
+                CarrierBid.shipment_id == shipment.id,
+                CarrierBid.status.in_(["requested", "drafted"]),
+                EmailMessage.direction == "outbound",
+            )
+            .order_by(EmailMessage.received_at.desc())
+        )
+    ).all()
+
+    recipient_carrier_ids: list[UUID] = []
+    for bid, outbound_message in requested_bids:
+        recipients = [_normalize_email(recipient) for recipient in (outbound_message.recipients_json or [])]
+        if sender_email in recipients:
+            carrier = await session.get(Carrier, bid.carrier_id)
+            if carrier is not None:
+                return carrier, "thread_outreach_recipient", "matched_outbound_recipient"
+        recipient_carrier_ids.append(bid.carrier_id)
+
+    unique_requested_carrier_ids: list[UUID] = list(dict.fromkeys(recipient_carrier_ids))
+    if len(unique_requested_carrier_ids) == 1:
+        carrier = await session.get(Carrier, unique_requested_carrier_ids[0])
+        if carrier is not None:
+            return carrier, "single_thread_carrier_inferred", "single_requested_carrier_for_thread"
+
+    return None, "unresolved", "no_carrier_match_from_thread"
 
 
 async def run_freight_inbox_orchestrator(
@@ -64,8 +144,23 @@ async def run_freight_inbox_orchestrator(
     shipment = await session.scalar(
         select(Shipment).where(Shipment.email_thread_id == email_message.thread_id)
     )
-    client = await session.scalar(select(Client).where(Client.email == email_message.sender))
-    carrier = await session.scalar(select(Carrier).where(Carrier.email == email_message.sender))
+    client = await _resolve_client_by_email(session, sender_email=email_message.sender)
+    carrier, carrier_resolution_mode, carrier_resolution_reason = await resolve_carrier_for_inbound_thread_reply(
+        session,
+        shipment=shipment,
+        email_message=email_message,
+    )
+    logger.info(
+        "carrier_reply.resolution_attempt provider_message_id=%s thread_id=%s shipment_id=%s quote_token=%s sender_email=%s resolved_carrier_email=%s resolution_mode=%s resolution_reason=%s",
+        email_message.provider_message_id,
+        email_message.thread_id,
+        shipment.id if shipment else None,
+        shipment.quote_token if shipment else None,
+        email_message.sender,
+        carrier.email if carrier else None,
+        carrier_resolution_mode,
+        carrier_resolution_reason,
+    )
 
     email_context = {
         "sender_email": email_message.sender,
@@ -127,6 +222,8 @@ async def run_freight_inbox_orchestrator(
             email_message=email_message,
             shipment=shipment,
             carrier=carrier,
+            carrier_resolution_mode=carrier_resolution_mode,
+            carrier_resolution_reason=carrier_resolution_reason,
             intent_result=intent_result,
             email_context=email_context,
             policy=policy,
@@ -156,6 +253,8 @@ async def run_freight_inbox_orchestrator(
             email_message=email_message,
             shipment=shipment,
             carrier=carrier,
+            carrier_resolution_mode=carrier_resolution_mode,
+            carrier_resolution_reason=carrier_resolution_reason,
             intent_result=intent_result,
             email_context=email_context,
             policy=policy,
@@ -446,7 +545,38 @@ async def _handle_new_quote_request(
     policy: AutomationPolicy,
 ) -> WorkflowDecisionResult:
     extraction = await extract_shipment_details(email_context)
+    logger.warning(
+        "shipment_parse.extracted email_message_id=%s shipment_id=%s origin=%s destination=%s pallets=%s weight_lb=%s equipment_type=%s ready_at=%s delivery_at=%s confidence=%s missing_fields=%s ambiguity_reasons=%s",
+        email_message.id,
+        shipment.id,
+        extraction.origin,
+        extraction.destination,
+        extraction.pallets,
+        extraction.weight_lb,
+        extraction.equipment_type,
+        extraction.ready_at.isoformat() if extraction.ready_at else None,
+        extraction.delivery_at.isoformat() if extraction.delivery_at else None,
+        extraction.confidence,
+        extraction.missing_fields,
+        extraction.ambiguity_reasons,
+    )
     _apply_shipment_extraction(shipment, extraction)
+    logger.warning(
+        "shipment_parse.applied email_message_id=%s shipment_id=%s status=%s origin=%s destination=%s pallets=%s weight_lb=%s equipment_type=%s ready_at=%s ready_at_local=%s ready_at_timezone=%s delivery_at=%s delivery_at_local=%s",
+        email_message.id,
+        shipment.id,
+        shipment.status,
+        shipment.origin,
+        shipment.destination,
+        shipment.pallets,
+        shipment.weight_lb,
+        shipment.equipment_type,
+        shipment.ready_at.isoformat() if shipment.ready_at else None,
+        shipment.ready_at_local.isoformat() if shipment.ready_at_local else None,
+        shipment.ready_at_timezone,
+        shipment.delivery_at.isoformat() if shipment.delivery_at else None,
+        shipment.delivery_at_local.isoformat() if shipment.delivery_at_local else None,
+    )
     await _log_event(
         session,
         shipment.id,
@@ -468,6 +598,14 @@ async def _handle_new_quote_request(
         },
     )
     await session.commit()
+    logger.warning(
+        "shipment_parse.committed email_message_id=%s shipment_id=%s origin=%s destination=%s status=%s",
+        email_message.id,
+        shipment.id,
+        shipment.origin,
+        shipment.destination,
+        shipment.status,
+    )
 
     manual_review = extraction.confidence < AUTO_PARSE_CONFIDENCE
     critical_missing = [field for field in extraction.missing_fields if field in CRITICAL_SHIPMENT_FIELDS]
@@ -652,8 +790,47 @@ async def _handle_customer_clarification(
     policy: AutomationPolicy,
 ) -> WorkflowDecisionResult:
     extraction = await extract_shipment_details(email_context)
+    logger.warning(
+        "shipment_clarification_parse.extracted email_message_id=%s shipment_id=%s origin=%s destination=%s pallets=%s weight_lb=%s equipment_type=%s ready_at=%s delivery_at=%s confidence=%s missing_fields=%s ambiguity_reasons=%s",
+        email_message.id,
+        shipment.id,
+        extraction.origin,
+        extraction.destination,
+        extraction.pallets,
+        extraction.weight_lb,
+        extraction.equipment_type,
+        extraction.ready_at.isoformat() if extraction.ready_at else None,
+        extraction.delivery_at.isoformat() if extraction.delivery_at else None,
+        extraction.confidence,
+        extraction.missing_fields,
+        extraction.ambiguity_reasons,
+    )
     _apply_shipment_extraction(shipment, extraction)
+    logger.warning(
+        "shipment_clarification_parse.applied email_message_id=%s shipment_id=%s status=%s origin=%s destination=%s pallets=%s weight_lb=%s equipment_type=%s ready_at=%s ready_at_local=%s ready_at_timezone=%s delivery_at=%s delivery_at_local=%s",
+        email_message.id,
+        shipment.id,
+        shipment.status,
+        shipment.origin,
+        shipment.destination,
+        shipment.pallets,
+        shipment.weight_lb,
+        shipment.equipment_type,
+        shipment.ready_at.isoformat() if shipment.ready_at else None,
+        shipment.ready_at_local.isoformat() if shipment.ready_at_local else None,
+        shipment.ready_at_timezone,
+        shipment.delivery_at.isoformat() if shipment.delivery_at else None,
+        shipment.delivery_at_local.isoformat() if shipment.delivery_at_local else None,
+    )
     await session.commit()
+    logger.warning(
+        "shipment_clarification_parse.committed email_message_id=%s shipment_id=%s origin=%s destination=%s status=%s",
+        email_message.id,
+        shipment.id,
+        shipment.origin,
+        shipment.destination,
+        shipment.status,
+    )
     await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
     if extraction.ambiguity_reasons:
         await _log_manual_review(
@@ -764,17 +941,45 @@ async def _handle_carrier_bid_reply(
     email_message: EmailMessage,
     shipment: Shipment,
     carrier: Carrier | None,
+    carrier_resolution_mode: str,
+    carrier_resolution_reason: str,
     intent_result: IntentResult,
     email_context: dict,
     policy: AutomationPolicy,
 ) -> WorkflowDecisionResult:
+    logger.info(
+        "carrier_reply.ingested provider_message_id=%s thread_id=%s shipment_id=%s quote_token=%s sender_email=%s resolved_carrier_email=%s resolution_mode=%s",
+        email_message.provider_message_id,
+        email_message.thread_id,
+        shipment.id,
+        shipment.quote_token,
+        email_message.sender,
+        carrier.email if carrier else None,
+        carrier_resolution_mode,
+    )
     if carrier is None:
         await _log_manual_review(
             session,
             shipment.id,
-            "Carrier reply could not be mapped to known carrier",
+            "Unknown carrier sender in RFQ thread",
             intent_result=intent_result,
+            review_type="carrier_bid_review",
+            structured_payload={
+                "sender_email": email_message.sender,
+                "carrier_resolution_mode": carrier_resolution_mode,
+                "carrier_resolution_reason": carrier_resolution_reason,
+                "identity_mismatch": True,
+            },
+            source_email_id=str(email_message.id),
             allow_repeat=policy.allow_repeat_manual_review,
+        )
+        logger.warning(
+            "carrier_reply.unresolved provider_message_id=%s shipment_id=%s sender_email=%s resolution_mode=%s resolution_reason=%s",
+            email_message.provider_message_id,
+            shipment.id,
+            email_message.sender,
+            carrier_resolution_mode,
+            carrier_resolution_reason,
         )
         return WorkflowDecisionResult(
             email_message_id=str(email_message.id),
@@ -786,6 +991,17 @@ async def _handle_carrier_bid_reply(
         )
 
     extraction = await extract_carrier_bid(email_context)
+    logger.info(
+        "carrier_reply.bid_extracted provider_message_id=%s shipment_id=%s sender_email=%s resolved_carrier_email=%s resolution_mode=%s amount=%s confidence=%s ambiguity_count=%s",
+        email_message.provider_message_id,
+        shipment.id,
+        email_message.sender,
+        carrier.email,
+        carrier_resolution_mode,
+        extraction.amount,
+        extraction.confidence,
+        len(extraction.ambiguity_reasons or []),
+    )
     existing_bid = await session.scalar(
         select(CarrierBid).where(CarrierBid.email_message_id == email_message.id)
     )
@@ -808,6 +1024,11 @@ async def _handle_carrier_bid_reply(
             shipment.status,
             {
                 "carrier_id": str(carrier.id),
+                "sender_email": email_message.sender,
+                "resolved_carrier_email": carrier.email,
+                "carrier_resolution_mode": carrier_resolution_mode,
+                "carrier_resolution_reason": carrier_resolution_reason,
+                "identity_mismatch": _normalize_email(email_message.sender) != _normalize_email(carrier.email),
                 "confidence": extraction.confidence,
                 "notes": extraction.notes,
                 "ambiguity_reasons": extraction.ambiguity_reasons,
@@ -820,12 +1041,32 @@ async def _handle_carrier_bid_reply(
             (
                 f"Ambiguous carrier bid: {', '.join(extraction.ambiguity_reasons)}"
                 if extraction.ambiguity_reasons
-                else "Carrier bid parsing confidence too low"
+                else "Low confidence bid parse"
             ),
             intent_result=intent_result,
+            review_type="carrier_bid_review",
             ambiguity_reasons=extraction.ambiguity_reasons,
+            structured_payload={
+                "sender_email": email_message.sender,
+                "resolved_carrier_email": carrier.email,
+                "carrier_resolution_mode": carrier_resolution_mode,
+                "carrier_resolution_reason": carrier_resolution_reason,
+                "identity_mismatch": _normalize_email(email_message.sender) != _normalize_email(carrier.email),
+                "amount": extraction.amount,
+                "confidence": extraction.confidence,
+            },
             source_email_id=str(email_message.id),
             allow_repeat=policy.allow_repeat_manual_review,
+        )
+        logger.warning(
+            "carrier_reply.manual_review provider_message_id=%s shipment_id=%s sender_email=%s resolved_carrier_email=%s resolution_mode=%s amount=%s confidence=%s",
+            email_message.provider_message_id,
+            shipment.id,
+            email_message.sender,
+            carrier.email,
+            carrier_resolution_mode,
+            extraction.amount,
+            extraction.confidence,
         )
         return WorkflowDecisionResult(
             email_message_id=str(email_message.id),
@@ -849,8 +1090,23 @@ async def _handle_carrier_bid_reply(
             currency=extraction.currency or "USD",
             eta_text=extraction.eta_text,
             raw_email=email_message.body_preview,
+            sender_email=email_message.sender,
+            resolved_carrier_email=carrier.email,
+            carrier_resolution_mode=carrier_resolution_mode,
+            carrier_resolution_reason=carrier_resolution_reason,
+            identity_mismatch=_normalize_email(email_message.sender) != _normalize_email(carrier.email),
             create_carrier_if_missing=False,
         ),
+    )
+    logger.info(
+        "carrier_reply.bid_created provider_message_id=%s shipment_id=%s sender_email=%s resolved_carrier_email=%s resolution_mode=%s bid_id=%s amount=%s",
+        email_message.provider_message_id,
+        shipment.id,
+        email_message.sender,
+        carrier.email,
+        carrier_resolution_mode,
+        bid.bid.id,
+        bid.bid.amount,
     )
 
     evaluation_triggered = False
@@ -984,6 +1240,8 @@ async def _handle_carrier_status_update(
     email_message: EmailMessage,
     shipment: Shipment,
     carrier: Carrier | None,
+    carrier_resolution_mode: str,
+    carrier_resolution_reason: str,
     intent_result: IntentResult,
     email_context: dict,
     policy: AutomationPolicy,
@@ -996,7 +1254,21 @@ async def _handle_carrier_status_update(
             intent_result=intent_result,
             review_type="carrier_status_update_review",
             next_action="rerun_tms_update",
+            structured_payload={
+                "sender_email": email_message.sender,
+                "carrier_resolution_mode": carrier_resolution_mode,
+                "carrier_resolution_reason": carrier_resolution_reason,
+                "identity_mismatch": True,
+            },
             allow_repeat=policy.allow_repeat_manual_review,
+        )
+        logger.warning(
+            "carrier_reply.unresolved provider_message_id=%s shipment_id=%s sender_email=%s resolution_mode=%s resolution_reason=%s branch=carrier_status_update",
+            email_message.provider_message_id,
+            shipment.id,
+            email_message.sender,
+            carrier_resolution_mode,
+            carrier_resolution_reason,
         )
         return WorkflowDecisionResult(
             email_message_id=str(email_message.id),
@@ -1026,9 +1298,23 @@ async def _handle_carrier_status_update(
                 "eta_text": extraction.eta_text,
                 "location_text": extraction.location_text,
                 "notes": extraction.notes,
+                "sender_email": email_message.sender,
+                "resolved_carrier_email": carrier.email,
+                "carrier_resolution_mode": carrier_resolution_mode,
+                "carrier_resolution_reason": carrier_resolution_reason,
+                "identity_mismatch": _normalize_email(email_message.sender) != _normalize_email(carrier.email),
             },
             source_email_id=str(email_message.id),
             allow_repeat=policy.allow_repeat_manual_review,
+        )
+        logger.warning(
+            "carrier_reply.manual_review provider_message_id=%s shipment_id=%s sender_email=%s resolved_carrier_email=%s resolution_mode=%s confidence=%s branch=carrier_status_update",
+            email_message.provider_message_id,
+            shipment.id,
+            email_message.sender,
+            carrier.email,
+            carrier_resolution_mode,
+            extraction.confidence,
         )
         return WorkflowDecisionResult(
             email_message_id=str(email_message.id),

@@ -73,6 +73,8 @@ class OutlookMailboxMessage:
     recipients: list[str]
     received_at: datetime
     raw_payload: dict
+    in_reply_to: str | None = None
+    references: list[str] | None = None
 
 
 class OutlookGraphClient:
@@ -210,11 +212,23 @@ class OutlookGraphClient:
         received_at = datetime.now(timezone.utc)
         if received_raw:
             received_at = datetime.fromisoformat(received_raw.replace("Z", "+00:00"))
+        headers = {
+            str(header.get("name") or "").strip().lower(): str(header.get("value") or "").strip()
+            for header in (payload.get("internetMessageHeaders") or [])
+            if isinstance(header, dict)
+        }
+        references = [
+            ref.strip()
+            for ref in headers.get("references", "").split()
+            if ref.strip()
+        ]
 
         return OutlookMailboxMessage(
             provider_message_id=payload.get("id", ""),
             conversation_id=payload.get("conversationId"),
             internet_message_id=payload.get("internetMessageId"),
+            in_reply_to=headers.get("in-reply-to") or None,
+            references=references,
             subject=payload.get("subject", ""),
             body_preview=payload.get("bodyPreview", ""),
             sender_email=(sender.get("address") or "").lower(),
@@ -242,7 +256,7 @@ class OutlookGraphClient:
             "$orderby": "receivedDateTime desc",
             "$select": (
                 "id,conversationId,internetMessageId,subject,bodyPreview,"
-                "from,toRecipients,receivedDateTime,hasAttachments"
+                "from,toRecipients,receivedDateTime,hasAttachments,internetMessageHeaders"
             ),
         }
 
@@ -278,7 +292,7 @@ class OutlookGraphClient:
         params = {
             "$select": (
                 "id,conversationId,internetMessageId,subject,bodyPreview,"
-                "from,toRecipients,receivedDateTime,hasAttachments"
+                "from,toRecipients,receivedDateTime,hasAttachments,internetMessageHeaders"
             ),
         }
 

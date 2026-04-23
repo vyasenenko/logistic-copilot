@@ -25,6 +25,7 @@ from app.schemas import (
 
 TStructured = TypeVar("TStructured", IntentResult, ShipmentExtractionResult, ShipmentFieldExtractionResult, CarrierBidExtractionResult, StatusRequestExtractionResult, CarrierStatusUpdateExtractionResult)
 logger = logging.getLogger(__name__)
+MAX_DEBUG_TEXT_CHARS = 1800
 
 ROUTE_FROM_TO_PATTERN = re.compile(
     r"(?:from\s+(?P<origin>[A-Za-z][A-Za-z .,-]{1,60}?)\s+to\s+(?P<destination>[A-Za-z][A-Za-z .,-]{1,60}?))(?=(?:\s+(?:today|tomorrow|tmrw|tmr|on|at|by|for|weight|equipment|ready|pickup|delivery|please|quote|pallets?|lbs?|lb|kg|kgs)\b)|$|\n|\.)",
@@ -144,6 +145,26 @@ def _extract_json_object(raw_text: str) -> dict:
 
 def _normalize_payload_for_schema(schema: type[TStructured], payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
+    for location_field in ("origin", "destination"):
+        value = normalized.get(location_field)
+        if isinstance(value, dict):
+            city = str(value.get("city") or "").strip()
+            state = str(value.get("state") or value.get("state_code") or "").strip()
+            country = str(value.get("country") or "").strip()
+            parts = [part for part in (city, state) if part]
+            if not parts and country:
+                parts = [country]
+            normalized[location_field] = ", ".join(parts) if parts else None
+    if "confidence" in normalized and isinstance(normalized["confidence"], str):
+        confidence_text = normalized["confidence"].strip().lower()
+        if isinstance(normalized.get("intent_confidence_score"), (int, float)):
+            normalized["confidence"] = normalized["intent_confidence_score"]
+        elif confidence_text in {"high", "very high", "certain", "confident"}:
+            normalized["confidence"] = 0.9
+        elif confidence_text in {"medium", "moderate"}:
+            normalized["confidence"] = 0.6
+        elif confidence_text in {"low", "weak", "uncertain"}:
+            normalized["confidence"] = 0.3
     for field_name, field_info in schema.model_fields.items():
         if field_name not in normalized:
             continue
@@ -164,10 +185,18 @@ async def _invoke_structured_with_fallback(
     schema: type[TStructured],
     prompt: str,
 ) -> TStructured:
+    schema_name = schema.__name__
+    logger.warning(
+        "freight_ai.invoke.start schema=%s prompt_chars=%s",
+        schema_name,
+        len(prompt or ""),
+    )
     if _supports_native_structured_output(llm):
         structured = llm.with_structured_output(schema)
         try:
-            return await structured.ainvoke(prompt)
+            result = await structured.ainvoke(prompt)
+            logger.warning("freight_ai.invoke.native_success schema=%s", schema_name)
+            return result
         except Exception as exc:
             error_text = str(exc).lower()
             unsupported_structured_output = (
@@ -179,6 +208,11 @@ async def _invoke_structured_with_fallback(
             )
             if not unsupported_structured_output:
                 raise
+            logger.warning(
+                "freight_ai.invoke.native_unsupported schema=%s error=%s",
+                schema_name,
+                str(exc)[:500],
+            )
 
     fallback_prompt = (
         f"{prompt}\n\n"
@@ -187,7 +221,24 @@ async def _invoke_structured_with_fallback(
         "Use null for unknown scalar fields, [] for unknown list fields, and preserve the requested schema keys."
     )
     message = await llm.ainvoke(fallback_prompt)
-    payload = _normalize_payload_for_schema(schema, _extract_json_object(_extract_message_text(message)))
+    raw_text = _extract_message_text(message)
+    logger.warning(
+        "freight_ai.invoke.raw schema=%s raw=%s",
+        schema_name,
+        raw_text[:MAX_DEBUG_TEXT_CHARS],
+    )
+    raw_payload = _extract_json_object(raw_text)
+    logger.warning(
+        "freight_ai.invoke.payload schema=%s payload=%s",
+        schema_name,
+        str(raw_payload)[:MAX_DEBUG_TEXT_CHARS],
+    )
+    payload = _normalize_payload_for_schema(schema, raw_payload)
+    logger.warning(
+        "freight_ai.invoke.normalized schema=%s payload=%s",
+        schema_name,
+        str(payload)[:MAX_DEBUG_TEXT_CHARS],
+    )
     return schema.model_validate(payload)
 
 
@@ -231,6 +282,7 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
         )
         return _merge_intent_results(result, heuristics)
     except Exception:
+        logger.exception("freight_ai.classify_intent.failed")
         return heuristics
 
 
@@ -245,10 +297,10 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
         prompt = (
             "Extract structured freight shipment data from the email. "
             "Use intent new_quote_request. Populate origin, destination, pallets, "
-            "weight_lb, equipment_type, ready_at, ready_at_local_text, delivery_at, delivery_at_local_text, notes, missing_fields, ambiguity_reasons and confidence. "
-            "Use ready_at_local_text for pickup-ready local civil time and delivery_at_local_text for delivery appointment/dropoff local civil time when present. "
-            "If you already know a precise absolute timestamp, you may also populate ready_at or delivery_at. "
-            "Prefer concise datetime strings like YYYY-MM-DDTHH:MM:SS for local text fields when possible. "
+            "weight_lb, equipment_type, ready_at, delivery_at, notes, missing_fields, ambiguity_reasons and confidence. "
+            "Use ready_at for the pickup-ready time and delivery_at for delivery appointment/dropoff time when present. "
+            "If the email gives a local civil time, return it as a concise datetime like YYYY-MM-DDTHH:MM:SS without inventing a timezone. "
+            "If the email clearly gives an absolute timezone-aware timestamp, you may return that precise instant. "
             "If a field is absent, leave it null and include it in missing_fields when critical. "
             "If the email suggests multiple routes, conflicting details, or attachment-only details, add ambiguity_reasons.\n\n"
             f"{_context_blob(email_context)}"
@@ -260,6 +312,7 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
         )
         return _merge_shipment_results(result, heuristics)
     except Exception:
+        logger.exception("freight_ai.extract_shipment.failed")
         return heuristics
 
 
@@ -503,10 +556,6 @@ def _merge_shipment_results(
         primary.ready_at = fallback.ready_at
     if primary.delivery_at is None:
         primary.delivery_at = fallback.delivery_at
-    if not primary.ready_at_local_text:
-        primary.ready_at_local_text = fallback.ready_at_local_text
-    if not primary.delivery_at_local_text:
-        primary.delivery_at_local_text = fallback.delivery_at_local_text
     if not primary.notes:
         primary.notes = fallback.notes
     primary.missing_fields = list(dict.fromkeys(primary.missing_fields + fallback.missing_fields))
@@ -521,14 +570,14 @@ def _merge_shipment_results(
     primary.notes = _normalize_shipment_notes(primary.notes)
     primary.ready_at = _normalize_schedule_candidate(
         utc_value=primary.ready_at,
-        local_text=primary.ready_at_local_text,
+        local_text=None,
         timezone_name=infer_shipment_timezone(primary.origin, primary.destination),
         ambiguity_reasons=primary.ambiguity_reasons,
         ambiguity_key="ready_at_timezone_unresolved",
     )
     primary.delivery_at = _normalize_schedule_candidate(
         utc_value=primary.delivery_at,
-        local_text=primary.delivery_at_local_text,
+        local_text=None,
         timezone_name=infer_delivery_timezone(primary.origin, primary.destination),
         ambiguity_reasons=primary.ambiguity_reasons,
         ambiguity_key="delivery_at_timezone_unresolved",
@@ -769,9 +818,11 @@ def _extract_delivery_at(text: str) -> datetime | None:
     return _parse_local_datetime_candidate(delivery_match.group(0))
 
 
-def _parse_local_datetime_candidate(value: str | None) -> datetime | None:
+def _parse_local_datetime_candidate(value: str | datetime | None) -> datetime | None:
     if not value:
         return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is None else value.replace(tzinfo=None)
     text = value.strip()
     if not text:
         return None
@@ -819,7 +870,7 @@ def _parse_local_datetime_candidate(value: str | None) -> datetime | None:
 def _normalize_schedule_candidate(
     *,
     utc_value: datetime | None,
-    local_text: str | None,
+    local_text: str | datetime | None,
     timezone_name: str | None,
     ambiguity_reasons: list[str],
     ambiguity_key: str,

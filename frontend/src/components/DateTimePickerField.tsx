@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Calendar, ChevronLeft, ChevronRight, Clock3, X } from "lucide-react";
 
@@ -14,8 +14,9 @@ interface DateTimePickerFieldProps {
 
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTH_LABELS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const HOUR_OPTIONS = Array.from({ length: 24 }, (_, hour) => String(hour).padStart(2, "0"));
+const HOUR_OPTIONS = Array.from({ length: 12 }, (_, index) => String(index + 1));
 const MINUTE_OPTIONS = Array.from({ length: 12 }, (_, index) => String(index * 5).padStart(2, "0"));
+const PERIOD_OPTIONS = ["AM", "PM"] as const;
 
 function parseLocalValue(value: string): Date | null {
   if (!value) return null;
@@ -49,6 +50,7 @@ function formatTriggerLabel(value: string, placeholder: string) {
     year: "numeric",
     hour: "numeric",
     minute: "2-digit",
+    hour12: true,
   }).format(parsed);
 }
 
@@ -72,6 +74,17 @@ function buildCalendarDays(monthDate: Date) {
   return days;
 }
 
+function getTimePartsForPicker(date: Date | null) {
+  const hours24 = date ? date.getHours() : 8;
+  const hour12 = ((hours24 + 11) % 12) + 1;
+  const period = hours24 >= 12 ? "PM" : "AM";
+  return {
+    hour12: String(hour12),
+    minute: date ? String(date.getMinutes()).padStart(2, "0") : "00",
+    period: period as (typeof PERIOD_OPTIONS)[number],
+  };
+}
+
 export function DateTimePickerField({
   label,
   value,
@@ -82,13 +95,11 @@ export function DateTimePickerField({
   const POPUP_WIDTH = 356;
   const DESKTOP_POPUP_HEIGHT = 404;
   const VIEWPORT_GAP = 16;
-  const DESKTOP_BREAKPOINT = 1280;
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const popupRef = useRef<HTMLDivElement | null>(null);
   const previousAutoOpenSignal = useRef(autoOpenSignal);
   const [open, setOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
-  const [useCustomPicker, setUseCustomPicker] = useState(false);
   const [position, setPosition] = useState<{ top: number; left: number; width: number; maxHeight: number; placement: "bottom" | "top" }>({
     top: 0,
     left: 0,
@@ -99,27 +110,40 @@ export function DateTimePickerField({
   const selectedDate = useMemo(() => parseLocalValue(value), [value]);
   const [viewMonth, setViewMonth] = useState<Date>(() => selectedDate ? new Date(selectedDate.getFullYear(), selectedDate.getMonth(), 1) : new Date(new Date().getFullYear(), new Date().getMonth(), 1));
 
-  useEffect(() => {
-    setMounted(true);
-    if (typeof window !== "undefined") {
-      setUseCustomPicker(window.innerWidth >= DESKTOP_BREAKPOINT);
-    }
-  }, []);
+  const updatePopupPosition = useCallback(() => {
+    if (!triggerRef.current) return;
+    const rect = triggerRef.current.getBoundingClientRect();
+    const viewportHeight = window.innerHeight;
+    const viewportWidth = window.innerWidth;
+    const popupWidth = Math.min(
+      Math.max(rect.width, POPUP_WIDTH),
+      Math.max(300, viewportWidth - VIEWPORT_GAP * 2),
+    );
+    const unclampedLeft = rect.left;
+    const maxLeft = viewportWidth - popupWidth - VIEWPORT_GAP;
+    const left = Math.max(VIEWPORT_GAP, Math.min(unclampedLeft, maxLeft));
+    const spaceBelow = viewportHeight - rect.bottom - VIEWPORT_GAP;
+    const spaceAbove = rect.top - VIEWPORT_GAP;
+    const preferredPlacement: "bottom" | "top" = spaceBelow >= 300 || spaceBelow >= spaceAbove ? "bottom" : "top";
+    const availableByPlacement = preferredPlacement === "top" ? spaceAbove : spaceBelow;
+    const maxHeight = Math.max(220, Math.min(DESKTOP_POPUP_HEIGHT, availableByPlacement));
+    const unclampedTop = preferredPlacement === "top"
+      ? rect.top - maxHeight - 10
+      : rect.bottom + 10;
+    const maxTop = viewportHeight - maxHeight - VIEWPORT_GAP;
+    const top = Math.max(VIEWPORT_GAP, Math.min(unclampedTop, maxTop));
+
+    setPosition({
+      top,
+      left,
+      width: popupWidth,
+      maxHeight,
+      placement: preferredPlacement,
+    });
+  }, [DESKTOP_POPUP_HEIGHT, POPUP_WIDTH, VIEWPORT_GAP]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const updatePickerMode = () => {
-      const shouldUseCustom = window.innerWidth >= DESKTOP_BREAKPOINT;
-      setUseCustomPicker(shouldUseCustom);
-      if (!shouldUseCustom) {
-        setOpen(false);
-      }
-    };
-    updatePickerMode();
-    window.addEventListener("resize", updatePickerMode);
-    return () => {
-      window.removeEventListener("resize", updatePickerMode);
-    };
+    setMounted(true);
   }, []);
 
   useEffect(() => {
@@ -139,39 +163,22 @@ export function DateTimePickerField({
   }, [autoOpenSignal, mounted]);
 
   useEffect(() => {
-    if (!open || !triggerRef.current) return;
-    const rect = triggerRef.current.getBoundingClientRect();
-    const viewportHeight = window.innerHeight;
-    const viewportWidth = window.innerWidth;
-    const spaceBelow = viewportHeight - rect.bottom - VIEWPORT_GAP;
-    const spaceAbove = rect.top - VIEWPORT_GAP;
-    const opensAbove = spaceBelow < 300 && spaceAbove > spaceBelow;
-    const availableHeight = Math.max(
-      260,
-      Math.min(
-        DESKTOP_POPUP_HEIGHT,
-        opensAbove ? spaceAbove : spaceBelow,
-      ),
-    );
-    const popupWidth = Math.min(
-      Math.max(rect.width, POPUP_WIDTH),
-      Math.max(300, viewportWidth - VIEWPORT_GAP * 2),
-    );
-    const unclampedLeft = rect.left + window.scrollX;
-    const maxLeft = window.scrollX + viewportWidth - popupWidth - VIEWPORT_GAP;
-    const left = Math.max(window.scrollX + VIEWPORT_GAP, Math.min(unclampedLeft, maxLeft));
-    const top = opensAbove
-      ? rect.top + window.scrollY - availableHeight - 10
-      : rect.bottom + window.scrollY + 10;
-
-    setPosition({
-      top: Math.max(window.scrollY + VIEWPORT_GAP, top),
-      left,
-      width: popupWidth,
-      maxHeight: availableHeight,
-      placement: opensAbove ? "top" : "bottom",
-    });
-  }, [open]);
+    if (!open) return;
+    updatePopupPosition();
+    const frame = requestAnimationFrame(updatePopupPosition);
+    const handleViewportChange = () => updatePopupPosition();
+    window.addEventListener("resize", handleViewportChange);
+    window.addEventListener("scroll", handleViewportChange, true);
+    window.visualViewport?.addEventListener("resize", handleViewportChange);
+    window.visualViewport?.addEventListener("scroll", handleViewportChange);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", handleViewportChange);
+      window.removeEventListener("scroll", handleViewportChange, true);
+      window.visualViewport?.removeEventListener("resize", handleViewportChange);
+      window.visualViewport?.removeEventListener("scroll", handleViewportChange);
+    };
+  }, [open, updatePopupPosition]);
 
   useEffect(() => {
     if (!open) return;
@@ -183,14 +190,11 @@ export function DateTimePickerField({
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
     };
-    const handleResize = () => setOpen(false);
     window.addEventListener("mousedown", handlePointer);
     window.addEventListener("keydown", handleEscape);
-    window.addEventListener("resize", handleResize);
     return () => {
       window.removeEventListener("mousedown", handlePointer);
       window.removeEventListener("keydown", handleEscape);
-      window.removeEventListener("resize", handleResize);
     };
   }, [open]);
 
@@ -200,29 +204,31 @@ export function DateTimePickerField({
     onChange(toLocalInputValue(base));
   };
 
-  const updateTimePart = (kind: "hour" | "minute", nextValue: string) => {
+  const updateTimePart = (kind: "hour12" | "minute" | "period", nextValue: string) => {
     const base = selectedDate ? new Date(selectedDate) : new Date(viewMonth.getFullYear(), viewMonth.getMonth(), 1, 8, 0, 0, 0);
-    if (kind === "hour") base.setHours(Number(nextValue));
+    if (kind === "hour12") {
+      const currentPeriod = base.getHours() >= 12 ? "PM" : "AM";
+      let nextHour24 = Number(nextValue) % 12;
+      if (currentPeriod === "PM") {
+        nextHour24 += 12;
+      }
+      base.setHours(nextHour24);
+    }
     if (kind === "minute") base.setMinutes(Number(nextValue));
+    if (kind === "period") {
+      const currentHours = base.getHours();
+      if (nextValue === "PM" && currentHours < 12) {
+        base.setHours(currentHours + 12);
+      } else if (nextValue === "AM" && currentHours >= 12) {
+        base.setHours(currentHours - 12);
+      }
+    }
     onChange(toLocalInputValue(base));
   };
 
   const calendarDays = buildCalendarDays(viewMonth);
   const selectedDayKey = selectedDate ? `${selectedDate.getFullYear()}-${selectedDate.getMonth()}-${selectedDate.getDate()}` : null;
-
-  if (!useCustomPicker) {
-    return (
-      <div className="relative">
-        {label && <span className="mb-2 block text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">{label}</span>}
-        <input
-          type="datetime-local"
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          className="field-input datetime-native-input min-h-[52px] w-full [color-scheme:dark]"
-        />
-      </div>
-    );
-  }
+  const timeParts = getTimePartsForPicker(selectedDate);
 
   return (
     <>
@@ -230,11 +236,11 @@ export function DateTimePickerField({
         ref={triggerRef}
         type="button"
         onClick={() => setOpen((current) => !current)}
-        className="field-input flex min-h-[52px] w-full items-center justify-between gap-3 text-left"
+        className="field-input flex min-h-[46px] w-full items-center justify-between gap-2 text-left"
       >
         <div className="min-w-0">
           {label && <span className="block text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">{label}</span>}
-          <span className={`mt-1 block truncate text-sm ${value ? "text-white" : "text-slate-400"}`}>
+          <span className={`block truncate text-sm ${value ? "text-white" : "text-slate-400"}`}>
             {formatTriggerLabel(value, placeholder)}
           </span>
         </div>
@@ -320,15 +326,15 @@ export function DateTimePickerField({
                   </div>
                 </div>
 
-                <div className="grid gap-2.5 sm:grid-cols-2">
+                <div className="grid gap-2.5 sm:grid-cols-3">
                   <label className="rounded-[18px] border border-white/10 bg-white/[0.03] p-2.5">
                     <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-slate-400">
                       <Clock3 size={13} />
                       Hour
                     </span>
                     <select
-                      value={selectedDate ? String(selectedDate.getHours()).padStart(2, "0") : "08"}
-                      onChange={(event) => updateTimePart("hour", event.target.value)}
+                      value={timeParts.hour12}
+                      onChange={(event) => updateTimePart("hour12", event.target.value)}
                       className="mt-1.5 w-full bg-transparent text-sm text-white outline-none"
                     >
                       {HOUR_OPTIONS.map((hour) => (
@@ -345,13 +351,31 @@ export function DateTimePickerField({
                       Minute
                     </span>
                     <select
-                      value={selectedDate ? String(selectedDate.getMinutes()).padStart(2, "0") : "00"}
+                      value={timeParts.minute}
                       onChange={(event) => updateTimePart("minute", event.target.value)}
                       className="mt-1.5 w-full bg-transparent text-sm text-white outline-none"
                     >
                       {MINUTE_OPTIONS.map((minute) => (
                         <option key={minute} value={minute} className="bg-slate-900">
                           {minute}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="rounded-[18px] border border-white/10 bg-white/[0.03] p-2.5">
+                    <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-slate-400">
+                      <Clock3 size={13} />
+                      AM/PM
+                    </span>
+                    <select
+                      value={timeParts.period}
+                      onChange={(event) => updateTimePart("period", event.target.value)}
+                      className="mt-1.5 w-full bg-transparent text-sm text-white outline-none"
+                    >
+                      {PERIOD_OPTIONS.map((period) => (
+                        <option key={period} value={period} className="bg-slate-900">
+                          {period}
                         </option>
                       ))}
                     </select>

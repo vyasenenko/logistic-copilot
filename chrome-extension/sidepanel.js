@@ -2,7 +2,6 @@ const messagesEl = document.getElementById('messages');
 const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
 const clearBtn = document.getElementById('clearBtn');
-const pageBtn = document.getElementById('pageBtn');
 const apiBaseInput = document.getElementById('apiBaseInput');
 const saveApiBtn = document.getElementById('saveApiBtn');
 const themeBtn = document.getElementById('themeBtn');
@@ -11,7 +10,7 @@ const STORAGE_MESSAGES = 'assistant_messages';
 const STORAGE_API_BASE = 'api_base_url';
 const STORAGE_CONVERSATION = 'conversation_id';
 const STORAGE_THEME = 'ui_theme';
-const DEFAULT_API_BASE = 'http://localhost:8000';
+const DEFAULT_API_BASE = 'https://api.logisticopilot.com';
 
 (function configureMarked() {
   if (typeof marked === 'undefined') return;
@@ -158,6 +157,23 @@ function renderMarkdown(text) {
   }
   console.warn('Markdown parser unavailable; plain text fallback');
   return `<p>${escapeHtml(raw).replace(/\n/g, '<br>')}</p>`;
+}
+
+/**
+ * Raw markdown for a streaming / finalized prose block (innerHTML is rendered; this preserves source).
+ * @param {HTMLElement} el
+ */
+function streamPlainSourceText(el) {
+  const raw = /** @type {{ _streamRaw?: string }} */ (el)._streamRaw;
+  if (typeof raw === 'string') return raw;
+  return el.textContent || '';
+}
+
+/** @param {HTMLElement} el */
+function setStreamPlainMarkdown(el, rawMarkdown) {
+  const raw = rawMarkdown == null ? '' : String(rawMarkdown);
+  /** @type {{ _streamRaw?: string }} */ (el)._streamRaw = raw;
+  el.innerHTML = renderMarkdown(raw);
 }
 
 /** @param {{ tool: string, status: string, toolInput?: object, toolOutput?: string }} tool */
@@ -388,13 +404,14 @@ function getOrCreateTextTail(streamBody) {
 function finalizeStreamMarkdown(streamBody) {
   for (const el of [...streamBody.children]) {
     if (el.classList.contains('stream-plain')) {
-      const raw = el.textContent || '';
+      const raw = streamPlainSourceText(el);
       el.className = 'markdown-body';
       if (raw.trim()) {
         el.innerHTML = renderMarkdown(raw);
       } else {
         el.remove();
       }
+      delete /** @type {{ _streamRaw?: string }} */ (el)._streamRaw;
     }
     if (el.classList.contains('inline-tool')) {
       const det = el.querySelector('details.inline-tool__drawer');
@@ -445,6 +462,21 @@ async function sendMessage() {
   /** @type {HTMLElement | null} */
   let streamBody = null;
 
+  let streamTailMdRaf = 0;
+  function flushStreamTailMarkdown() {
+    streamTailMdRaf = 0;
+    if (!streamBody) return;
+    const tail = streamBody.querySelector('.stream-plain--tail');
+    if (!tail) return;
+    setStreamPlainMarkdown(tail, pendingText);
+  }
+  function scheduleStreamTailMarkdown() {
+    if (streamTailMdRaf) return;
+    streamTailMdRaf = requestAnimationFrame(() => {
+      flushStreamTailMarkdown();
+    });
+  }
+
   function ensureStreamTurn() {
     if (streamArticle) return;
     typingArticle.remove();
@@ -469,7 +501,10 @@ async function sendMessage() {
       (chunk) => {
         pendingText += chunk;
         ensureStreamTurn();
-        if (streamBody) getOrCreateTextTail(streamBody).textContent = pendingText;
+        if (streamBody) {
+          getOrCreateTextTail(streamBody);
+          scheduleStreamTailMarkdown();
+        }
         scrollToBottom();
       },
       (ev) => {
@@ -491,7 +526,7 @@ async function sendMessage() {
             } else {
               const block = document.createElement('div');
               block.className = 'markdown-body stream-plain';
-              block.textContent = pendingText;
+              setStreamPlainMarkdown(block, pendingText);
               streamBody.appendChild(block);
             }
             pendingText = '';
@@ -550,7 +585,10 @@ async function sendMessage() {
         }
         if (ev.event === 'error') {
           pendingText += `\n\n**Error**\n\n${typeof ev.data === 'string' ? ev.data : stringifySafe(ev.data)}`;
-          if (streamBody) getOrCreateTextTail(streamBody).textContent = pendingText;
+          if (streamBody) {
+            getOrCreateTextTail(streamBody);
+            flushStreamTailMarkdown();
+          }
         }
         if (typeof ev.conversation_id === 'string') {
           conversationId = ev.conversation_id;
@@ -563,15 +601,21 @@ async function sendMessage() {
     const finalTime = getTime();
 
     if (streamArticle && streamBody) {
+      if (streamTailMdRaf) {
+        cancelAnimationFrame(streamTailMdRaf);
+        streamTailMdRaf = 0;
+      }
+      flushStreamTailMarkdown();
+
       if (pendingText.trim()) {
         const tail = streamBody.querySelector('.stream-plain--tail');
         if (tail) {
-          tail.textContent = pendingText;
+          setStreamPlainMarkdown(tail, pendingText);
           tail.classList.remove('stream-plain--tail');
         } else {
           const block = document.createElement('div');
           block.className = 'markdown-body stream-plain';
-          block.textContent = pendingText;
+          setStreamPlainMarkdown(block, pendingText);
           streamBody.appendChild(block);
         }
         pendingText = '';
@@ -583,7 +627,7 @@ async function sendMessage() {
       const segments = [];
       for (const el of streamBody.children) {
         if (el.classList.contains('stream-plain')) {
-          const t = el.textContent || '';
+          const t = streamPlainSourceText(el);
           if (t.trim()) segments.push({ type: 'text', text: t });
         }
         if (el.classList.contains('inline-tool')) {
@@ -643,32 +687,6 @@ function setSending(isSending) {
   sendBtn.disabled = isSending;
   userInput.disabled = isSending;
 }
-
-pageBtn.addEventListener('click', async () => {
-  pageBtn.disabled = true;
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.id) {
-      appendAssistantTurn('Could not access the **active tab**.', getTime(), null);
-      return;
-    }
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => ({
-        title: document.title,
-        url: location.href,
-        text: document.body.innerText.replace(/\s+/g, ' ').trim().slice(0, 500),
-      }),
-    });
-    const { title, url, text } = results[0].result;
-    const md = `### Active tab\n\n**${title}**\n\n${url}\n\n\`\`\`\n${text}\n\`\`\``;
-    appendAssistantTurn(md, getTime(), null);
-  } catch (err) {
-    appendAssistantTurn(`**Error**\n\n${escapeHtml(err.message)}`, getTime(), null);
-  } finally {
-    pageBtn.disabled = false;
-  }
-});
 
 clearBtn.addEventListener('click', () => {
   if (!confirm('Clear conversation history?')) return;

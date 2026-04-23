@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render grouped, colored `make help` for CopilotRunner (reads Makefile)."""
+"""Render grouped, colored `make help` for Logistic Copilot (reads Makefile)."""
 
 from __future__ import annotations
 
@@ -109,7 +109,7 @@ def parse_makefile(makefile: Path) -> dict[str, str]:
 
 
 def print_header() -> None:
-    title = "CopilotRunner"
+    title = "Logistic Copilot"
     subtitle = "make <цель>   ·   подсказка: make help   ·   подробные команды: V=1 make up"
     bar = "═" * 62
     print()

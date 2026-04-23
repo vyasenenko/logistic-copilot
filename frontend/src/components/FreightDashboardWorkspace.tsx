@@ -38,10 +38,11 @@ import {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers";
+type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers" | "archive";
 type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
 type DrawerMode = "overview" | "edit";
 type ThreadTab = "timeline" | "client" | "carrier_quotes" | "system";
+type ArchiveReasonCode = "duplicate" | "cancelled" | "parsed_error" | "fraud" | "test" | "non_delivery_bounce" | "other";
 type EditFocusTarget = "client_id" | "equipment_type" | "origin" | "destination" | "pallets" | "weight_lb" | "ready_at" | "delivery_at" | "notes";
 type StatusQueueAction = "preview" | "approve_and_send" | "approve_and_push" | "rebuild_draft" | "retry_push" | "dismiss";
 type OperatorAction =
@@ -163,6 +164,8 @@ interface ShipmentRecord {
   has_active_booking_warning: boolean;
   next_step_label: string | null;
   is_archived: boolean;
+  archive_reason_code: ArchiveReasonCode | null;
+  archive_reason_note: string | null;
   archived_reason: string | null;
   archived_at: string | null;
   created_at: string;
@@ -404,6 +407,20 @@ interface ArchiveDialogState {
   shipmentLabel: string;
 }
 
+const ARCHIVE_REASON_OPTIONS: Array<{ value: ArchiveReasonCode | "all"; label: string; helper: string }> = [
+  { value: "duplicate", label: "Duplicate", helper: "Same request already exists." },
+  { value: "cancelled", label: "Cancelled", helper: "Customer or operator cancelled it." },
+  { value: "parsed_error", label: "Parsed error", helper: "AI/system created an invalid shipment." },
+  { value: "fraud", label: "Fraud / spam", helper: "Suspicious or unwanted request." },
+  { value: "test", label: "Test", helper: "Internal or test data." },
+  { value: "non_delivery_bounce", label: "Non-delivery bounce", helper: "Email bounce or delivery failure." },
+  { value: "other", label: "Other", helper: "Anything else." },
+];
+
+function archiveReasonLabel(value: string | null | undefined) {
+  return ARCHIVE_REASON_OPTIONS.find((item) => item.value === value)?.label || "Other";
+}
+
 const EMPTY_OVERVIEW: OverviewResponse = {
   counts: {
     clients: 0,
@@ -472,9 +489,23 @@ function formatDate(value: string | null) {
 }
 
 function formatShipmentSchedule(displayValue: string | null, localValue: string | null) {
-  if (displayValue) return displayValue;
-  if (!localValue) return "Not scheduled";
-  return localValue.replace("T", " ").slice(0, 16);
+  const rawValue = displayValue
+    ? displayValue.replace(/\s*\([^)]+\)\s*$/, "").trim()
+    : localValue
+      ? localValue.replace("T", " ").trim()
+      : "";
+  if (!rawValue) return "Not scheduled";
+  const normalizedForParse = rawValue.includes("T") ? rawValue : rawValue.replace(" ", "T");
+  const parsed = new Date(normalizedForParse);
+  if (Number.isNaN(parsed.getTime())) return rawValue;
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(parsed);
 }
 
 function currentMonthValue() {
@@ -738,6 +769,10 @@ export function FreightDashboardWorkspace() {
   const [clients, setClients] = useState<ClientRecord[]>([]);
   const [carriers, setCarriers] = useState<CarrierRecord[]>([]);
   const [shipments, setShipments] = useState<ShipmentRecord[]>([]);
+  const [archivedShipments, setArchivedShipments] = useState<ShipmentRecord[]>([]);
+  const [archiveSearch, setArchiveSearch] = useState("");
+  const [archiveReasonFilter, setArchiveReasonFilter] = useState<ArchiveReasonCode | "all">("all");
+  const [archiveMonth, setArchiveMonth] = useState(currentMonthValue());
   const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
   const [statusQueue, setStatusQueue] = useState<StatusQueueItem[]>([]);
   const [events, setEvents] = useState<WorkflowEventRecord[]>([]);
@@ -766,7 +801,8 @@ export function FreightDashboardWorkspace() {
   const [activeThreadTab, setActiveThreadTab] = useState<ThreadTab>("timeline");
   const [contextMenu, setContextMenu] = useState<{ shipmentId: string; x: number; y: number } | null>(null);
   const [archiveDialog, setArchiveDialog] = useState<ArchiveDialogState | null>(null);
-  const [archiveReason, setArchiveReason] = useState("invalid shipment from non-delivery email");
+  const [archiveReasonCode, setArchiveReasonCode] = useState<ArchiveReasonCode>("parsed_error");
+  const [archiveReasonNote, setArchiveReasonNote] = useState("invalid shipment from non-delivery email");
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState<string | null>(null);
   const [threadCache, setThreadCache] = useState<Record<string, ShipmentThreadResponse>>({});
@@ -778,6 +814,7 @@ export function FreightDashboardWorkspace() {
   const drawerScrollRef = useRef<HTMLDivElement | null>(null);
   const monthPickerRef = useRef<HTMLDivElement | null>(null);
   const overviewRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resolvingQuoteTokenRef = useRef<string | null>(null);
   const editFieldRefs = useRef<Partial<Record<EditFocusTarget, HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null>>>({});
   const [shipmentCreateForm, setShipmentCreateForm] = useState({
     client_id: "",
@@ -800,8 +837,11 @@ export function FreightDashboardWorkspace() {
   });
 
   const selectedShipment = useMemo(
-    () => shipments.find((shipment) => shipment.id === selectedShipmentId) || null,
-    [shipments, selectedShipmentId],
+    () =>
+      shipments.find((shipment) => shipment.id === selectedShipmentId) ||
+      archivedShipments.find((shipment) => shipment.id === selectedShipmentId) ||
+      null,
+    [archivedShipments, shipments, selectedShipmentId],
   );
   const selectedClient = useMemo(
     () => (selectedShipment?.client_id ? clients.find((client) => client.id === selectedShipment.client_id) || null : null),
@@ -927,6 +967,60 @@ export function FreightDashboardWorkspace() {
     });
   }
 
+  function currentQuoteParam() {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("quote");
+  }
+
+  function setQuoteParam(quoteToken: string | null, mode: "push" | "replace" = "push") {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    if (quoteToken) {
+      url.searchParams.set("quote", quoteToken);
+    } else {
+      url.searchParams.delete("quote");
+    }
+    const next = `${url.pathname}${url.search}${url.hash}`;
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (next === current) return;
+    if (mode === "replace") {
+      window.history.replaceState({}, "", next);
+    } else {
+      window.history.pushState({}, "", next);
+    }
+  }
+
+  async function openShipmentByQuoteToken(quoteToken: string, options?: { replaceUrl?: boolean }) {
+    const normalized = quoteToken.trim().toUpperCase();
+    if (!normalized) return;
+    const existing = shipments.find((shipment) => shipment.quote_token?.toUpperCase() === normalized);
+    if (existing) {
+      if (selectedShipmentId === existing.id && drawerOpen) {
+        setQuoteParam(existing.quote_token || normalized, options?.replaceUrl ? "replace" : "push");
+        return;
+      }
+      if (selectShipment(existing.id, { openDrawer: true })) {
+        setQuoteParam(existing.quote_token || normalized, options?.replaceUrl ? "replace" : "push");
+      }
+      return;
+    }
+    if (resolvingQuoteTokenRef.current === normalized) return;
+    resolvingQuoteTokenRef.current = normalized;
+    try {
+      const shipment = await fetchJson<ShipmentRecord>(`/api/freight/shipments/by-token/${encodeURIComponent(normalized)}`);
+      mergeShipmentIntoState(shipment);
+      setSelectedShipmentId(shipment.id);
+      setDrawerOpen(true);
+      setDrawerMode("overview");
+      setQuoteParam(shipment.quote_token || normalized, options?.replaceUrl ? "replace" : "push");
+    } catch {
+      setNotice(`Shipment ${normalized} was not found.`);
+      setQuoteParam(null, "replace");
+    } finally {
+      resolvingQuoteTokenRef.current = null;
+    }
+  }
+
   function removeShipmentFromState(shipmentId: string) {
     setShipments((current) => {
       const next = current.filter((item) => item.id !== shipmentId);
@@ -956,7 +1050,24 @@ export function FreightDashboardWorkspace() {
   async function refreshShipmentList(month = selectedBoardMonth) {
     const shipmentData = await fetchJson<ShipmentRecord[]>(`/api/freight/shipments?month=${encodeURIComponent(month)}`);
     setShipments(shipmentData);
-    setSelectedShipmentId((current) => current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null);
+    setSelectedShipmentId((current) => {
+      if (currentQuoteParam() && current) return current;
+      return current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null;
+    });
+  }
+
+  async function refreshArchivedShipments() {
+    const params = new URLSearchParams();
+    params.set("month", archiveMonth);
+    params.set("limit", "200");
+    if (archiveSearch.trim()) {
+      params.set("query", archiveSearch.trim());
+    }
+    if (archiveReasonFilter !== "all") {
+      params.set("reason_code", archiveReasonFilter);
+    }
+    const archiveData = await fetchJson<ShipmentRecord[]>(`/api/freight/shipments/archive?${params.toString()}`);
+    setArchivedShipments(archiveData);
   }
 
   async function refreshSelectedShipment(shipmentId: string) {
@@ -1004,7 +1115,10 @@ export function FreightDashboardWorkspace() {
         setShipments(shipmentData);
         setReviewQueue(reviewData);
         setStatusQueue(statusQueueData);
-        setSelectedShipmentId((current) => current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null);
+        setSelectedShipmentId((current) => {
+          if (currentQuoteParam() && current) return current;
+          return current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null;
+        });
         setSelectedStatusTaskId((current) => current && statusQueueData.some((item) => item.task_id === current) ? current : statusQueueData[0]?.task_id || null);
         if (!bidForm.carrier_id && carrierData[0]) {
           setBidForm((current) => ({ ...current, carrier_id: carrierData[0].id }));
@@ -1063,6 +1177,7 @@ export function FreightDashboardWorkspace() {
     }
     setDrawerOpen(false);
     setDrawerMode("overview");
+    setQuoteParam(null);
   }
 
   function backToOverview() {
@@ -1082,6 +1197,13 @@ export function FreightDashboardWorkspace() {
     setSelectedShipmentId(shipmentId);
     if (options?.openDrawer) {
       setDrawerOpen(true);
+      const shipment = shipments.find((item) => item.id === shipmentId);
+      const archivedShipment = archivedShipments.find((item) => item.id === shipmentId);
+      if (archivedShipment) {
+        setQuoteParam(null);
+      } else if (shipment?.quote_token) {
+        setQuoteParam(shipment.quote_token);
+      }
     }
     return true;
   }
@@ -1174,6 +1296,37 @@ export function FreightDashboardWorkspace() {
       setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipments for selected month.");
     });
   }, [selectedBoardMonth]);
+
+  useEffect(() => {
+    if (initialLoading || tab !== "archive") {
+      return;
+    }
+    void refreshArchivedShipments().catch((loadError) => {
+      setError(loadError instanceof Error ? loadError.message : "Failed to refresh archived shipments.");
+    });
+  }, [archiveMonth, archiveReasonFilter, archiveSearch, initialLoading, tab]);
+
+  useEffect(() => {
+    if (initialLoading) return;
+    const quoteToken = currentQuoteParam();
+    if (!quoteToken) return;
+    void openShipmentByQuoteToken(quoteToken, { replaceUrl: true });
+  }, [initialLoading, shipments]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handlePopState = () => {
+      const quoteToken = currentQuoteParam();
+      if (quoteToken) {
+        void openShipmentByQuoteToken(quoteToken, { replaceUrl: true });
+        return;
+      }
+      setDrawerOpen(false);
+      setDrawerMode("overview");
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [shipments, selectedShipmentId, drawerOpen, drawerMode, shipmentFormDirty, selectedShipment]);
 
   useEffect(() => {
     return () => {
@@ -1301,11 +1454,13 @@ export function FreightDashboardWorkspace() {
     window.addEventListener("contextmenu", close);
     window.addEventListener("keydown", handleEsc);
     window.addEventListener("mousedown", handlePointerDown);
+    window.addEventListener("scroll", close, true);
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("contextmenu", close);
       window.removeEventListener("keydown", handleEsc);
       window.removeEventListener("mousedown", handlePointerDown);
+      window.removeEventListener("scroll", close, true);
     };
   }, []);
 
@@ -1322,7 +1477,8 @@ export function FreightDashboardWorkspace() {
     if (action === "archive_shipment") {
       const targetShipment = shipments.find((shipment) => shipment.id === targetShipmentId) || selectedShipment;
       setContextMenu(null);
-      setArchiveReason("invalid shipment from non-delivery email");
+      setArchiveReasonCode("parsed_error");
+      setArchiveReasonNote("invalid shipment from non-delivery email");
       setArchiveDialog({
         shipmentId: targetShipmentId,
         shipmentLabel: targetShipment ? formatRoute(targetShipment) : "this shipment",
@@ -1370,7 +1526,8 @@ export function FreightDashboardWorkspace() {
         method: "POST",
         body: JSON.stringify({
           action: "archive_shipment",
-          reason: archiveReason.trim() || "archived_by_operator",
+          reason_code: archiveReasonCode,
+          reason_note: archiveReasonNote.trim() || null,
           suppress_source_thread: true,
         }),
       });
@@ -1379,6 +1536,7 @@ export function FreightDashboardWorkspace() {
       setContextMenu(null);
       setArchiveDialog(null);
       removeShipmentFromState(archiveDialog.shipmentId);
+      await refreshArchivedShipments();
       await Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue()]);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to archive shipment.");
@@ -1774,6 +1932,7 @@ export function FreightDashboardWorkspace() {
     actionModel?.contextActions.filter(
       (action) => action.operatorAction !== actionModel.operatorAction && action.key !== "archive_shipment",
     ) || [];
+  const quickActions = actionModel?.contextActions.filter((action) => action.operatorAction !== actionModel.operatorAction) || [];
   const boardColumns = [
     { key: "parsing", label: "Parsing", accent: "from-teal-300/18 to-teal-500/0" },
     { key: "waiting_bids", label: "Waiting Bids", accent: "from-orange-300/18 to-orange-500/0" },
@@ -1794,7 +1953,7 @@ export function FreightDashboardWorkspace() {
       label: string,
       value: string,
       onClick: () => void,
-      magicAction?: { label: string; onClick: () => void; loading?: boolean },
+      magicAction?: { label: string; tooltip: string; onClick: () => void; loading?: boolean },
     ) => (
       <div
         role="button"
@@ -1808,29 +1967,94 @@ export function FreightDashboardWorkspace() {
         }}
         className="rounded-2xl bg-white/5 p-3 text-left transition hover:bg-white/9 hover:ring-1 hover:ring-cyan-200/20"
       >
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex items-start justify-between gap-3">
           <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">{label}</p>
           <span className="text-[10px] uppercase tracking-[0.16em] text-cyan-100/70">Edit</span>
         </div>
-        <p className="mt-2 text-white">{value}</p>
-        {magicAction && (
-          <div className="mt-3 flex justify-end">
-            <button
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                magicAction.onClick();
-              }}
-              disabled={Boolean(magicAction.loading)}
-              className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200/16 bg-cyan-200/8 px-3 py-1.5 text-[10px] uppercase tracking-[0.18em] text-cyan-50 transition hover:bg-cyan-200/14 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Sparkles size={12} />
-              {magicAction.loading ? "Reading thread..." : magicAction.label}
-            </button>
-          </div>
-        )}
+        <div className="mt-1.5 flex items-center justify-between gap-2">
+          <p className="min-w-0 flex-1 text-white">{value}</p>
+          {magicAction && (
+            <div className="group/magic relative shrink-0">
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  magicAction.onClick();
+                }}
+                disabled={Boolean(magicAction.loading)}
+                aria-label={magicAction.loading ? "Reading thread..." : magicAction.label}
+                className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-cyan-200/16 bg-cyan-200/8 text-cyan-50 transition hover:bg-cyan-200/14 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Sparkles size={10} className={magicAction.loading ? "animate-pulse" : ""} />
+                <span className="sr-only">{magicAction.loading ? "Reading thread..." : magicAction.label}</span>
+              </button>
+              <div className="pointer-events-none absolute right-0 top-full z-30 mt-1.5 w-72 translate-y-1 rounded-xl border border-cyan-200/18 bg-slate-950/95 px-3 py-2 text-[11px] leading-4 text-slate-200 opacity-0 shadow-xl transition group-hover/magic:translate-y-0 group-hover/magic:opacity-100 group-focus-within/magic:translate-y-0 group-focus-within/magic:opacity-100">
+                {magicAction.tooltip}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     );
+
+    if (selectedShipment.is_archived) {
+      return (
+        <div className="flex flex-col gap-4">
+          <div className="rounded-[28px] border border-amber-300/18 bg-amber-300/[0.06] p-5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-full border border-amber-300/20 bg-amber-300/12 px-3 py-1 text-xs text-amber-100">
+                Archived
+              </span>
+              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-[var(--text-muted)]">
+                {archiveReasonLabel(selectedShipment.archive_reason_code)}
+              </span>
+              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-[var(--text-muted)]">
+                {selectedShipment.quote_token || "No quote token"}
+              </span>
+            </div>
+            <h2 className="mt-4 text-2xl font-semibold tracking-[-0.04em] text-white">{formatRoute(selectedShipment)}</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-300">
+              This shipment is archived and excluded from active automation, board counters, active search, and active agent tools.
+            </p>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-2xl bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Archive note</p>
+                <p className="mt-2 text-white">{selectedShipment.archive_reason_note || selectedShipment.archived_reason || "No note"}</p>
+              </div>
+              <div className="rounded-2xl bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Archived at</p>
+                <p className="mt-2 text-white">{formatDate(selectedShipment.archived_at)}</p>
+              </div>
+              <div className="rounded-2xl bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Original status</p>
+                <p className="mt-2 text-white capitalize">{selectedShipment.status.replaceAll("_", " ")}</p>
+              </div>
+              <div className="rounded-2xl bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Source thread</p>
+                <p className="mt-2 break-all text-white">{selectedShipment.email_thread_id || "No linked thread"}</p>
+              </div>
+            </div>
+          </div>
+          <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
+            <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Archive timeline</p>
+            <div className="mt-4 space-y-3">
+              {events.length === 0 && <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-5 text-sm text-[var(--text-muted)]">No archive events loaded yet.</div>}
+              {events.map((eventRecord) => (
+                <div key={eventRecord.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-white">{eventRecord.event_type.replaceAll("_", " ")}</p>
+                    <span className="text-xs text-[var(--text-muted)]">{formatDate(eventRecord.created_at)}</span>
+                  </div>
+                  {typeof eventRecord.payload.reason === "string" && (
+                    <p className="mt-2 text-sm text-[var(--text-muted)]">{eventRecord.payload.reason}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
 
     if (drawerMode === "edit") {
       const fieldLabelClass = "mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]";
@@ -1954,6 +2178,23 @@ export function FreightDashboardWorkspace() {
               />
             </label>
           </div>
+          <div className="mt-5 border-t border-white/10 pt-4">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <button
+                onClick={backToOverview}
+                className="action-button w-full border border-white/15 bg-white/8 px-4 py-2.5 text-sm font-medium text-white hover:bg-white/14"
+              >
+                Back to overview
+              </button>
+              <button
+                onClick={() => void persistShipmentEdits()}
+                disabled={!shipmentFormDirty || submitting !== null}
+                className="action-button w-full bg-[var(--accent-cyan)] px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-[0_10px_24px_rgba(103,232,249,0.24)] hover:brightness-110 disabled:opacity-50"
+              >
+                {submitting === "save_shipment" ? "Saving..." : "Save changes"}
+              </button>
+            </div>
+          </div>
         </div>
       );
     }
@@ -1990,6 +2231,8 @@ export function FreightDashboardWorkspace() {
                   () => enterEditMode("ready_at"),
                   {
                     label: "Auto-fill from thread",
+                    tooltip:
+                      "We will re-read the customer email thread and try to auto-fill this field if the required details are present in the messages.",
                     onClick: () => void runMagicFill("ready_at_local"),
                     loading: magicFillingField === "ready_at_local",
                   },
@@ -2507,6 +2750,7 @@ export function FreightDashboardWorkspace() {
               { key: "shipments", label: "Shipments", icon: Package2 },
               { key: "clients", label: "Customers", icon: Users },
               { key: "carriers", label: "Carriers", icon: Truck },
+              { key: "archive", label: "Archive", icon: Archive },
             ].map(({ key, label, icon: Icon }) => {
               const active = tab === key;
               return (
@@ -2651,33 +2895,55 @@ export function FreightDashboardWorkspace() {
                     </div>
                   </>
                 ) : (
-                  <div className="rounded-[20px] border border-cyan-200/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.008))] px-3 py-3">
-                    <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                      <div className="flex min-w-0 flex-1 flex-wrap gap-1.5">
-                        <span className="inline-flex items-center gap-1.5 rounded-[11px] border border-cyan-200/12 bg-cyan-200/8 px-2.5 py-1.5 text-[10px] text-cyan-100">
-                          <Calendar size={14} /> {formatMonthLabel(selectedBoardMonth)}
-                        </span>
-                        <span className="rounded-[11px] border border-cyan-200/10 bg-slate-950/24 px-2.5 py-1.5 text-[10px] text-slate-300">
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setBoardControlsExpanded(true)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        setBoardControlsExpanded(true);
+                      }
+                    }}
+                    className="rounded-[20px] border border-cyan-200/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.008))] px-3 py-3 transition hover:border-cyan-200/18 hover:bg-cyan-200/6"
+                  >
+                    <div className="flex items-center gap-2">
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+                        <div ref={monthPickerRef}>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setMonthPickerOpen(true);
+                            }}
+                            className="inline-flex items-center gap-1.5 rounded-[11px] border border-cyan-200/12 bg-cyan-200/8 px-2.5 py-1.5 text-[10px] text-cyan-100 transition hover:border-cyan-200/22 hover:bg-cyan-200/14"
+                          >
+                            <Calendar size={14} /> {formatMonthLabel(selectedBoardMonth)}
+                          </button>
+                        </div>
+                        <span className="truncate rounded-[11px] border border-cyan-200/10 bg-slate-950/24 px-2.5 py-1.5 text-[10px] text-slate-300">
                           {boardShipments.length} shipments visible
                         </span>
-                        <span className="rounded-[11px] border border-cyan-200/10 bg-slate-950/20 px-2.5 py-1.5 text-[10px] text-slate-400">
+                        <span className="hidden truncate rounded-[11px] border border-cyan-200/10 bg-slate-950/20 px-2.5 py-1.5 text-[10px] text-slate-400 sm:inline-flex">
                           {attentionShipmentCount} awaiting operator
                         </span>
                         {shipmentSearch.trim() ? (
-                          <span className="rounded-[11px] border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[10px] text-slate-300">
+                          <span className="hidden truncate rounded-[11px] border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[10px] text-slate-300 lg:inline-flex">
                             Search: {shipmentSearch}
                           </span>
                         ) : null}
                       </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => setBoardControlsExpanded(true)}
-                          className="inline-flex items-center gap-2 rounded-[12px] border border-cyan-200/12 bg-[linear-gradient(135deg,rgba(110,184,255,0.08),rgba(110,184,255,0.02))] px-3 py-2 text-[12px] font-medium text-white transition hover:border-cyan-200/22 hover:bg-cyan-200/8"
-                        >
-                          <ChevronDown size={16} /> Expand controls
-                        </button>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setBoardControlsExpanded(true);
+                        }}
+                        className="ml-auto inline-flex shrink-0 items-center gap-2 rounded-[12px] border border-cyan-200/12 bg-[linear-gradient(135deg,rgba(110,184,255,0.08),rgba(110,184,255,0.02))] px-3 py-2 text-[12px] font-medium text-white transition hover:border-cyan-200/22 hover:bg-cyan-200/8"
+                      >
+                        <ChevronDown size={16} />
+                        <span className="hidden sm:inline">Expand controls</span>
+                      </button>
                     </div>
                   </div>
                 )}
@@ -2708,7 +2974,7 @@ export function FreightDashboardWorkspace() {
                               key={shipment.id}
                               onContextMenu={(event: ReactMouseEvent<HTMLDivElement>) => {
                                 event.preventDefault();
-                                if (!selectShipment(shipment.id, { openDrawer: true })) return;
+                                if (!selectShipment(shipment.id)) return;
                                 setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
                               }}
                               className={`group relative overflow-hidden rounded-[18px] border px-3 pt-2 pb-1.5 transition ${
@@ -2720,7 +2986,7 @@ export function FreightDashboardWorkspace() {
                               <button
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  if (!selectShipment(shipment.id, { openDrawer: true })) return;
+                                  if (!selectShipment(shipment.id)) return;
                                   setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
                                 }}
                                 className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full text-[var(--text-muted)] opacity-100 transition hover:bg-white/10 hover:text-white xl:opacity-0 xl:group-hover:opacity-100"
@@ -2748,7 +3014,7 @@ export function FreightDashboardWorkspace() {
                                     </span>
                                   </div>
                                   <p className="mt-1.5 line-clamp-2 text-[13px] font-medium leading-4.5 text-white">{formatRoute(shipment)}</p>
-                                  <div className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] leading-4 text-[var(--text-muted)]">
+                                  <div className="mt-1.5 grid grid-cols-[minmax(0,1.25fr)_minmax(0,0.95fr)] gap-x-2 gap-y-1 text-[10px] leading-4 text-[var(--text-muted)]">
                                     <p className="min-w-0 whitespace-normal">{formatShipmentSchedule(shipment.ready_at_display, shipment.ready_at_local || null) || "TBD"}</p>
                                     <p className="min-w-0 text-right whitespace-normal">Weight: {shipment.weight_lb ?? "--"} lb</p>
                                     <p className="min-w-0 whitespace-normal">Token: {shipment.quote_token || "--"}</p>
@@ -2935,6 +3201,92 @@ export function FreightDashboardWorkspace() {
             )
           : null}
 
+        {!initialLoading && tab === "archive" && (
+          <section className="glass-panel p-5">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Archive</p>
+                <h2 className="mt-1 text-2xl font-semibold tracking-[-0.04em] text-white">Ignored shipments</h2>
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
+                  View-only archive for duplicates, cancelled loads, parsing errors, fraud/spam, tests, and non-delivery bounces.
+                </p>
+              </div>
+              <button
+                onClick={() => void refreshArchivedShipments()}
+                disabled={submitting !== null}
+                className="action-button bg-white/8 text-white hover:bg-white/12 disabled:opacity-50"
+              >
+                <RefreshCcw size={15} /> Refresh archive
+              </button>
+            </div>
+            <div className="mt-5 grid gap-3 lg:grid-cols-[minmax(0,1fr),220px,180px]">
+              <label className="block">
+                <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Search archive</span>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-500" size={16} />
+                  <input
+                    className="field-input pl-11"
+                    value={archiveSearch}
+                    onChange={(event) => setArchiveSearch(event.target.value)}
+                    placeholder="Route, token, thread, reason..."
+                  />
+                </div>
+              </label>
+              <label className="block">
+                <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Reason</span>
+                <select className="field-input" value={archiveReasonFilter} onChange={(event) => setArchiveReasonFilter(event.target.value as ArchiveReasonCode | "all")}>
+                  <option value="all">All reasons</option>
+                  {ARCHIVE_REASON_OPTIONS.map((reason) => (
+                    <option key={reason.value} value={reason.value}>{reason.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Archive month</span>
+                <input className="field-input" type="month" value={archiveMonth} onChange={(event) => setArchiveMonth(event.target.value)} />
+              </label>
+            </div>
+            <div className="mt-5 grid gap-3 xl:grid-cols-2">
+              {archivedShipments.length === 0 && (
+                <div className="rounded-[24px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">
+                  No archived shipments match these filters.
+                </div>
+              )}
+              {archivedShipments.map((shipment) => (
+                <button
+                  key={shipment.id}
+                  onClick={() => {
+                    setSelectedShipmentId(shipment.id);
+                    setDrawerOpen(true);
+                    setDrawerMode("overview");
+                    setQuoteParam(null);
+                  }}
+                  className="rounded-[24px] border border-white/10 bg-white/[0.04] p-4 text-left transition hover:border-amber-300/24 hover:bg-amber-300/[0.06]"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border border-amber-300/20 bg-amber-300/12 px-3 py-1 text-xs text-amber-100">
+                      {archiveReasonLabel(shipment.archive_reason_code)}
+                    </span>
+                    <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-[var(--text-muted)]">
+                      {shipment.status.replaceAll("_", " ")}
+                    </span>
+                    <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-[var(--text-muted)]">
+                      {shipment.quote_token || "No token"}
+                    </span>
+                  </div>
+                  <h3 className="mt-3 text-lg font-semibold text-white">{formatRoute(shipment)}</h3>
+                  <div className="mt-3 grid gap-2 text-sm text-slate-300 sm:grid-cols-2">
+                    <p>Archived: {formatDate(shipment.archived_at)}</p>
+                    <p>Created: {formatDate(shipment.created_at)}</p>
+                    <p className="sm:col-span-2">Reason: {shipment.archive_reason_note || shipment.archived_reason || "No note"}</p>
+                    <p className="break-all sm:col-span-2">Thread: {shipment.email_thread_id || "No linked thread"}</p>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+
         {!initialLoading && tab === "clients" && (
           <section className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
             <form className="glass-panel p-5 space-y-3" onSubmit={handleCreateClient}>
@@ -2996,7 +3348,7 @@ export function FreightDashboardWorkspace() {
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(event) => event.stopPropagation()}
           >
-            <button onClick={() => { selectShipment(contextMenu.shipmentId); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
+            <button onClick={() => { selectShipment(contextMenu.shipmentId, { openDrawer: true }); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
               <Package2 size={16} /> Open shipment
             </button>
             {actionModel.label && actionModel.operatorAction && (
@@ -3007,7 +3359,7 @@ export function FreightDashboardWorkspace() {
             <button onClick={() => { enterEditMode(); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
               <PencilLine size={16} /> Edit details
             </button>
-            {secondaryActions.map((action) => (
+            {quickActions.map((action) => (
               <button
                 key={action.key}
                 onClick={() => void handleContextAction(action)}
@@ -3054,11 +3406,23 @@ export function FreightDashboardWorkspace() {
                     </div>
                     <div className="mt-4">
                       <label className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Archive reason</label>
-                      <input
+                      <select
                         className="field-input"
-                        value={archiveReason}
-                        onChange={(event) => setArchiveReason(event.target.value)}
-                        placeholder="invalid shipment from non-delivery email"
+                        value={archiveReasonCode}
+                        onChange={(event) => setArchiveReasonCode(event.target.value as ArchiveReasonCode)}
+                      >
+                        {ARCHIVE_REASON_OPTIONS.map((reason) => (
+                          <option key={reason.value} value={reason.value}>{reason.label} - {reason.helper}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="mt-4">
+                      <label className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Optional note</label>
+                      <textarea
+                        className="field-input min-h-[90px] resize-none"
+                        value={archiveReasonNote}
+                        onChange={(event) => setArchiveReasonNote(event.target.value)}
+                        placeholder="Add context for future audit..."
                       />
                     </div>
                     <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
@@ -3101,23 +3465,7 @@ export function FreightDashboardWorkspace() {
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
-                    {drawerMode === "edit" ? (
-                      <>
-                        <button
-                          onClick={backToOverview}
-                          className="action-button bg-white/10 px-3 py-1.5 text-sm text-white hover:bg-white/15"
-                        >
-                          Back to overview
-                        </button>
-                        <button
-                          onClick={() => void persistShipmentEdits()}
-                          disabled={!shipmentFormDirty || submitting !== null}
-                          className="action-button bg-[var(--accent-cyan)] px-3 py-1.5 text-sm text-slate-950 hover:brightness-110 disabled:opacity-50"
-                        >
-                          {submitting === "save_shipment" ? "Saving..." : "Save changes"}
-                        </button>
-                      </>
-                    ) : (
+                    {drawerMode !== "edit" && !selectedShipment?.is_archived && (
                       <button
                         onClick={() => enterEditMode()}
                         disabled={!selectedShipment}

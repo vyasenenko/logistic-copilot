@@ -163,6 +163,8 @@ class Shipment(Base):
     margin_policy_json = Column(JSON, default=dict, nullable=False)
     notes = Column(Text, default="", nullable=False)
     is_archived = Column(Boolean, default=False, nullable=False)
+    archive_reason_code = Column(String(50), nullable=True)
+    archive_reason_note = Column(String(500), nullable=True)
     archived_reason = Column(String(500), nullable=True)
     archived_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -288,6 +290,12 @@ async def init_db() -> None:
         )
         await conn.execute(
             text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS archive_reason_code VARCHAR(50)")
+        )
+        await conn.execute(
+            text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS archive_reason_note VARCHAR(500)")
         )
         await conn.execute(
             text("ALTER TABLE shipments ADD COLUMN IF NOT EXISTS archived_reason VARCHAR(500)")

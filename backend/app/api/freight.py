@@ -23,6 +23,7 @@ from app.memory.database import (
     get_session,
 )
 from app.schemas import (
+    ArchiveReasonCode,
     AutomationPolicy,
     BidIntakeRequest,
     BidIntakeResponse,
@@ -128,6 +129,51 @@ def _shipment_matches_month_filter(
     if reference is None:
         return False
     return reference.strftime("%Y-%m") == month
+
+
+async def _serialize_shipment_detail(session: AsyncSession, shipment: Shipment) -> ShipmentRecord:
+    ai_payloads = await _latest_ai_payloads(session, [shipment.id])
+    booking_payloads = await _latest_booking_payloads(session, [shipment.id])
+    status_payloads = await _latest_status_payloads(session, [shipment.id])
+    status_review_payloads = await _latest_status_review_payloads(session, [shipment.id])
+    tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id])
+    status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id])
+    document_action_payloads = await _latest_document_action_payloads(session, [shipment.id])
+    attachment_counts = await _attachment_counts(session, [shipment])
+    document_summaries = await _document_booking_summaries(session, [shipment], document_action_payloads)
+    now = datetime.now(timezone.utc)
+    status_stale = _is_status_stale(
+        shipment_status=shipment.status,
+        last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
+        now=now,
+    )
+    return _serialize_shipment(
+        shipment,
+        {
+            **(ai_payloads.get(shipment.id) or {}),
+            **(booking_payloads.get(shipment.id) or {}),
+            **(status_payloads.get(shipment.id) or {}),
+            **(status_review_payloads.get(shipment.id) or {}),
+            **(tms_identity_payloads.get(shipment.id) or {}),
+            **(status_workflow_payloads.get(shipment.id) or {}),
+            "attachment_count": attachment_counts.get(shipment.id, 0),
+            "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
+            "document_enrichment": document_summaries.get(shipment.id, {}).get("document_enrichment", {}),
+            "document_health_status": document_summaries.get(shipment.id, {}).get("document_health_status"),
+            "ocr_pending_count": document_summaries.get(shipment.id, {}).get("ocr_pending_count", 0),
+            "document_conflict_count": document_summaries.get(shipment.id, {}).get("document_conflict_count", 0),
+            "missing_document_types": document_summaries.get(shipment.id, {}).get("missing_document_types", []),
+            "booking_review_warning": document_summaries.get(shipment.id, {}).get("booking_review_warning"),
+            "booking_review_required": document_summaries.get(shipment.id, {}).get("review_required", False),
+            "status_stale": status_stale,
+            "status_sync_health": _status_sync_health(
+                status_stale=status_stale,
+                status_review_required=bool((status_review_payloads.get(shipment.id) or {}).get("status_review_required", False)),
+                status_workflow_state=(status_workflow_payloads.get(shipment.id) or {}).get("status_workflow_state"),
+            ),
+            "status_sla_hours": settings.status_sla_hours_default,
+        },
+    )
 
 
 def _clean_message_excerpt(value: str | None) -> str:
@@ -300,7 +346,12 @@ async def _process_outlook_mailbox_message(
                 policy=policy,
             )
             _apply_decision(result, decision)
-        except RuntimeError:
+        except Exception:
+            logger.exception(
+                "freight_inbox_orchestrator.failed email_message_id=%s shipment_id=%s",
+                result.email_message_id,
+                result.shipment_id,
+            )
             result.manual_review_required = True
             result.next_action = "manual_review"
             result.intent = "orchestrator_error"
@@ -493,6 +544,9 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
             status=shipment.status,
         ),
         is_archived=bool(getattr(shipment, "is_archived", False)),
+        archive_reason_code=getattr(shipment, "archive_reason_code", None)
+        or (ArchiveReasonCode.OTHER.value if bool(getattr(shipment, "is_archived", False)) else None),
+        archive_reason_note=getattr(shipment, "archive_reason_note", None) or getattr(shipment, "archived_reason", None),
         archived_reason=getattr(shipment, "archived_reason", None),
         archived_at=getattr(shipment, "archived_at", None),
         created_at=shipment.created_at,
@@ -608,11 +662,17 @@ async def _archive_shipment_and_optionally_suppress_source(
     *,
     shipment: Shipment,
     reason: str | None,
+    reason_code: ArchiveReasonCode | None = None,
+    reason_note: str | None = None,
     suppress_source_thread: bool,
 ) -> tuple[Shipment, EmailThread | None]:
     now = datetime.now(timezone.utc)
-    archive_reason = (reason or "archived_by_operator").strip() or "archived_by_operator"
+    archive_reason_code = (reason_code or ArchiveReasonCode.OTHER).value
+    archive_reason_note = (reason_note or reason or "").strip() or None
+    archive_reason = archive_reason_note or archive_reason_code
     shipment.is_archived = True
+    shipment.archive_reason_code = archive_reason_code
+    shipment.archive_reason_note = archive_reason_note
     shipment.archived_reason = archive_reason
     shipment.archived_at = now
     shipment.updated_at = now
@@ -623,6 +683,8 @@ async def _archive_shipment_and_optionally_suppress_source(
         stage=shipment.status,
         payload_json={
             "reason": archive_reason,
+            "reason_code": archive_reason_code,
+            "reason_note": archive_reason_note,
             "suppress_source_thread": suppress_source_thread,
             "email_thread_id": str(shipment.email_thread_id) if shipment.email_thread_id else None,
         },
@@ -640,6 +702,8 @@ async def _archive_shipment_and_optionally_suppress_source(
             stage=shipment.status,
             payload_json={
                 "reason": archive_reason,
+                "reason_code": archive_reason_code,
+                "reason_note": archive_reason_note,
                 "email_thread_id": str(thread.id),
                 "suppressed": True,
             },
@@ -1672,10 +1736,9 @@ async def freight_foundation() -> FreightFoundationResponse:
             "internet_message_id",
             "in_reply_to",
             "references",
-            "provider_conversation_id",
             "subject_token",
-            "normalized_subject_fallback",
-            "sender_time_window_fallback",
+            "reply_gated_provider_conversation_id",
+            "new_customer_quote_creates_new_shipment",
         ],
         margin_defaults=MarginPolicy(
             percent=settings.profit_margin_percent_default,
@@ -1920,6 +1983,131 @@ async def create_shipment(
     return _serialize_shipment(shipment)
 
 
+@router.get("/freight/shipments/by-token/{quote_token}", response_model=ShipmentRecord)
+async def get_shipment_by_token(
+    quote_token: str,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentRecord:
+    """Get an active shipment by its public quote token."""
+    normalized_token = quote_token.strip().upper()
+    if not normalized_token:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    shipment = await session.scalar(
+        select(Shipment).where(
+            Shipment.is_archived.is_(False),
+            func.upper(Shipment.quote_token) == normalized_token,
+        )
+    )
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    return await _serialize_shipment_detail(session, shipment)
+
+
+def _shipment_archive_reason_code(shipment: Shipment) -> str:
+    code = getattr(shipment, "archive_reason_code", None)
+    if code:
+        return str(code)
+    legacy_reason = str(getattr(shipment, "archived_reason", None) or "").lower()
+    if "duplicate" in legacy_reason:
+        return ArchiveReasonCode.DUPLICATE.value
+    if "cancel" in legacy_reason:
+        return ArchiveReasonCode.CANCELLED.value
+    if "bounce" in legacy_reason or "non-delivery" in legacy_reason or "undeliver" in legacy_reason:
+        return ArchiveReasonCode.NON_DELIVERY_BOUNCE.value
+    if "fraud" in legacy_reason or "spam" in legacy_reason:
+        return ArchiveReasonCode.FRAUD.value
+    if "test" in legacy_reason:
+        return ArchiveReasonCode.TEST.value
+    if "parse" in legacy_reason or "invalid" in legacy_reason or "error" in legacy_reason:
+        return ArchiveReasonCode.PARSED_ERROR.value
+    return ArchiveReasonCode.OTHER.value
+
+
+def _shipment_archive_reason_note(shipment: Shipment) -> str | None:
+    note = getattr(shipment, "archive_reason_note", None)
+    if note:
+        return str(note)
+    legacy = getattr(shipment, "archived_reason", None)
+    return str(legacy) if legacy else None
+
+
+@router.get("/freight/shipments/archive", response_model=list[ShipmentRecord])
+async def list_archived_shipments(
+    reason_code: ArchiveReasonCode | None = Query(default=None),
+    query: str | None = Query(default=None),
+    month: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}$"),
+    limit: int = Query(default=100, ge=1, le=300),
+    session: AsyncSession = Depends(get_session),
+) -> list[ShipmentRecord]:
+    """List archived shipments for the archive-only dashboard surface."""
+    result = await session.execute(
+        select(Shipment)
+        .where(Shipment.is_archived.is_(True))
+        .order_by(Shipment.archived_at.desc().nullslast(), Shipment.created_at.desc())
+        .limit(500)
+    )
+    query_text = (query or "").strip().lower()
+    rows: list[ShipmentRecord] = []
+    for shipment in result.scalars().all():
+        code = _shipment_archive_reason_code(shipment)
+        if reason_code and code != reason_code.value:
+            continue
+        archived_reference = shipment.archived_at or shipment.updated_at or shipment.created_at
+        if month and (archived_reference is None or archived_reference.strftime("%Y-%m") != month):
+            continue
+        if query_text:
+            haystack = " ".join(
+                [
+                    shipment.origin or "",
+                    shipment.destination or "",
+                    shipment.quote_token or "",
+                    str(shipment.email_thread_id or ""),
+                    shipment.archived_reason or "",
+                    _shipment_archive_reason_note(shipment) or "",
+                    code,
+                ]
+            ).lower()
+            if query_text not in haystack:
+                continue
+        record = _serialize_shipment(shipment)
+        record.archive_reason_code = ArchiveReasonCode(code)
+        record.archive_reason_note = _shipment_archive_reason_note(shipment)
+        rows.append(record)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+@router.get("/freight/shipments/archive/by-token/{quote_token}", response_model=ShipmentRecord)
+async def get_archived_shipment_by_token(
+    quote_token: str,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentRecord:
+    """Get an archived shipment by quote token."""
+    normalized_token = quote_token.strip().upper()
+    shipment = await session.scalar(
+        select(Shipment).where(
+            Shipment.is_archived.is_(True),
+            func.upper(Shipment.quote_token) == normalized_token,
+        )
+    )
+    if shipment is None:
+        raise HTTPException(status_code=404, detail="Archived shipment not found.")
+    return await _serialize_shipment_detail(session, shipment)
+
+
+@router.get("/freight/shipments/archive/{shipment_id}", response_model=ShipmentRecord)
+async def get_archived_shipment(
+    shipment_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> ShipmentRecord:
+    """Get an archived shipment by id."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None or not shipment.is_archived:
+        raise HTTPException(status_code=404, detail="Archived shipment not found.")
+    return await _serialize_shipment_detail(session, shipment)
+
+
 @router.get("/freight/shipments/{shipment_id}", response_model=ShipmentRecord)
 async def get_shipment(
     shipment_id: UUID,
@@ -1927,53 +2115,9 @@ async def get_shipment(
 ) -> ShipmentRecord:
     """Get a shipment by id."""
     shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
+    if shipment is None or shipment.is_archived:
         raise HTTPException(status_code=404, detail="Shipment not found.")
-    ai_payloads = await _latest_ai_payloads(session, [shipment.id])
-    booking_payloads = await _latest_booking_payloads(session, [shipment.id])
-    status_payloads = await _latest_status_payloads(session, [shipment.id])
-    status_review_payloads = await _latest_status_review_payloads(session, [shipment.id])
-    tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id])
-    status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id])
-    document_action_payloads = await _latest_document_action_payloads(session, [shipment.id])
-    attachment_counts = await _attachment_counts(session, [shipment])
-    document_summaries = await _document_booking_summaries(session, [shipment], document_action_payloads)
-    now = datetime.now(timezone.utc)
-    return _serialize_shipment(
-        shipment,
-        {
-            **(ai_payloads.get(shipment.id) or {}),
-            **(booking_payloads.get(shipment.id) or {}),
-            **(status_payloads.get(shipment.id) or {}),
-            **(status_review_payloads.get(shipment.id) or {}),
-            **(tms_identity_payloads.get(shipment.id) or {}),
-            **(status_workflow_payloads.get(shipment.id) or {}),
-            "attachment_count": attachment_counts.get(shipment.id, 0),
-            "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
-            "document_enrichment": document_summaries.get(shipment.id, {}).get("document_enrichment", {}),
-            "document_health_status": document_summaries.get(shipment.id, {}).get("document_health_status"),
-            "ocr_pending_count": document_summaries.get(shipment.id, {}).get("ocr_pending_count", 0),
-            "document_conflict_count": document_summaries.get(shipment.id, {}).get("document_conflict_count", 0),
-            "missing_document_types": document_summaries.get(shipment.id, {}).get("missing_document_types", []),
-            "booking_review_warning": document_summaries.get(shipment.id, {}).get("booking_review_warning"),
-            "booking_review_required": document_summaries.get(shipment.id, {}).get("review_required", False),
-            "status_stale": _is_status_stale(
-                shipment_status=shipment.status,
-                last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
-                now=now,
-            ),
-            "status_sync_health": _status_sync_health(
-                status_stale=_is_status_stale(
-                    shipment_status=shipment.status,
-                    last_status_event_at=(status_payloads.get(shipment.id) or {}).get("last_status_event_at"),
-                    now=now,
-                ),
-                status_review_required=bool((status_review_payloads.get(shipment.id) or {}).get("status_review_required", False)),
-                status_workflow_state=(status_workflow_payloads.get(shipment.id) or {}).get("status_workflow_state"),
-            ),
-            "status_sla_hours": settings.status_sla_hours_default,
-        },
-    )
+    return await _serialize_shipment_detail(session, shipment)
 
 
 @router.get("/freight/shipments/{shipment_id}/thread", response_model=ShipmentThreadResponse)
@@ -2031,6 +2175,8 @@ async def magic_fill_shipment_field(
     if shipment is None:
         logger.warning("magic_fill.shipment_not_found shipment_id=%s", shipment_id)
         raise HTTPException(status_code=404, detail="Shipment not found.")
+    if shipment.is_archived:
+        raise HTTPException(status_code=409, detail="Shipment is archived and cannot be edited.")
     if shipment.email_thread_id is None:
         logger.warning("magic_fill.no_thread shipment_id=%s", shipment_id)
         raise HTTPException(status_code=400, detail="Shipment has no linked email thread.")
@@ -2176,6 +2322,8 @@ async def update_shipment(
     shipment = await session.get(Shipment, shipment_id)
     if shipment is None:
         raise HTTPException(status_code=404, detail="Shipment not found.")
+    if shipment.is_archived:
+        raise HTTPException(status_code=409, detail="Shipment is archived and cannot be edited.")
 
     client_id = None
     if request.client_id:
@@ -2687,6 +2835,8 @@ async def freight_operator_action(
                 session,
                 shipment=shipment,
                 reason=request.reason,
+                reason_code=request.reason_code,
+                reason_note=request.reason_note,
                 suppress_source_thread=request.suppress_source_thread,
             )
             return ShipmentOperatorActionResponse(
@@ -2720,6 +2870,14 @@ async def freight_operator_action(
             latest_message = await _latest_inbound_message_for_shipment(session, shipment)
             if latest_message is None:
                 raise RuntimeError("No inbound email available to re-run parsing.")
+            logger.warning(
+                "shipment_operator.rerun_parsing shipment_id=%s email_message_id=%s provider_message_id=%s subject=%s body_preview=%s",
+                shipment.id,
+                latest_message.id,
+                latest_message.provider_message_id,
+                latest_message.subject,
+                (latest_message.body_preview or "")[:1200],
+            )
             decision = await run_freight_inbox_orchestrator(
                 session,
                 email_message_id=latest_message.id,
@@ -2959,7 +3117,19 @@ async def freight_operator_action(
                 manual_review_required=False,
             )
     except RuntimeError as exc:
+        logger.exception(
+            "shipment_operator.action_failed shipment_id=%s action=%s",
+            shipment.id,
+            request.action,
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "shipment_operator.action_failed shipment_id=%s action=%s",
+            shipment.id,
+            request.action,
+        )
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
     raise HTTPException(status_code=400, detail="Unsupported operator action.")
 
@@ -2977,7 +3147,8 @@ async def archive_shipment(
         shipment_id,
         ShipmentOperatorActionRequest(
             action=OperatorAction.ARCHIVE_SHIPMENT,
-            reason=request.reason,
+            reason_code=request.reason_code,
+            reason_note=request.reason_note,
             suppress_source_thread=request.suppress_source_thread,
         ),
         session,

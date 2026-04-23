@@ -1,4 +1,4 @@
-# CopilotRunner — dev workflow (Docker, backend, frontend, mobile)
+# Logistic Copilot — dev workflow (Docker, backend, frontend, mobile)
 # Usage: make help | make up-d | make restart-backend | V=1 make up
 
 PROJECT_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))

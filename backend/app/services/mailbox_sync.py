@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,10 +15,27 @@ from app.services.email_correlation import build_correlation_signals, generate_q
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.outlook import OutlookMailboxMessage
 
+REPLY_SUBJECT_PATTERN = re.compile(r"^(re|fw|fwd)\s*:\s*", re.IGNORECASE)
+
 
 def _display_name_from_email(email: str) -> str:
     local_part = email.split("@", 1)[0]
     return local_part.replace(".", " ").replace("_", " ").title() or email
+
+
+def _is_reply_like_message(
+    mailbox_message: OutlookMailboxMessage,
+    *,
+    subject_quote_token: str | None,
+) -> bool:
+    """Only reply-like messages are allowed to reuse existing workflow threads."""
+    if subject_quote_token:
+        return True
+    if getattr(mailbox_message, "in_reply_to", None):
+        return True
+    if getattr(mailbox_message, "references", None):
+        return True
+    return bool(REPLY_SUBJECT_PATTERN.match(mailbox_message.subject or ""))
 
 
 def _looks_like_bounce_or_non_delivery(mailbox_message: OutlookMailboxMessage) -> tuple[bool, str | None]:
@@ -61,28 +79,41 @@ async def _find_or_create_thread(
         subject=mailbox_message.subject,
         sender=mailbox_message.sender_email,
         internet_message_id=mailbox_message.internet_message_id,
+        in_reply_to=mailbox_message.in_reply_to,
+        references=mailbox_message.references or [],
         conversation_id=mailbox_message.conversation_id,
+    )
+    subject_quote_token = signals.quote_token
+    reply_like = _is_reply_like_message(
+        mailbox_message,
+        subject_quote_token=subject_quote_token,
     )
 
     thread = None
-    if mailbox_message.conversation_id:
+    if reply_like and mailbox_message.conversation_id:
         thread = await session.scalar(
             select(EmailThread).where(
                 EmailThread.provider_thread_id == mailbox_message.conversation_id
             )
         )
 
-    if thread is None and quote_token:
-        thread = await session.scalar(
-            select(EmailThread).where(EmailThread.quote_token == quote_token)
+    reply_message_ids = [
+        message_id
+        for message_id in [mailbox_message.in_reply_to, *(mailbox_message.references or [])]
+        if message_id
+    ]
+    if thread is None and reply_like and reply_message_ids:
+        referenced_message = await session.scalar(
+            select(EmailMessage)
+            .where(EmailMessage.internet_message_id.in_(reply_message_ids))
+            .order_by(EmailMessage.received_at.desc())
         )
+        if referenced_message is not None:
+            thread = referenced_message.thread
 
-    if thread is None:
+    if thread is None and subject_quote_token:
         thread = await session.scalar(
-            select(EmailThread).where(
-                EmailThread.mailbox == settings.microsoft_mailbox,
-                EmailThread.normalized_subject == signals.normalized_subject,
-            )
+            select(EmailThread).where(EmailThread.quote_token == subject_quote_token)
         )
 
     created = False
@@ -90,7 +121,7 @@ async def _find_or_create_thread(
         thread = EmailThread(
             provider="outlook",
             mailbox=settings.microsoft_mailbox or "unknown",
-            provider_thread_id=mailbox_message.conversation_id,
+            provider_thread_id=mailbox_message.conversation_id if reply_like else None,
             quote_token=quote_token,
             subject=mailbox_message.subject,
             normalized_subject=signals.normalized_subject,
@@ -102,7 +133,8 @@ async def _find_or_create_thread(
     else:
         thread.subject = mailbox_message.subject or thread.subject
         thread.normalized_subject = signals.normalized_subject
-        thread.provider_thread_id = mailbox_message.conversation_id or thread.provider_thread_id
+        if reply_like and mailbox_message.conversation_id:
+            thread.provider_thread_id = mailbox_message.conversation_id
         thread.quote_token = thread.quote_token or quote_token
         thread.last_message_at = mailbox_message.received_at
 
@@ -237,6 +269,8 @@ async def ingest_outlook_message(
         provider_message_id=mailbox_message.provider_message_id,
         internet_message_id=mailbox_message.internet_message_id,
         conversation_id=mailbox_message.conversation_id,
+        in_reply_to=mailbox_message.in_reply_to,
+        references_json=mailbox_message.references or [],
         sender=mailbox_message.sender_email,
         recipients_json=mailbox_message.recipients,
         direction="inbound",

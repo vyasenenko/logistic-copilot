@@ -35,7 +35,7 @@ data:
   BACKEND_CORS_ORIGINS: "https://logisticopilot.com,https://www.logisticopilot.com"
   CORS_ALLOW_CHROME_EXTENSIONS: "false"
 
-  LANGCHAIN_TRACING_V2: "true"
+  LANGCHAIN_TRACING_V2: "false"
   LANGCHAIN_PROJECT: "logistic-copilot"
 
   # DigitalOcean Spaces (S3 API vs public object URLs)

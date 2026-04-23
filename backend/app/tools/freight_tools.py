@@ -7,14 +7,16 @@ where the underlying service supports it.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from uuid import UUID
 
 from langchain_core.tools import tool
 from sqlalchemy import select
 
 from app.config import settings
-from app.memory.database import Carrier, Client, Shipment, WorkflowEvent, async_session
+from app.memory.database import Carrier, Client, EmailThread, Shipment, WorkflowEvent, async_session
 from app.schemas import (
+    ArchiveReasonCode,
     BidIntakeRequest,
     FreightFoundationResponse,
     MarginPolicy,
@@ -31,8 +33,16 @@ from app.services.freight_execution import (
 from app.services.freight_outreach import create_carrier_outreach
 from app.services.freight_read import (
     build_freight_overview,
+    get_archived_shipment_brief_by_token,
     get_shipment_brief,
+    get_shipment_brief_by_token,
+    list_shipments_by_city_brief,
     list_shipments_brief,
+    list_today_shipments_brief,
+    search_archived_shipments_brief,
+    search_shipments_brief,
+    summarize_archived_shipment_case,
+    summarize_shipment_case,
 )
 from app.services.workflow_event_codec import workflow_event_to_record
 
@@ -55,10 +65,9 @@ async def freight_domain_foundation() -> str:
             "internet_message_id",
             "in_reply_to",
             "references",
-            "provider_conversation_id",
             "subject_token",
-            "normalized_subject_fallback",
-            "sender_time_window_fallback",
+            "reply_gated_provider_conversation_id",
+            "new_customer_quote_creates_new_shipment",
         ],
         margin_defaults=MarginPolicy(
             percent=settings.profit_margin_percent_default,
@@ -106,6 +115,172 @@ async def freight_get_shipment(shipment_id: str) -> str:
 
 
 @tool
+async def freight_get_shipment_by_token(quote_token: str) -> str:
+    """Get one active shipment by quote token like Q-87845634 (JSON)."""
+    async with async_session() as session:
+        row = await get_shipment_brief_by_token(session, quote_token)
+        if row is None:
+            return f"Error: shipment not found for quote token: {quote_token}"
+        return _json(row)
+
+
+@tool
+async def freight_search_shipments(query: str, status: str | None = None, limit: int = 50) -> str:
+    """Search active shipments by token, route/city, equipment, notes, or status."""
+    async with async_session() as session:
+        rows = await search_shipments_brief(session, query=query, status=status, limit=limit)
+        return _json(rows)
+
+
+@tool
+async def freight_list_shipments_by_city(city: str, date_scope: str = "today", limit: int = 50) -> str:
+    """List active shipments touching a city in origin/destination. date_scope: today or all."""
+    async with async_session() as session:
+        rows = await list_shipments_by_city_brief(session, city=city, date_scope=date_scope, limit=limit)
+        return _json(rows)
+
+
+@tool
+async def freight_list_today_shipments(status: str | None = None, limit: int = 100) -> str:
+    """List today's active shipments using pickup-local date, with created_at fallback."""
+    async with async_session() as session:
+        rows = await list_today_shipments_brief(session, status=status, limit=limit)
+        return _json(rows)
+
+
+@tool
+async def freight_summarize_shipment_case(quote_token: str) -> str:
+    """Summarize one shipment case by quote token: shipment, recent events, and bid snapshot."""
+    async with async_session() as session:
+        summary = await summarize_shipment_case(session, quote_token)
+        if summary is None:
+            return f"Error: shipment not found for quote token: {quote_token}"
+        return _json(summary)
+
+
+@tool
+async def freight_search_archived_shipments(query: str = "", reason_code: str | None = None, limit: int = 50) -> str:
+    """Search archived shipments only. Use only when user asks about archive/ignored/deleted shipments."""
+    async with async_session() as session:
+        rows = await search_archived_shipments_brief(session, query=query, reason_code=reason_code, limit=limit)
+        return _json(rows)
+
+
+@tool
+async def freight_get_archived_shipment_by_token(quote_token: str) -> str:
+    """Get one archived shipment by quote token. Use only for archive lookup."""
+    async with async_session() as session:
+        row = await get_archived_shipment_brief_by_token(session, quote_token)
+        if row is None:
+            return f"Error: archived shipment not found for quote token: {quote_token}"
+        return _json(row)
+
+
+@tool
+async def freight_summarize_archived_shipment(quote_token: str) -> str:
+    """Summarize one archived shipment case by quote token."""
+    async with async_session() as session:
+        summary = await summarize_archived_shipment_case(session, quote_token)
+        if summary is None:
+            return f"Error: archived shipment not found for quote token: {quote_token}"
+        return _json(summary)
+
+
+@tool
+async def freight_archive_shipment(
+    shipment_id: str,
+    reason_code: str = "other",
+    reason_note: str | None = None,
+    suppress_source_thread: bool = True,
+    dry_run: bool = True,
+) -> str:
+    """Archive an active shipment and optionally suppress its source thread. Prefer dry_run=True unless user explicitly asks to archive."""
+    try:
+        sid = UUID(shipment_id.strip())
+    except ValueError:
+        return "Error: shipment_id must be a valid UUID."
+    try:
+        code = ArchiveReasonCode(reason_code)
+    except ValueError:
+        allowed = ", ".join(item.value for item in ArchiveReasonCode)
+        return f"Error: reason_code must be one of: {allowed}"
+
+    async with async_session() as session:
+        shipment = await session.get(Shipment, sid)
+        if shipment is None or shipment.is_archived:
+            return f"Error: active shipment not found: {shipment_id}"
+        thread = await session.get(EmailThread, shipment.email_thread_id) if shipment.email_thread_id else None
+        if dry_run:
+            return _json(
+                {
+                    "dry_run": True,
+                    "would_archive": str(shipment.id),
+                    "quote_token": shipment.quote_token,
+                    "route": f"{shipment.origin or 'Origin TBD'} -> {shipment.destination or 'Destination TBD'}",
+                    "reason_code": code.value,
+                    "reason_note": reason_note,
+                    "would_suppress_thread": bool(thread is not None and suppress_source_thread),
+                    "thread_id": str(thread.id) if thread else None,
+                }
+            )
+
+        now = datetime.now(timezone.utc)
+        note = (reason_note or "").strip() or None
+        legacy_reason = note or code.value
+        shipment.is_archived = True
+        shipment.archive_reason_code = code.value
+        shipment.archive_reason_note = note
+        shipment.archived_reason = legacy_reason
+        shipment.archived_at = now
+        shipment.updated_at = now
+        session.add(
+            WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.SHIPMENT_ARCHIVED.value,
+                stage=shipment.status,
+                payload_json={
+                    "reason": legacy_reason,
+                    "reason_code": code.value,
+                    "reason_note": note,
+                    "suppress_source_thread": suppress_source_thread,
+                    "source": "agent_tool",
+                },
+            )
+        )
+        if suppress_source_thread and thread is not None:
+            thread.shipment_ingest_suppressed = True
+            thread.shipment_ingest_suppressed_reason = legacy_reason
+            thread.shipment_ingest_suppressed_at = now
+            session.add(
+                WorkflowEvent(
+                    shipment_id=shipment.id,
+                    event_type=WorkflowEventType.SHIPMENT_SOURCE_SUPPRESSED.value,
+                    stage=shipment.status,
+                    payload_json={
+                        "reason": legacy_reason,
+                        "reason_code": code.value,
+                        "reason_note": note,
+                        "email_thread_id": str(thread.id),
+                        "suppressed": True,
+                        "source": "agent_tool",
+                    },
+                )
+            )
+        await session.commit()
+        return _json(
+            {
+                "archived": True,
+                "shipment_id": str(shipment.id),
+                "quote_token": shipment.quote_token,
+                "reason_code": code.value,
+                "reason_note": note,
+                "suppression_applied": bool(thread is not None and suppress_source_thread),
+                "suppressed_thread_id": str(thread.id) if thread is not None and suppress_source_thread else None,
+            }
+        )
+
+
+@tool
 async def freight_list_workflow_events(shipment_id: str, limit: int = 40) -> str:
     """Return recent workflow events for a shipment (newest first) as JSON."""
     try:
@@ -115,7 +290,7 @@ async def freight_list_workflow_events(shipment_id: str, limit: int = 40) -> str
     lim = max(1, min(limit, 100))
     async with async_session() as session:
         shipment = await session.get(Shipment, sid)
-        if shipment is None:
+        if shipment is None or shipment.is_archived:
             return f"Error: shipment not found: {shipment_id}"
         result = await session.execute(
             select(WorkflowEvent)
@@ -294,6 +469,15 @@ def get_freight_tools():
         freight_get_overview,
         freight_list_shipments,
         freight_get_shipment,
+        freight_get_shipment_by_token,
+        freight_search_shipments,
+        freight_list_shipments_by_city,
+        freight_list_today_shipments,
+        freight_summarize_shipment_case,
+        freight_search_archived_shipments,
+        freight_get_archived_shipment_by_token,
+        freight_summarize_archived_shipment,
+        freight_archive_shipment,
         freight_list_workflow_events,
         freight_list_clients,
         freight_list_carriers,
