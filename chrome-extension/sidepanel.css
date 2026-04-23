@@ -156,12 +156,17 @@ body {
 }
 
 .brand-mark {
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: #cbe8f6;
+  flex-shrink: 0;
+}
+
+.brand-mark__svg {
+  display: block;
   flex-shrink: 0;
 }
 
@@ -524,16 +529,19 @@ html[data-theme="light"] .chat-picker-backdrop {
 
 .chat-picker-panel {
   position: absolute;
-  top: 0;
+  /* Inset from viewport so rounded corners + borders are not clipped by the panel edge */
+  top: 10px;
   right: 0;
-  bottom: 0;
+  bottom: 10px;
   width: min(100%, 300px);
   display: flex;
   flex-direction: column;
-  border-radius: 14px 0 0 14px;
-  border-left: 1px solid rgba(255, 255, 255, 0.48);
+  border-radius: 16px 0 0 16px;
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-right: none;
   box-shadow: -12px 0 40px rgba(0, 0, 0, 0.38);
   backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
   transform: translateX(105%);
   transition: transform var(--chat-picker-ms) var(--chat-picker-ease), box-shadow var(--chat-picker-ms) ease;
 }
@@ -546,7 +554,8 @@ html[data-theme="dark"] .chat-picker-panel {
 
 html[data-theme="light"] .chat-picker-panel {
   background: #ffffff;
-  border-left: 1px solid rgba(17, 24, 39, 0.08);
+  border-color: rgba(17, 24, 39, 0.1);
+  border-right: none;
   box-shadow: -8px 0 32px rgba(17, 24, 39, 0.1);
 }
 
@@ -558,10 +567,12 @@ html[data-theme="light"] .chat-picker-panel {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 12px 14px 16px;
+  padding: 12px 15px 18px;
   min-width: 0;
   flex: 1;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: hidden;
+  min-height: 0;
 }
 
 .chat-picker-header {
@@ -625,9 +636,12 @@ html[data-theme="light"] .chat-picker-title {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  padding-bottom: 2px;
+  -webkit-overflow-scrolling: touch;
 }
 
 .chat-picker-empty {
@@ -687,7 +701,8 @@ html[data-theme="dark"] .chat-picker-row-wrap--active {
   text-align: left;
   padding: 10px 10px 10px 12px;
   border: none;
-  border-radius: 12px 0 0 12px;
+  /* Slightly smaller radius than row wrap so strokes meet cleanly at the divider */
+  border-radius: 10px 0 0 10px;
   background: transparent;
   color: var(--text);
   font: inherit;
@@ -734,7 +749,7 @@ html[data-theme="dark"] .chat-picker-row-wrap--active {
   color: var(--text-muted);
   border: none;
   border-left: 1px solid var(--border);
-  border-radius: 0 12px 12px 0;
+  border-radius: 0 10px 10px 0;
   background: transparent;
   transition: background 0.12s, color 0.12s;
 }

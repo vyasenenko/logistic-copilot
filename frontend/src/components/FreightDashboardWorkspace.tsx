@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 
 import { useFreightSocket } from "@/hooks/useFreightSocket";
 import { DateTimePickerField } from "@/components/DateTimePickerField";
+import { DashboardLogo } from "@/components/DashboardLogo";
 import {
   AlertTriangle,
   Archive,
@@ -20,7 +21,6 @@ import {
   CircleDollarSign,
   ClipboardCheck,
   Clock3,
-  LayoutDashboard,
   Loader2,
   Mail,
   MapPin,
@@ -1398,12 +1398,34 @@ export function FreightDashboardWorkspace() {
     setDrawerMode("edit");
   }
 
+  function clearDrawerContext(shipmentId: string | null) {
+    setEvents([]);
+    setBids([]);
+    setDocuments([]);
+    setEvaluation(null);
+    setQuotePreview(null);
+    setStatusReplyPreview(null);
+    setTmsPreview(null);
+    setBookingResult(null);
+    setThreadError(null);
+    setThreadLoading(false);
+    setActiveThreadTab("timeline");
+    if (!shipmentId) return;
+    setThreadCache((current) => {
+      if (!(shipmentId in current)) return current;
+      const next = { ...current };
+      delete next[shipmentId];
+      return next;
+    });
+  }
+
   function closeDrawer() {
     if (drawerMode === "edit" && shipmentFormDirty) {
       const confirmed = window.confirm("You have unsaved shipment edits. Close without saving?");
       if (!confirmed) return;
       setShipmentEditor(buildShipmentEditor(selectedShipment));
     }
+    clearDrawerContext(selectedShipmentId);
     setDrawerOpen(false);
     setDrawerMode("overview");
     setQuoteParam(null);
@@ -3007,7 +3029,8 @@ export function FreightDashboardWorkspace() {
             <div className="min-w-0 space-y-3">
               <div className="flex flex-wrap items-center gap-3">
                 <div className="inline-flex h-9 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[11px] uppercase tracking-[0.24em] text-cyan-100">
-                  <LayoutDashboard size={13} /> Logistic Copilot
+                  <DashboardLogo className="h-4 w-4 shrink-0 text-cyan-100" />
+                  Logistic Copilot
                 </div>
                 <span className="hidden text-[11px] uppercase tracking-[0.24em] text-cyan-200/40 md:inline">
                   Live operations board

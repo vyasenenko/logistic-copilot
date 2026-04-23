@@ -4,6 +4,7 @@ import { startTransition, useEffect, useMemo, useState } from "react";
 
 import { useFreightSocket } from "@/hooks/useFreightSocket";
 import { DateTimePickerField } from "@/components/DateTimePickerField";
+import { DashboardLogo } from "@/components/DashboardLogo";
 import {
   AlertTriangle,
   ArrowRight,
@@ -12,7 +13,6 @@ import {
   CircleDollarSign,
   ClipboardCheck,
   Clock3,
-  LayoutDashboard,
   Loader2,
   Mail,
   Map,
@@ -1574,7 +1574,8 @@ function LegacyFreightDashboard() {
           <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
             <div className="max-w-3xl space-y-4">
               <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">
-                <LayoutDashboard size={14} /> Logistic Copilot
+                <DashboardLogo className="h-4 w-4 shrink-0 text-white/85" />
+                Logistic Copilot
               </div>
               <div className="space-y-3">
                 <h1 className="max-w-3xl text-3xl font-semibold tracking-[-0.04em] text-white sm:text-4xl">
