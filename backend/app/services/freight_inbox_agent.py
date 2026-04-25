@@ -34,6 +34,7 @@ from app.services.freight_execution import (
     fetch_tms_shipment_status,
     intake_bid,
     push_carrier_status_to_tms,
+    deliver_customer_thread_email,
     send_client_acknowledgement,
     send_customer_status_reply,
     send_customer_quote,
@@ -1412,11 +1413,15 @@ async def send_customer_clarification(
         f"Missing fields: {', '.join(missing_fields)}\n\n"
         "Please reply with the missing information and we will continue right away."
     )
-    from app.services.outlook import OutlookGraphClient
-
     subject = f"Need more details for your quote [{shipment.quote_token or 'Q-UNKNOWN'}]"
-    outlook = OutlookGraphClient()
-    await outlook.send_mail(subject=subject, body=body, recipients=[client.email])
+    delivery_payload = await deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email=client.email,
+        subject=subject,
+        body=body,
+        dry_run=False,
+    )
     session.add(
         EmailMessage(
             thread_id=shipment.email_thread_id,
@@ -1425,7 +1430,11 @@ async def send_customer_clarification(
             direction="outbound",
             subject=subject,
             body_preview=body[:1000],
-            raw_payload_json={"type": "customer_clarification", "missing_fields": missing_fields},
+            raw_payload_json={
+                "type": "customer_clarification",
+                "missing_fields": missing_fields,
+                **delivery_payload,
+            },
             received_at=datetime.now(timezone.utc),
         )
     )

@@ -5,12 +5,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.memory.database import Carrier, CarrierBid, EmailMessage, EmailThread, Shipment, WorkflowEvent
-from app.schemas import CarrierOutreachItem, CarrierOutreachResponse, ShipmentStage, WorkflowEventType
+from app.schemas import (
+    CarrierFollowupResponse,
+    CarrierOutreachItem,
+    CarrierOutreachResponse,
+    ShipmentStage,
+    WorkflowEventType,
+)
 from app.services.email_correlation import attach_quote_token, generate_quote_reference, normalize_subject
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import format_ready_at_wall_display
@@ -44,6 +50,67 @@ def _build_outreach_body(shipment: Shipment, custom_message: str | None = None) 
         parts.extend(["", custom_message.strip()])
     parts.extend(["", "Reply with your best rate and ETA."])
     return "\n".join(parts)
+
+
+async def _find_carrier_reply_anchor(
+    session: AsyncSession,
+    *,
+    shipment: Shipment,
+    carrier_email: str,
+) -> EmailMessage | None:
+    """Find the first inbound carrier message that can anchor a real reply."""
+    if not shipment.email_thread_id:
+        return None
+    normalized_email = carrier_email.strip().lower()
+    if not normalized_email:
+        return None
+    return await session.scalar(
+        select(EmailMessage)
+        .where(
+            EmailMessage.thread_id == shipment.email_thread_id,
+            EmailMessage.direction == "inbound",
+            EmailMessage.provider_message_id.is_not(None),
+            EmailMessage.provider_message_id != "",
+            func.lower(EmailMessage.sender) == normalized_email,
+        )
+        .order_by(EmailMessage.received_at.asc(), EmailMessage.created_at.asc())
+    )
+
+
+async def deliver_carrier_thread_email(
+    session: AsyncSession,
+    *,
+    shipment: Shipment,
+    carrier_email: str,
+    subject: str,
+    body: str,
+    dry_run: bool,
+) -> dict:
+    """Send carrier follow-up as a reply after the first carrier contact exists."""
+    anchor = await _find_carrier_reply_anchor(
+        session,
+        shipment=shipment,
+        carrier_email=carrier_email,
+    )
+    delivery_payload = {
+        "delivery_mode": "reply" if anchor is not None else "send_mail_fallback",
+        "reply_to_provider_message_id": (
+            anchor.provider_message_id if anchor is not None else None
+        ),
+    }
+    if dry_run:
+        return delivery_payload
+
+    outlook = OutlookGraphClient()
+    if anchor is not None:
+        await outlook.reply_to_message(
+            message_id=anchor.provider_message_id,
+            body=body,
+            recipients=[carrier_email],
+        )
+    else:
+        await outlook.send_mail(subject=subject, body=body, recipients=[carrier_email])
+    return delivery_payload
 
 
 async def _ensure_thread(session: AsyncSession, shipment: Shipment) -> EmailThread:
@@ -144,6 +211,8 @@ async def create_carrier_outreach(
             "body": body,
             "recipient": carrier.email,
             "dry_run": dry_run,
+            "delivery_mode": "new_thread",
+            "reply_to_provider_message_id": None,
         }
         if not dry_run:
             await outlook.send_mail(subject=subject, body=body, recipients=[carrier.email])
@@ -181,6 +250,7 @@ async def create_carrier_outreach(
                 bid_id=str(bid.id),
                 email_message_id=str(outbound_message.id),
                 status="queued" if dry_run else "sent",
+                delivery_mode="new_thread",
             )
         )
 
@@ -214,4 +284,102 @@ async def create_carrier_outreach(
         targeted=len(carriers),
         created_bids=created_bids,
         results=results,
+    )
+
+
+async def send_carrier_followup(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID,
+    carrier_id: str | None,
+    carrier_email: str | None,
+    dry_run: bool,
+    subject: str | None,
+    message: str,
+) -> CarrierFollowupResponse:
+    """Send a follow-up to one carrier, replying in-thread when a carrier reply exists."""
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None:
+        raise RuntimeError("Shipment not found")
+
+    carrier: Carrier | None = None
+    if carrier_id:
+        try:
+            carrier_uuid = UUID(carrier_id)
+        except ValueError as exc:
+            raise RuntimeError("carrier_id must be a valid UUID") from exc
+        carrier = await session.get(Carrier, carrier_uuid)
+    elif carrier_email:
+        carrier = await session.scalar(
+            select(Carrier).where(func.lower(Carrier.email) == carrier_email.strip().lower())
+        )
+    if carrier is None:
+        raise RuntimeError("Carrier not found")
+
+    thread = await _ensure_thread(session, shipment)
+    body = message.strip()
+    if not body:
+        raise RuntimeError("Carrier follow-up message cannot be empty")
+    followup_subject = subject.strip() if subject and subject.strip() else attach_quote_token(
+        f"Follow-up {shipment.origin or 'Origin'} to {shipment.destination or 'Destination'}",
+        thread.quote_token or shipment.quote_token or "Q-UNKNOWN",
+    )
+    delivery_payload = await deliver_carrier_thread_email(
+        session,
+        shipment=shipment,
+        carrier_email=carrier.email,
+        subject=followup_subject,
+        body=body,
+        dry_run=dry_run,
+    )
+
+    outbound_message: EmailMessage | None = None
+    if shipment.email_thread_id:
+        outbound_message = EmailMessage(
+            thread_id=shipment.email_thread_id,
+            sender=settings.microsoft_mailbox or "unknown",
+            recipients_json=[carrier.email],
+            direction="outbound",
+            subject=followup_subject,
+            body_preview=body[:1000],
+            raw_payload_json={
+                "type": "carrier_followup",
+                "provider": "outlook",
+                "dry_run": dry_run,
+                "carrier_id": str(carrier.id),
+                "carrier_email": carrier.email,
+                **delivery_payload,
+            },
+            received_at=datetime.now(timezone.utc),
+        )
+        session.add(outbound_message)
+        await session.flush()
+
+    shipment.updated_at = datetime.now(timezone.utc)
+    thread.last_message_at = shipment.updated_at
+    workflow_event = WorkflowEvent(
+        shipment_id=shipment.id,
+        event_type=WorkflowEventType.CARRIER_FOLLOWUP_SENT.value,
+        stage=shipment.status,
+        payload_json={
+            "dry_run": dry_run,
+            "subject": followup_subject,
+            "carrier_id": str(carrier.id),
+            "carrier_email": carrier.email,
+            **delivery_payload,
+        },
+    )
+    session.add(workflow_event)
+    await session.commit()
+    await freight_realtime_hub.notify_workflow_event(workflow_event)
+
+    return CarrierFollowupResponse(
+        shipment_id=str(shipment.id),
+        carrier_id=str(carrier.id),
+        carrier_email=carrier.email,
+        subject=followup_subject,
+        body=body,
+        dry_run=dry_run,
+        email_message_id=str(outbound_message.id) if outbound_message is not None else None,
+        **delivery_payload,
     )

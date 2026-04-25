@@ -1625,10 +1625,9 @@ function LegacyFreightDashboard() {
               <p className="text-xs uppercase tracking-[0.2em] text-[var(--text-muted)]">Navigation</p>
               <p className="mt-2 text-lg font-medium text-white">Choose what to work on</p>
             </div>
-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
               {[
                 { key: "shipments", label: "Shipments", icon: Package2 },
-                { key: "status_ops", label: "Status Ops", icon: RadioTower },
                 { key: "clients", label: "Clients", icon: Users },
                 { key: "carriers", label: "Carriers", icon: Truck },
               ].map(({ key, label, icon: Icon }) => {

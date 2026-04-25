@@ -615,6 +615,47 @@ class OutlookGraphClient:
             "sender_address": effective_sender,
         }
 
+    async def reply_to_message(
+        self,
+        *,
+        message_id: str,
+        body: str,
+        recipients: list[str] | None = None,
+    ) -> dict:
+        """Reply to an existing Outlook message so the customer sees one thread."""
+        missing = self.missing_settings()
+        if missing:
+            raise RuntimeError(
+                "Microsoft Graph is not configured. Missing: " + ", ".join(missing)
+            )
+        if not message_id:
+            raise RuntimeError("A provider message id is required to send an email reply")
+
+        url = f"{self.base_url}/users/{settings.microsoft_mailbox}/messages/{message_id}/reply"
+        message: dict = {
+            "body": {
+                "contentType": "Text",
+                "content": body,
+            }
+        }
+        if recipients:
+            message["toRecipients"] = [
+                {"emailAddress": {"address": recipient}}
+                for recipient in recipients
+            ]
+        payload = {"message": message}
+
+        async with await self._authorized_client() as client:
+            response = await client.post(url, json=payload)
+            _raise_graph_http(response, operation="reply")
+
+        return {
+            "provider": "outlook",
+            "reply_to_provider_message_id": message_id,
+            "recipients": recipients or [],
+            "sender_address": settings.microsoft_mailbox.strip(),
+        }
+
     async def list_subscriptions(self) -> list[dict]:
         """List Graph subscriptions visible to the current app registration."""
         missing = self.missing_settings()

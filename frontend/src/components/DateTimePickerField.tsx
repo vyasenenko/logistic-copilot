@@ -110,8 +110,19 @@ export function DateTimePickerField({
   const selectedDate = useMemo(() => parseLocalValue(value), [value]);
   const [viewMonth, setViewMonth] = useState<Date>(() => selectedDate ? new Date(selectedDate.getFullYear(), selectedDate.getMonth(), 1) : new Date(new Date().getFullYear(), new Date().getMonth(), 1));
 
+  const triggerIsVisible = useCallback(() => {
+    const trigger = triggerRef.current;
+    if (!trigger) return false;
+    const rect = trigger.getBoundingClientRect();
+    return trigger.getClientRects().length > 0 && rect.width > 0 && rect.height > 0;
+  }, []);
+
   const updatePopupPosition = useCallback(() => {
     if (!triggerRef.current) return;
+    if (!triggerIsVisible()) {
+      setOpen(false);
+      return;
+    }
     const rect = triggerRef.current.getBoundingClientRect();
     const viewportHeight = window.innerHeight;
     const viewportWidth = window.innerWidth;
@@ -140,7 +151,7 @@ export function DateTimePickerField({
       maxHeight,
       placement: preferredPlacement,
     });
-  }, [DESKTOP_POPUP_HEIGHT, POPUP_WIDTH, VIEWPORT_GAP]);
+  }, [DESKTOP_POPUP_HEIGHT, POPUP_WIDTH, VIEWPORT_GAP, triggerIsVisible]);
 
   useEffect(() => {
     setMounted(true);
@@ -156,11 +167,12 @@ export function DateTimePickerField({
     const changed = autoOpenSignal > 0 && autoOpenSignal !== previousAutoOpenSignal.current;
     previousAutoOpenSignal.current = autoOpenSignal;
     if (!changed) return;
+    if (!triggerIsVisible()) return;
     setOpen(true);
     requestAnimationFrame(() => {
       triggerRef.current?.focus();
     });
-  }, [autoOpenSignal, mounted]);
+  }, [autoOpenSignal, mounted, triggerIsVisible]);
 
   useEffect(() => {
     if (!open) return;

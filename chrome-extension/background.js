@@ -127,6 +127,32 @@ async function captureActiveTabPageContext() {
   return capturePageContextForTab(tab?.id);
 }
 
+function buildDashboardQuoteUrl(base, token) {
+  const normalized = String(base || '').trim().replace(/\/$/, '');
+  const safeBase = normalized || 'https://logisticopilot.com';
+  return `${safeBase}/?quote=${encodeURIComponent(String(token || '').toUpperCase())}`;
+}
+
+function isDashboardTabUrl(tabUrl, frontendBase) {
+  const normalizedBase = String(frontendBase || '').trim().replace(/\/$/, '');
+  if (!tabUrl || !normalizedBase) return false;
+  return tabUrl === normalizedBase || tabUrl.startsWith(`${normalizedBase}/`) || tabUrl.startsWith(`${normalizedBase}?`);
+}
+
+async function openDashboardQuoteInExistingTab(tabId, destination) {
+  const target = new URL(destination);
+  const nextPath = `${target.pathname}${target.search}${target.hash}`;
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (path) => {
+      window.history.pushState({}, '', path);
+      window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+    },
+    args: [nextPath],
+  });
+  await chrome.tabs.update(tabId, { active: true });
+}
+
 // Open side panel when extension icon is clicked
 chrome.action.onClicked.addListener(async (tab) => {
   await chrome.sidePanel.open({ tabId: tab.id });
@@ -163,6 +189,46 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     chrome.storage.local.get([STORAGE_CURRENT_PAGE_CONTEXT], (result) => {
       sendResponse({ ok: true, payload: result[STORAGE_CURRENT_PAGE_CONTEXT] || null });
     });
+    return true;
+  }
+  if (message?.type === 'OPEN_DASHBOARD_QUOTE') {
+    const token = typeof message?.token === 'string' ? message.token.trim().toUpperCase() : '';
+    const frontendBase = typeof message?.frontendBase === 'string' ? message.frontendBase.trim() : '';
+    if (!/^Q-[A-Z0-9]{6,}$/.test(token)) {
+      sendResponse({ ok: false, error: 'Invalid quote token.' });
+      return false;
+    }
+    const destination = buildDashboardQuoteUrl(frontendBase, token);
+    (async () => {
+      try {
+        const existing = await chrome.tabs.query({ url: destination });
+        const existingTab = existing.find((t) => typeof t.id === 'number');
+        if (existingTab?.id) {
+          await chrome.tabs.update(existingTab.id, { active: true });
+          if (typeof existingTab.windowId === 'number') {
+            await chrome.windows.update(existingTab.windowId, { focused: true });
+          }
+          sendResponse({ ok: true, mode: 'focused_existing_tab' });
+          return;
+        }
+        const allTabs = await chrome.tabs.query({});
+        const dashboardTab =
+          allTabs.find((tab) => tab.active && isDashboardTabUrl(tab.url || '', frontendBase)) ||
+          allTabs.find((tab) => isDashboardTabUrl(tab.url || '', frontendBase));
+        if (dashboardTab?.id) {
+          await openDashboardQuoteInExistingTab(dashboardTab.id, destination);
+          if (typeof dashboardTab.windowId === 'number') {
+            await chrome.windows.update(dashboardTab.windowId, { focused: true });
+          }
+          sendResponse({ ok: true, mode: 'updated_existing_dashboard_without_reload' });
+          return;
+        }
+        await chrome.tabs.create({ url: destination, active: true });
+        sendResponse({ ok: true, mode: 'opened_new_tab' });
+      } catch (error) {
+        sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    })();
     return true;
   }
   return false;

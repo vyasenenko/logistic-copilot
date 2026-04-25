@@ -640,7 +640,9 @@ html[data-theme="light"] .chat-picker-title {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding-bottom: 2px;
+  /* Inner breathing room so hover lift/shadow is never clipped by scroll container edges */
+  padding: 10px;
+  margin: 0 -10px;
   -webkit-overflow-scrolling: touch;
 }
 
@@ -655,40 +657,68 @@ html[data-theme="light"] .chat-picker-title {
   display: flex;
   align-items: stretch;
   width: 100%;
-  border-radius: 12px;
+  position: relative;
+  z-index: 1;
+  border-radius: 13px;
   overflow: visible;
-  transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
+  transition: background 0.16s, border-color 0.16s, box-shadow 0.16s, transform 0.16s;
+}
+
+.chat-picker-row-wrap--menu-open {
+  z-index: 220;
 }
 
 html[data-theme="dark"] .chat-picker-row-wrap {
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: color-mix(in srgb, var(--surface2) 88%, transparent);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: color-mix(in srgb, var(--surface2) 90%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 html[data-theme="dark"] .chat-picker-row-wrap:hover {
-  background: color-mix(in srgb, var(--surface) 75%, var(--surface2));
-  border-color: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.24);
+  background: color-mix(in srgb, var(--surface) 78%, var(--surface2));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 8px 18px rgba(0, 0, 0, 0.26);
+  transform: translateY(-1px);
 }
 
 html[data-theme="light"] .chat-picker-row-wrap {
-  border: 1px solid rgba(17, 24, 39, 0.08);
-  background: #ffffff;
-  box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
+  border: 1px solid rgba(17, 24, 39, 0.1);
+  background: color-mix(in srgb, #ffffff 92%, #eef2f7);
+  box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04), inset 0 1px 0 rgba(255, 255, 255, 0.96);
 }
 
 html[data-theme="light"] .chat-picker-row-wrap:hover {
-  border-color: rgba(17, 24, 39, 0.12);
-  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.06);
+  border-color: rgba(17, 24, 39, 0.15);
+  background: color-mix(in srgb, #ffffff 84%, #eaf1f8);
+  box-shadow: 0 5px 14px rgba(17, 24, 39, 0.09), inset 0 1px 0 rgba(255, 255, 255, 0.98);
+  transform: translateY(-1px);
 }
 
 .chat-picker-row-wrap--active {
-  border-color: color-mix(in srgb, var(--accent) 50%, var(--border)) !important;
-  box-shadow: 0 0 0 1px var(--accent-dim);
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--border)) !important;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-dim) 90%, transparent), inset 0 1px 0 rgba(255, 255, 255, 0.09);
 }
 
 html[data-theme="dark"] .chat-picker-row-wrap--active {
-  border-color: rgba(255, 255, 255, 0.42) !important;
-  background: color-mix(in srgb, var(--surface2) 92%, var(--accent-glow));
+  border-color: rgba(197, 232, 239, 0.48) !important;
+  background: color-mix(in srgb, var(--surface2) 90%, var(--accent-glow));
+}
+
+.chat-picker-row-wrap::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 99px;
+  background: transparent;
+  transition: background 0.16s ease, opacity 0.16s ease;
+  opacity: 0.9;
+}
+
+.chat-picker-row-wrap--active::before {
+  background: color-mix(in srgb, var(--accent) 72%, transparent);
 }
 
 .chat-picker-row {
@@ -699,10 +729,9 @@ html[data-theme="dark"] .chat-picker-row-wrap--active {
   flex: 1;
   min-width: 0;
   text-align: left;
-  padding: 10px 10px 10px 12px;
+  padding: 10px 10px 10px 14px;
   border: none;
-  /* Slightly smaller radius than row wrap so strokes meet cleanly at the divider */
-  border-radius: 10px 0 0 10px;
+  border-radius: 12px 0 0 12px;
   background: transparent;
   color: var(--text);
   font: inherit;
@@ -716,7 +745,8 @@ html[data-theme="dark"] .chat-picker-row-wrap--active {
 
 .chat-picker-row-title {
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 560;
+  letter-spacing: 0.01em;
   color: var(--text);
   width: 100%;
   overflow: hidden;
@@ -726,13 +756,18 @@ html[data-theme="dark"] .chat-picker-row-wrap--active {
 
 .chat-picker-row-meta {
   font-size: 11px;
-  color: var(--text-muted);
+  color: color-mix(in srgb, var(--text-muted) 92%, #94a3b8);
 }
 
 .chat-picker-row-menu {
   position: relative;
   flex-shrink: 0;
   align-self: stretch;
+  z-index: 1;
+}
+
+.chat-picker-row-menu[open] {
+  z-index: 230;
 }
 
 .chat-picker-row-more {
@@ -748,14 +783,14 @@ html[data-theme="dark"] .chat-picker-row-wrap--active {
   cursor: pointer;
   color: var(--text-muted);
   border: none;
-  border-left: 1px solid var(--border);
-  border-radius: 0 10px 10px 0;
+  border-left: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
+  border-radius: 0 12px 12px 0;
   background: transparent;
-  transition: background 0.12s, color 0.12s;
+  transition: background 0.16s, color 0.16s, border-color 0.16s;
 }
 
 html[data-theme="dark"] .chat-picker-row-more {
-  border-left-color: rgba(255, 255, 255, 0.1);
+  border-left-color: rgba(255, 255, 255, 0.12);
 }
 
 .chat-picker-row-more::-webkit-details-marker {
@@ -764,40 +799,46 @@ html[data-theme="dark"] .chat-picker-row-more {
 
 .chat-picker-row-more:hover,
 .chat-picker-row-menu[open] .chat-picker-row-more {
-  background: color-mix(in srgb, var(--surface) 55%, transparent);
+  background: color-mix(in srgb, var(--surface) 50%, transparent);
   color: var(--text);
+  border-left-color: color-mix(in srgb, var(--accent) 26%, var(--border));
 }
 
 .chat-picker-row-menu-panel {
   position: absolute;
   right: 0;
-  top: calc(100% - 2px);
-  min-width: 148px;
+  top: calc(100% + 4px);
+  min-width: 132px;
   padding: 6px;
-  background: var(--elevated);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  box-shadow: var(--shadow);
-  z-index: 10;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--surface2) 92%, transparent), color-mix(in srgb, var(--bg1) 96%, transparent));
+  border: 1px solid color-mix(in srgb, var(--border-strong) 90%, transparent);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.34);
+  z-index: 120;
 }
 
 .chat-picker-row-delete {
   width: 100%;
-  padding: 9px 10px;
+  padding: 8px 10px;
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: 8px;
   background: transparent;
   color: #f87171;
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  transition: background 0.12s;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transition: background 0.12s, color 0.12s;
 }
 
 .chat-picker-row-delete:hover {
-  background: rgba(248, 113, 113, 0.1);
+  background: rgba(248, 113, 113, 0.12);
+  color: #fca5a5;
 }
 
 html[data-theme="light"] .chat-picker-row-delete {
@@ -1089,6 +1130,18 @@ html[data-theme="light"] .chat-picker-status--error {
   color: var(--link);
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+
+.markdown-body a.quote-token-link {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in srgb, var(--accent) 52%, transparent);
+}
+
+.markdown-body a.quote-token-link:hover {
+  color: var(--link);
+  text-decoration-style: solid;
 }
 
 .markdown-body h1,

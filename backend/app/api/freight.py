@@ -29,6 +29,8 @@ from app.schemas import (
     BidIntakeResponse,
     BidRecord,
     BookingExecutionResponse,
+    CarrierFollowupRequest,
+    CarrierFollowupResponse,
     CarrierOutreachRequest,
     CarrierOutreachResponse,
     CarrierRecord,
@@ -110,7 +112,7 @@ from app.services.location_timezone import (
     normalize_pickup_datetime_fields,
 )
 from app.services.workflow_event_codec import workflow_event_to_record
-from app.services.freight_outreach import create_carrier_outreach
+from app.services.freight_outreach import create_carrier_outreach, send_carrier_followup
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
 from app.services.outlook_mail_actions import (
@@ -3344,6 +3346,30 @@ async def shipment_carrier_outreach(
             carrier_ids=request.carrier_ids,
             dry_run=request.dry_run,
             custom_message=request.custom_message,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/freight/shipments/{shipment_id}/carrier-followup",
+    response_model=CarrierFollowupResponse,
+)
+async def shipment_carrier_followup(
+    shipment_id: UUID,
+    request: CarrierFollowupRequest,
+    session: AsyncSession = Depends(get_session),
+) -> CarrierFollowupResponse:
+    """Send a follow-up to one carrier, replying in-thread after first contact."""
+    try:
+        return await send_carrier_followup(
+            session,
+            shipment_id=shipment_id,
+            carrier_id=request.carrier_id,
+            carrier_email=request.carrier_email,
+            dry_run=request.dry_run,
+            subject=request.subject,
+            message=request.message,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

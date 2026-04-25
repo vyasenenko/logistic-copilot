@@ -74,8 +74,8 @@
                   </svg>
                 </span>
                 <span class="topbar-menu__item-text">
-                  <span class="topbar-menu__item-label">Backend URL</span>
-                  <span class="topbar-menu__item-desc">API base for this panel</span>
+                  <span class="topbar-menu__item-label">Endpoints</span>
+                  <span class="topbar-menu__item-desc">API + frontend links for this panel</span>
                 </span>
                 <span class="topbar-menu__item-chevron topbar-menu__item-chevron--settings" aria-hidden="true">›</span>
               </summary>
@@ -87,7 +87,13 @@
                   <option value="http://localhost:8000"></option>
                 </datalist>
                 <button type="button" id="saveApiBtn" class="btn-primary">Save</button>
-                <p class="field-hint">CORS: <code>CORS_ALLOW_CHROME_EXTENSIONS=true</code> or add <code>chrome-extension://…</code> to <code>BACKEND_CORS_ORIGINS</code>.</p>
+                <label class="field-label" for="frontendBaseInput">Frontend URL</label>
+                <input type="url" id="frontendBaseInput" class="field-input" placeholder="https://logisticopilot.com" list="frontendBaseSuggestions" />
+                <datalist id="frontendBaseSuggestions">
+                  <option value="https://logisticopilot.com"></option>
+                  <option value="http://localhost:3000"></option>
+                </datalist>
+                <button type="button" id="saveFrontendBtn" class="btn-primary">Save link base</button>
               </div>
             </details>
             <div class="topbar-menu__delete-block" role="none">
@@ -147,11 +153,14 @@
           ></textarea>
         </div>
         <div class="composer-actions">
+          <!--
+          Voice button is temporarily disabled; keep markup for quick restore.
           <button type="button" id="micBtn" class="composer-fab composer-fab--mic" title="Start voice dictation" aria-label="Start voice dictation">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" aria-hidden="true">
               <rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0"></path><path d="M12 18v3"></path><path d="M8 21h8"></path>
             </svg>
           </button>
+          -->
           <button type="button" id="sendBtn" class="composer-fab send-fab" title="Send" aria-label="Send">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
               <path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>

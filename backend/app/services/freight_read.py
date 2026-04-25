@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 import html
 import re
 from uuid import UUID
@@ -244,11 +244,107 @@ async def list_notification_feed(
     )
 
 
-async def list_shipments_brief(session: AsyncSession, *, limit: int = 80) -> list[dict]:
+SHIPMENT_LIST_DATE_SCOPES = {"today", "last_2_days", "last_7_days", "current_month", "last_30_days", "all"}
+SHIPMENT_LIST_DATE_FIELDS = {"created_at", "updated_at", "ready_at_local"}
+SHIPMENT_QUERY_SORT_FIELDS = {"created_at", "updated_at", "ready_at_local", "date_field"}
+
+
+def normalize_shipment_date_scope(date_scope: str | None) -> str:
+    scope = (date_scope or "last_7_days").strip().lower()
+    return scope if scope in SHIPMENT_LIST_DATE_SCOPES else "last_7_days"
+
+
+def normalize_shipment_date_field(date_field: str | None) -> str:
+    field = (date_field or "created_at").strip().lower()
+    return field if field in SHIPMENT_LIST_DATE_FIELDS else "created_at"
+
+
+def normalize_shipment_sort_field(sort_by: str | None) -> str:
+    field = (sort_by or "date_field").strip().lower()
+    return field if field in SHIPMENT_QUERY_SORT_FIELDS else "date_field"
+
+
+def shipment_list_window(*, date_scope: str, now: datetime | None = None) -> tuple[datetime | None, datetime | None]:
+    scope = normalize_shipment_date_scope(date_scope)
+    if scope == "all":
+        return None, None
+
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    reference = reference.astimezone(timezone.utc)
+
+    if scope == "today":
+        start = datetime.combine(reference.date(), time.min, tzinfo=timezone.utc)
+    elif scope == "last_2_days":
+        start = reference - timedelta(days=2)
+    elif scope == "last_7_days":
+        start = reference - timedelta(days=7)
+    elif scope == "current_month":
+        start = datetime(reference.year, reference.month, 1, tzinfo=timezone.utc)
+    else:
+        start = reference - timedelta(days=30)
+    return start, reference
+
+
+def _shipment_list_date_column(date_field: str):
+    field = normalize_shipment_date_field(date_field)
+    if field == "updated_at":
+        return Shipment.updated_at
+    if field == "ready_at_local":
+        return Shipment.ready_at_local
+    return Shipment.created_at
+
+
+def _shipment_query_sort_column(*, sort_by: str, date_field: str):
+    field = normalize_shipment_sort_field(sort_by)
+    return _shipment_list_date_column(date_field if field == "date_field" else field)
+
+
+def _shipment_attention_condition():
+    manual_review_exists = (
+        select(WorkflowEvent.id)
+        .where(
+            WorkflowEvent.shipment_id == Shipment.id,
+            WorkflowEvent.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+        )
+        .exists()
+    )
+    return or_(Shipment.status == ShipmentStage.WAITING_CUSTOMER_DETAILS.value, manual_review_exists)
+
+
+def _shipment_date_conditions(*, date_scope: str, date_field: str):
+    normalized_date_field = normalize_shipment_date_field(date_field)
+    column = _shipment_list_date_column(normalized_date_field)
+    start, end = shipment_list_window(date_scope=date_scope)
+    conditions = []
+    if start is not None:
+        conditions.append(column >= start.replace(tzinfo=None) if normalized_date_field == "ready_at_local" else column >= start)
+    if end is not None:
+        conditions.append(column <= end.replace(tzinfo=None) if normalized_date_field == "ready_at_local" else column <= end)
+    return column, conditions
+
+
+async def list_shipments_brief(
+    session: AsyncSession,
+    *,
+    limit: int = 80,
+    date_scope: str = "all",
+    date_field: str = "created_at",
+    status: str | None = None,
+) -> list[dict]:
     """Lightweight shipment rows for agents (no enrichment join fan-out)."""
     lim = max(1, min(limit, 200))
+    column, date_conditions = _shipment_date_conditions(date_scope=date_scope, date_field=date_field)
+    conditions = [Shipment.is_archived.is_(False)]
+    if status:
+        conditions.append(Shipment.status == status)
+    conditions.extend(date_conditions)
     result = await session.execute(
-        select(Shipment).where(Shipment.is_archived.is_(False)).order_by(Shipment.created_at.desc()).limit(lim)
+        select(Shipment)
+        .where(*conditions)
+        .order_by(column.desc(), Shipment.updated_at.desc(), Shipment.created_at.desc())
+        .limit(lim)
     )
     rows: list[dict] = []
     for s in result.scalars().all():
@@ -268,6 +364,72 @@ async def list_shipments_brief(session: AsyncSession, *, limit: int = 80) -> lis
             }
         )
     return rows
+
+
+async def query_shipments_brief(
+    session: AsyncSession,
+    *,
+    date_scope: str = "last_7_days",
+    date_field: str = "created_at",
+    status: str | None = None,
+    city: str | None = None,
+    attention_only: bool = False,
+    sort_by: str = "date_field",
+    limit: int = 50,
+) -> dict:
+    """Agent-friendly shipment query with metadata and bounded results."""
+    lim = max(1, min(limit, 200))
+    normalized_date_scope = normalize_shipment_date_scope(date_scope)
+    normalized_date_field = normalize_shipment_date_field(date_field)
+    normalized_sort_by = normalize_shipment_sort_field(sort_by)
+    _date_column, date_conditions = _shipment_date_conditions(
+        date_scope=normalized_date_scope,
+        date_field=normalized_date_field,
+    )
+    sort_column = _shipment_query_sort_column(sort_by=normalized_sort_by, date_field=normalized_date_field)
+    conditions = [Shipment.is_archived.is_(False), *date_conditions]
+    if status:
+        conditions.append(Shipment.status == status)
+    if city and city.strip():
+        q = f"%{city.strip()}%"
+        conditions.append(or_(Shipment.origin.ilike(q), Shipment.destination.ilike(q)))
+    if attention_only:
+        conditions.append(_shipment_attention_condition())
+
+    result = await session.execute(
+        select(Shipment)
+        .where(*conditions)
+        .order_by(sort_column.desc(), Shipment.updated_at.desc(), Shipment.created_at.desc())
+        .limit(lim + 1)
+    )
+    shipments = result.scalars().all()
+    rows = [_shipment_brief_row(shipment) for shipment in shipments[:lim]]
+    match_reasons = []
+    if normalized_date_scope != "all":
+        match_reasons.append(f"{normalized_date_field} in {normalized_date_scope}")
+    if status:
+        match_reasons.append(f"status is {status}")
+    if city and city.strip():
+        match_reasons.append(f"origin or destination contains {city.strip()}")
+    if attention_only:
+        match_reasons.append("requires operator attention")
+    for row in rows:
+        row["match_reason"] = "; ".join(match_reasons) if match_reasons else "active shipment"
+
+    return {
+        "summary": {
+            "returned": len(rows),
+            "limit": lim,
+            "has_more": len(shipments) > lim,
+            "date_scope": normalized_date_scope,
+            "date_field": normalized_date_field,
+            "status": status,
+            "city": city,
+            "attention_only": attention_only,
+            "sort_by": normalized_sort_by,
+        },
+        "items": rows,
+    }
 
 
 def _shipment_brief_row(shipment: Shipment) -> dict:

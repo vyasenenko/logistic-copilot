@@ -5,6 +5,8 @@ const sendBtn = document.getElementById('sendBtn');
 const micBtn = document.getElementById('micBtn');
 const apiBaseInput = document.getElementById('apiBaseInput');
 const saveApiBtn = document.getElementById('saveApiBtn');
+const frontendBaseInput = document.getElementById('frontendBaseInput');
+const saveFrontendBtn = document.getElementById('saveFrontendBtn');
 const menuClearBtn = document.getElementById('menuClearBtn');
 const menuNewChatBtn = document.getElementById('menuNewChatBtn');
 const menuChatsBtn = document.getElementById('menuChatsBtn');
@@ -26,10 +28,12 @@ const chatPickerStatus = document.getElementById('chatPickerStatus');
 
 const STORAGE_MESSAGES = 'assistant_messages';
 const STORAGE_API_BASE = 'api_base_url';
+const STORAGE_FRONTEND_BASE = 'frontend_base_url';
 const STORAGE_CONVERSATION = 'conversation_id';
 const STORAGE_THEME = 'ui_theme';
 const STORAGE_USE_PAGE_CONTEXT = 'use_page_context';
 const DEFAULT_API_BASE = 'https://api.logisticopilot.com';
+const DEFAULT_FRONTEND_BASE = 'https://logisticopilot.com';
 const CHAT_PICKER_TRANSITION_MS = 260;
 /** Default two lines: 14.5px * 1.45 * 2 + padding 11+10 ≈ 64px */
 const COMPOSER_TEXTAREA_MIN_PX = 64;
@@ -253,8 +257,13 @@ const STOP_ICON = `
 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
   <rect x="6.4" y="6.4" width="11.2" height="11.2" rx="2.2"></rect>
 </svg>`;
+const DELETE_ICON = `
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+  <path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v6M14 11v6"></path>
+</svg>`;
 
 let currentPageContext = null;
+let currentFrontendBase = DEFAULT_FRONTEND_BASE;
 
 (function configureMarked() {
   if (typeof marked === 'undefined') return;
@@ -348,6 +357,17 @@ function saveApiBase(url, callback) {
   chrome.storage.local.set({ [STORAGE_API_BASE]: trimmed }, () => callback(trimmed));
 }
 
+function loadFrontendBase(callback) {
+  chrome.storage.local.get([STORAGE_FRONTEND_BASE], (r) => {
+    callback((r[STORAGE_FRONTEND_BASE] || DEFAULT_FRONTEND_BASE).replace(/\/$/, ''));
+  });
+}
+
+function saveFrontendBase(url, callback) {
+  const trimmed = (url || '').trim().replace(/\/$/, '') || DEFAULT_FRONTEND_BASE;
+  chrome.storage.local.set({ [STORAGE_FRONTEND_BASE]: trimmed }, () => callback(trimmed));
+}
+
 function loadConversationId(callback) {
   chrome.storage.local.get([STORAGE_CONVERSATION], (r) => {
     callback(r[STORAGE_CONVERSATION] || null);
@@ -378,6 +398,18 @@ function saveUsePageContext(enabled) {
   chrome.storage.local.set({ [STORAGE_USE_PAGE_CONTEXT]: Boolean(enabled) });
 }
 
+let shouldStickToBottom = true;
+const SCROLL_BOTTOM_EPSILON_PX = 28;
+
+function isMessagesScrolledToBottom() {
+  const distance = messagesEl.scrollHeight - messagesEl.clientHeight - messagesEl.scrollTop;
+  return distance <= SCROLL_BOTTOM_EPSILON_PX;
+}
+
+function setAutoStickToBottom(enabled) {
+  shouldStickToBottom = Boolean(enabled);
+}
+
 function scrollToBottom() {
   const el = messagesEl;
   const top = el.scrollHeight;
@@ -390,6 +422,12 @@ function scrollToBottom() {
   } else {
     el.scrollTop = top;
   }
+  shouldStickToBottom = true;
+}
+
+function scrollToBottomIfSticky() {
+  if (!shouldStickToBottom) return;
+  scrollToBottom();
 }
 
 function clearThreadTurns() {
@@ -665,25 +703,108 @@ function wrapMarkdownTables(html) {
   return host.innerHTML;
 }
 
+function buildShipmentQuoteLink(token) {
+  const base = (currentFrontendBase || DEFAULT_FRONTEND_BASE).replace(/\/$/, '');
+  return `${base}/?quote=${encodeURIComponent(token)}`;
+}
+
+function linkifyQuoteTokensInTextContainer(root) {
+  if (!root) return;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  while (walker.nextNode()) textNodes.push(walker.currentNode);
+  const tokenRe = /\bQ-[A-Z0-9]{6,}\b/gi;
+  for (const node of textNodes) {
+    const parent = node.parentElement;
+    if (!parent) continue;
+    if (parent.closest('a, pre, script, style')) continue;
+    const raw = node.nodeValue || '';
+    tokenRe.lastIndex = 0;
+    if (!tokenRe.test(raw)) continue;
+    tokenRe.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    let m;
+    while ((m = tokenRe.exec(raw)) !== null) {
+      const start = m.index;
+      const end = start + m[0].length;
+      if (start > last) frag.appendChild(document.createTextNode(raw.slice(last, start)));
+      const token = m[0].toUpperCase();
+      const a = document.createElement('a');
+      a.href = buildShipmentQuoteLink(token);
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.className = 'quote-token-link';
+      a.dataset.quoteToken = token;
+      a.textContent = token;
+      frag.appendChild(a);
+      last = end;
+    }
+    if (last < raw.length) frag.appendChild(document.createTextNode(raw.slice(last)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+}
+
+function linkifyShipmentQuoteTokensInHtml(html) {
+  if (!html || !/Q-[A-Z0-9]{6,}/i.test(html)) return html;
+  const host = document.createElement('div');
+  host.innerHTML = html;
+  const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  while (walker.nextNode()) textNodes.push(walker.currentNode);
+  const tokenRe = /\bQ-[A-Z0-9]{6,}\b/gi;
+  for (const node of textNodes) {
+    const parent = node.parentElement;
+    if (!parent) continue;
+    if (parent.closest('a, pre, script, style')) continue;
+    const raw = node.nodeValue || '';
+    tokenRe.lastIndex = 0;
+    if (!tokenRe.test(raw)) continue;
+    tokenRe.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    let m;
+    while ((m = tokenRe.exec(raw)) !== null) {
+      const start = m.index;
+      const end = start + m[0].length;
+      if (start > last) frag.appendChild(document.createTextNode(raw.slice(last, start)));
+      const token = m[0].toUpperCase();
+      const a = document.createElement('a');
+      a.href = buildShipmentQuoteLink(token);
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.className = 'quote-token-link';
+      a.dataset.quoteToken = token;
+      a.textContent = token;
+      frag.appendChild(a);
+      last = end;
+    }
+    if (last < raw.length) frag.appendChild(document.createTextNode(raw.slice(last)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+  return host.innerHTML;
+}
+
 function renderMarkdown(text) {
   const raw = text == null ? '' : String(text);
   if (!raw.trim()) return '<p class="text-muted">…</p>';
   const unsafe = parseMarkdownToUnsafeHtml(raw);
   const withTableWrap = unsafe != null ? wrapMarkdownTables(unsafe) : null;
-  if (withTableWrap != null && typeof DOMPurify !== 'undefined') {
+  const withQuoteLinks = withTableWrap != null ? linkifyShipmentQuoteTokensInHtml(withTableWrap) : null;
+  if (withQuoteLinks != null && typeof DOMPurify !== 'undefined') {
     try {
-      return DOMPurify.sanitize(withTableWrap, { USE_PROFILES: { html: true } });
+      return DOMPurify.sanitize(withQuoteLinks, { USE_PROFILES: { html: true } });
     } catch (e) {
       console.warn('DOMPurify.sanitize failed', e);
       try {
-        return DOMPurify.sanitize(withTableWrap);
+        return DOMPurify.sanitize(withQuoteLinks);
       } catch (e2) {
         console.warn('DOMPurify fallback failed', e2);
       }
     }
   }
-  if (withTableWrap != null && typeof DOMPurify === 'undefined') {
-    return withTableWrap;
+  if (withQuoteLinks != null && typeof DOMPurify === 'undefined') {
+    return withQuoteLinks;
   }
   console.warn('Markdown parser unavailable; plain text fallback');
   return `<p>${escapeHtml(raw).replace(/\n/g, '<br>')}</p>`;
@@ -786,6 +907,7 @@ function appendUserTurn(text, time) {
   const line = document.createElement('div');
   line.className = 'user-line';
   line.textContent = text;
+  linkifyQuoteTokensInTextContainer(line);
   article.appendChild(line);
   article.appendChild(createTurnFooter(time || getTime(), () => text));
   messagesEl.appendChild(article);
@@ -818,6 +940,7 @@ function renderAssistantFromSegments(segments, time) {
   const meta = createTurnFooter(time || getTime(), () => extractCopyTextFromFlow(flow));
   article.appendChild(flow);
   article.appendChild(meta);
+  linkifyQuoteTokensInTextContainer(flow);
   messagesEl.appendChild(article);
   scrollToBottom();
   return article;
@@ -1050,6 +1173,56 @@ function abortCurrentChat() {
   }
 }
 
+/**
+ * @returns {Promise<'granted' | 'prompt' | 'denied' | 'unknown'>}
+ */
+async function getMicrophonePermissionState() {
+  try {
+    if (!navigator.permissions?.query) return 'unknown';
+    const status = await navigator.permissions.query({ name: 'microphone' });
+    const state = status?.state;
+    if (state === 'granted' || state === 'prompt' || state === 'denied') return state;
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * Convert browser-specific microphone permission errors into actionable guidance.
+ * @param {unknown} err
+ * @returns {Promise<string>}
+ */
+async function describeMicStartError(err) {
+  const fallback = err instanceof Error ? err.message : String(err);
+  const permissionState = await getMicrophonePermissionState();
+  if (err instanceof DOMException) {
+    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+      const lowered = (err.message || '').toLowerCase();
+      if (permissionState === 'prompt' && lowered.includes('dismiss')) {
+        return 'Microphone permission prompt was dismissed. Click the mic button again and choose Allow.';
+      }
+      if (permissionState === 'denied') {
+        return 'Microphone permission is denied. Allow microphone in Chrome site settings and OS privacy settings for Chrome, then reload the side panel.';
+      }
+      if (permissionState === 'granted') {
+        return 'Microphone access is granted but recording is still blocked. Check OS privacy permissions for Chrome and close any app that exclusively uses the microphone.';
+      }
+      return 'Microphone access was blocked. Check Chrome site permissions and OS privacy settings, then reload the side panel.';
+    }
+    if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+      return 'No microphone device was found. Connect a microphone and try again.';
+    }
+    if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+      return 'Microphone is busy or unavailable. Close other apps using the mic and try again.';
+    }
+    if (err.name === 'SecurityError') {
+      return 'Microphone access is blocked by browser security policy for this context.';
+    }
+  }
+  return fallback || 'Unknown microphone error.';
+}
+
 function cancelTranscription() {
   if (activeTranscriptionAbortController) {
     activeTranscriptionAbortController.abort();
@@ -1078,7 +1251,7 @@ async function startVoiceRecording() {
     sendAfterTranscription = false;
     updateComposerControls();
   } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = await describeMicStartError(err);
     appendSystemNote(`Unable to start voice recording: ${reason}`);
     stopMediaStream();
   }
@@ -1329,7 +1502,7 @@ function renderConversationRows(conversations) {
     const delBtn = document.createElement('button');
     delBtn.type = 'button';
     delBtn.className = 'chat-picker-row-delete';
-    delBtn.textContent = 'Delete conversation…';
+    delBtn.innerHTML = `${DELETE_ICON}<span>Delete</span>`;
     delBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -1339,9 +1512,13 @@ function renderConversationRows(conversations) {
     actions.appendChild(sum);
     actions.appendChild(panel);
     actions.addEventListener('toggle', () => {
+      wrap.classList.toggle('chat-picker-row-wrap--menu-open', actions.open);
       if (!actions.open) return;
       chatPickerList?.querySelectorAll('details.chat-picker-row-menu').forEach((d) => {
-        if (d !== actions && d instanceof HTMLDetailsElement) d.open = false;
+        if (!(d instanceof HTMLDetailsElement)) return;
+        if (d === actions) return;
+        d.open = false;
+        d.closest('.chat-picker-row-wrap')?.classList.remove('chat-picker-row-wrap--menu-open');
       });
     });
 
@@ -1416,6 +1593,7 @@ async function sendMessage() {
   const text = userInput.value.trim();
   if (!text) return;
 
+  setAutoStickToBottom(true);
   userInput.value = '';
   autoResize();
   setSending(true);
@@ -1467,6 +1645,7 @@ async function sendMessage() {
     const tail = streamBody.querySelector('.stream-plain--tail');
     if (!tail) return;
     setStreamPlainMarkdown(tail, pendingText);
+    scrollToBottomIfSticky();
   }
   function scheduleStreamTailMarkdown() {
     if (streamTailMdRaf) return;
@@ -1486,7 +1665,7 @@ async function sendMessage() {
     streamArticle.appendChild(streamBody);
     streamArticle.appendChild(meta);
     messagesEl.appendChild(streamArticle);
-    scrollToBottom();
+    scrollToBottomIfSticky();
   }
 
   const chatAbortController = new AbortController();
@@ -1503,7 +1682,7 @@ async function sendMessage() {
           getOrCreateTextTail(streamBody);
           scheduleStreamTailMarkdown();
         }
-        scrollToBottom();
+        scrollToBottomIfSticky();
       },
       (ev) => {
         if (ev.event === '_conversation_id' && typeof ev.data === 'string') {
@@ -1541,7 +1720,7 @@ async function sendMessage() {
             streamBody.appendChild(aside);
             toolAsides.push(aside);
           }
-          scrollToBottom();
+          scrollToBottomIfSticky();
         }
         if (ev.event === 'tool_end') {
           const raw = ev.data;
@@ -1579,7 +1758,7 @@ async function sendMessage() {
             const aside = toolAsides[idx];
             if (aside) refreshInlineToolPanels(aside);
           }
-          scrollToBottom();
+          scrollToBottomIfSticky();
         }
         if (ev.event === 'error') {
           pendingText += `\n\n**Error**\n\n${typeof ev.data === 'string' ? ev.data : stringifySafe(ev.data)}`;
@@ -1962,6 +2141,18 @@ saveApiBtn.addEventListener('click', () => {
   });
 });
 
+saveFrontendBtn?.addEventListener('click', () => {
+  saveFrontendBase(frontendBaseInput?.value || '', (saved) => {
+    currentFrontendBase = saved;
+    if (frontendBaseInput) frontendBaseInput.value = saved;
+    saveFrontendBtn.textContent = 'Saved';
+    closeTopbarMenu();
+    setTimeout(() => {
+      if (saveFrontendBtn) saveFrontendBtn.textContent = 'Save link base';
+    }, 1200);
+  });
+});
+
 refreshPageContextBtn?.addEventListener('click', async () => {
   refreshPageContextBtn.disabled = true;
   const previous = refreshPageContextBtn.textContent;
@@ -1987,6 +2178,40 @@ menuChatsBtn?.addEventListener('click', () => {
   void refreshChatPickerList();
 });
 
+messagesEl.addEventListener('click', (e) => {
+  const target = e.target instanceof Element ? e.target : null;
+  const link = target?.closest('a.quote-token-link, a[href*="?quote="], a');
+  if (!(link instanceof HTMLAnchorElement)) return;
+  const byDataset = (link.dataset.quoteToken || '').trim().toUpperCase();
+  const byText = (link.textContent || '').trim().toUpperCase();
+  let token = byDataset;
+  if (!/^Q-[A-Z0-9]{6,}$/.test(token) && /^Q-[A-Z0-9]{6,}$/.test(byText)) token = byText;
+  if (!/^Q-[A-Z0-9]{6,}$/.test(token)) {
+    try {
+      const href = link.getAttribute('href') || '';
+      const parsed = new URL(href, window.location.href);
+      const q = String(parsed.searchParams.get('quote') || '').trim().toUpperCase();
+      if (/^Q-[A-Z0-9]{6,}$/.test(q)) token = q;
+    } catch {
+      /* ignore malformed href */
+    }
+  }
+  if (!/^Q-[A-Z0-9]{6,}$/.test(token)) return;
+  e.preventDefault();
+  chrome.runtime.sendMessage(
+    {
+      type: 'OPEN_DASHBOARD_QUOTE',
+      token,
+      frontendBase: (currentFrontendBase || DEFAULT_FRONTEND_BASE).replace(/\/$/, ''),
+    },
+    (response) => {
+      if (chrome.runtime.lastError || !response?.ok) {
+        window.open(buildShipmentQuoteLink(token), '_blank', 'noopener,noreferrer');
+      }
+    }
+  );
+});
+
 document.addEventListener('click', (e) => {
   if (!(e.target instanceof Node)) return;
   if (topbarMenu instanceof HTMLDetailsElement && topbarMenu.open && !topbarMenu.contains(e.target)) {
@@ -1997,6 +2222,10 @@ document.addEventListener('click', (e) => {
       d.open = false;
     }
   });
+});
+
+messagesEl.addEventListener('scroll', () => {
+  setAutoStickToBottom(isMessagesScrolledToBottom());
 });
 
 chatPickerBackdrop?.addEventListener('click', () => {
@@ -2026,6 +2255,11 @@ document.addEventListener('keydown', (e) => {
 
 loadApiBase((base) => {
   apiBaseInput.value = base;
+});
+
+loadFrontendBase((base) => {
+  currentFrontendBase = base;
+  if (frontendBaseInput) frontendBaseInput.value = base;
 });
 
 loadUsePageContext((enabled) => {

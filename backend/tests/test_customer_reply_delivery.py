@@ -1,0 +1,175 @@
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+import pytest
+
+from app.memory.database import EmailMessage, Shipment
+from app.services import freight_execution
+
+
+class FakeScalarSession:
+    def __init__(self, scalar_results):
+        self.scalar_results = list(scalar_results)
+
+    async def scalar(self, _query):
+        if self.scalar_results:
+            return self.scalar_results.pop(0)
+        return None
+
+
+def _shipment(thread_id=None):
+    return Shipment(
+        id=uuid4(),
+        email_thread_id=thread_id or uuid4(),
+        status="received",
+    )
+
+
+def _inbound_message(*, thread_id, message_id, sender="client@example.com", received_at=None):
+    return EmailMessage(
+        id=uuid4(),
+        thread_id=thread_id,
+        provider_message_id=message_id,
+        sender=sender,
+        recipients_json=["ops@example.com"],
+        direction="inbound",
+        subject="Quote request",
+        body_preview="Please quote this shipment",
+        received_at=received_at or datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_customer_reply_anchor_prefers_client_first_inbound_message():
+    thread_id = uuid4()
+    shipment = _shipment(thread_id)
+    client_anchor = _inbound_message(
+        thread_id=thread_id,
+        message_id="client-first",
+        received_at=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    session = FakeScalarSession([client_anchor])
+
+    anchor = await freight_execution._find_customer_reply_anchor(
+        session,
+        shipment=shipment,
+        client_email="CLIENT@example.com",
+    )
+
+    assert anchor is client_anchor
+    assert anchor.provider_message_id == "client-first"
+
+
+@pytest.mark.asyncio
+async def test_deliver_customer_thread_email_replies_when_anchor_exists(monkeypatch):
+    calls = []
+
+    class FakeOutlook:
+        async def reply_to_message(self, **kwargs):
+            calls.append(("reply", kwargs))
+
+        async def send_mail(self, **kwargs):
+            calls.append(("send", kwargs))
+
+    monkeypatch.setattr(freight_execution, "OutlookGraphClient", FakeOutlook)
+    thread_id = uuid4()
+    shipment = _shipment(thread_id)
+    anchor = _inbound_message(thread_id=thread_id, message_id="msg-123")
+    session = FakeScalarSession([anchor])
+
+    delivery = await freight_execution.deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email="client@example.com",
+        subject="Quote ready",
+        body="We can cover this load.",
+        dry_run=False,
+    )
+
+    assert delivery == {
+        "delivery_mode": "reply",
+        "reply_to_provider_message_id": "msg-123",
+    }
+    assert calls == [
+        (
+            "reply",
+            {
+                "message_id": "msg-123",
+                "body": "We can cover this load.",
+                "recipients": ["client@example.com"],
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deliver_customer_thread_email_falls_back_to_send_mail_without_anchor(monkeypatch):
+    calls = []
+
+    class FakeOutlook:
+        async def reply_to_message(self, **kwargs):
+            calls.append(("reply", kwargs))
+
+        async def send_mail(self, **kwargs):
+            calls.append(("send", kwargs))
+
+    monkeypatch.setattr(freight_execution, "OutlookGraphClient", FakeOutlook)
+    shipment = _shipment()
+    session = FakeScalarSession([None, None])
+
+    delivery = await freight_execution.deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email="client@example.com",
+        subject="Quote ready",
+        body="We can cover this load.",
+        dry_run=False,
+    )
+
+    assert delivery == {
+        "delivery_mode": "send_mail_fallback",
+        "reply_to_provider_message_id": None,
+    }
+    assert calls == [
+        (
+            "send",
+            {
+                "subject": "Quote ready",
+                "body": "We can cover this load.",
+                "recipients": ["client@example.com"],
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deliver_customer_thread_email_dry_run_reports_reply_without_sending(monkeypatch):
+    calls = []
+
+    class FakeOutlook:
+        async def reply_to_message(self, **kwargs):
+            calls.append(("reply", kwargs))
+
+        async def send_mail(self, **kwargs):
+            calls.append(("send", kwargs))
+
+    monkeypatch.setattr(freight_execution, "OutlookGraphClient", FakeOutlook)
+    thread_id = uuid4()
+    shipment = _shipment(thread_id)
+    anchor = _inbound_message(thread_id=thread_id, message_id="msg-123")
+    session = FakeScalarSession([anchor])
+
+    delivery = await freight_execution.deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email="client@example.com",
+        subject="Quote ready",
+        body="We can cover this load.",
+        dry_run=True,
+    )
+
+    assert delivery == {
+        "delivery_mode": "reply",
+        "reply_to_provider_message_id": "msg-123",
+    }
+    assert calls == []

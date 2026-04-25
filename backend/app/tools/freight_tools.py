@@ -30,7 +30,7 @@ from app.services.freight_execution import (
     intake_bid,
     send_customer_quote,
 )
-from app.services.freight_outreach import create_carrier_outreach
+from app.services.freight_outreach import create_carrier_outreach, send_carrier_followup
 from app.services.freight_read import (
     build_freight_overview,
     diagnose_shipment_issue,
@@ -43,6 +43,7 @@ from app.services.freight_read import (
     list_shipments_by_city_brief,
     list_shipments_brief,
     list_today_shipments_brief,
+    query_shipments_brief,
     search_archived_shipments_brief,
     search_shipments_brief,
     summarize_archived_shipment_case,
@@ -287,11 +288,47 @@ async def freight_get_overview() -> str:
 
 
 @tool
-async def freight_list_shipments(limit: int = 50) -> str:
-    """List recent shipments (id, status, lane, equipment, timestamps). limit capped at 200."""
+async def freight_list_shipments(
+    date_scope: str = "last_7_days",
+    date_field: str = "created_at",
+    status: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List active shipments by date scope. date_scope: today, last_2_days, last_7_days, current_month, last_30_days, all. date_field: created_at, updated_at, ready_at_local. limit capped at 200."""
     async with async_session() as session:
-        rows = await list_shipments_brief(session, limit=limit)
+        rows = await list_shipments_brief(
+            session,
+            limit=limit,
+            date_scope=date_scope,
+            date_field=date_field,
+            status=status,
+        )
         return _json(rows)
+
+
+@tool
+async def freight_query_shipments(
+    date_scope: str = "last_7_days",
+    date_field: str = "created_at",
+    status: str | None = None,
+    city: str | None = None,
+    attention_only: bool = False,
+    sort_by: str = "date_field",
+    limit: int = 50,
+) -> str:
+    """Query active shipments with filters and summary metadata. date_scope: today, last_2_days, last_7_days, current_month, last_30_days, all. date_field/sort_by: created_at, updated_at, ready_at_local. attention_only limits to review-like shipments."""
+    async with async_session() as session:
+        result = await query_shipments_brief(
+            session,
+            date_scope=date_scope,
+            date_field=date_field,
+            status=status,
+            city=city,
+            attention_only=attention_only,
+            sort_by=sort_by,
+            limit=limit,
+        )
+        return _json(result)
 
 
 @tool
@@ -801,12 +838,45 @@ async def freight_send_carrier_outreach(
             return f"Error: {e}"
 
 
+@tool
+async def freight_send_carrier_followup(
+    shipment_id: str,
+    message: str,
+    dry_run: bool = True,
+    carrier_id: str | None = None,
+    carrier_email: str | None = None,
+    subject: str | None = None,
+) -> str:
+    """Send a follow-up to one carrier. First outreach stays new; follow-ups reply in thread when possible."""
+    try:
+        sid = UUID(shipment_id.strip())
+    except ValueError:
+        return "Error: shipment_id must be a valid UUID."
+    if not carrier_id and not carrier_email:
+        return "Error: carrier_id or carrier_email is required."
+    async with async_session() as session:
+        try:
+            out = await send_carrier_followup(
+                session,
+                shipment_id=sid,
+                carrier_id=carrier_id,
+                carrier_email=carrier_email,
+                dry_run=dry_run,
+                subject=subject,
+                message=message,
+            )
+            return out.model_dump_json(indent=2)
+        except RuntimeError as e:
+            return f"Error: {e}"
+
+
 def get_freight_tools():
     """Tools registered for the freight-capable agent."""
     return [
         freight_domain_foundation,
         freight_get_overview,
         freight_list_shipments,
+        freight_query_shipments,
         freight_get_shipment,
         freight_get_shipment_by_token,
         freight_update_shipment_details,
@@ -831,4 +901,5 @@ def get_freight_tools():
         freight_send_customer_quote,
         freight_handoff_shipment_to_tms,
         freight_send_carrier_outreach,
+        freight_send_carrier_followup,
     ]

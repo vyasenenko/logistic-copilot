@@ -52,6 +52,7 @@ class WorkflowEventType(str, Enum):
     SHIPMENT_PARSE_FAILED = "shipment_parse_failed"
     CLIENT_ACK_SENT = "client_ack_sent"
     CARRIER_OUTREACH_SENT = "carrier_outreach_sent"
+    CARRIER_FOLLOWUP_SENT = "carrier_followup_sent"
     BID_RECEIVED = "bid_received"
     BID_PARSE_FAILED = "bid_parse_failed"
     EVALUATION_COMPLETED = "evaluation_completed"
@@ -840,6 +841,8 @@ class CarrierOutreachItem(BaseModel):
     bid_id: str | None = None
     email_message_id: str | None = None
     status: str
+    delivery_mode: str | None = None
+    reply_to_provider_message_id: str | None = None
 
 
 class CarrierOutreachResponse(BaseModel):
@@ -852,6 +855,26 @@ class CarrierOutreachResponse(BaseModel):
     targeted: int = 0
     created_bids: int = 0
     results: list[CarrierOutreachItem] = Field(default_factory=list)
+
+
+class CarrierFollowupRequest(BaseModel):
+    carrier_id: str | None = None
+    carrier_email: str | None = None
+    dry_run: bool = True
+    subject: str | None = None
+    message: str
+
+
+class CarrierFollowupResponse(BaseModel):
+    shipment_id: str
+    carrier_id: str
+    carrier_email: str
+    subject: str
+    body: str
+    dry_run: bool
+    delivery_mode: str
+    reply_to_provider_message_id: str | None = None
+    email_message_id: str | None = None
 
 
 class BidIntakeRequest(BaseModel):
@@ -914,6 +937,8 @@ class ClientAcknowledgementResponse(BaseModel):
     subject: str
     body: str
     dry_run: bool
+    delivery_mode: str | None = None
+    reply_to_provider_message_id: str | None = None
 
 
 class BookingConfirmationResponse(BaseModel):
@@ -922,6 +947,8 @@ class BookingConfirmationResponse(BaseModel):
     subject: str
     body: str
     dry_run: bool
+    delivery_mode: str | None = None
+    reply_to_provider_message_id: str | None = None
 
 
 class CustomerQuoteRequest(BaseModel):
@@ -940,6 +967,8 @@ class CustomerQuoteResponse(BaseModel):
     margin_amount: float
     final_amount: float
     dry_run: bool
+    delivery_mode: str | None = None
+    reply_to_provider_message_id: str | None = None
 
 
 class TmsHandoffRequest(BaseModel):
@@ -968,6 +997,8 @@ class CustomerStatusReplyResponse(BaseModel):
     subject: str
     body: str
     dry_run: bool
+    delivery_mode: str | None = None
+    reply_to_provider_message_id: str | None = None
 
 
 class CustomerStatusReplyRequest(BaseModel):

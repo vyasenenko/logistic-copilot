@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -79,6 +79,72 @@ def _normalize_identifier(value: str | None) -> str | None:
         return None
     normalized = value.strip().upper().strip(" .,:;")
     return normalized or None
+
+
+async def _find_customer_reply_anchor(
+    session: AsyncSession,
+    *,
+    shipment: Shipment,
+    client_email: str | None,
+) -> EmailMessage | None:
+    """Find the first customer message we can use as a real Outlook reply anchor."""
+    if not shipment.email_thread_id:
+        return None
+
+    base_query = (
+        select(EmailMessage)
+        .where(
+            EmailMessage.thread_id == shipment.email_thread_id,
+            EmailMessage.direction == "inbound",
+            EmailMessage.provider_message_id.is_not(None),
+            EmailMessage.provider_message_id != "",
+        )
+        .order_by(EmailMessage.received_at.asc(), EmailMessage.created_at.asc())
+    )
+    normalized_client_email = (client_email or "").strip().lower()
+    if normalized_client_email:
+        client_anchor = await session.scalar(
+            base_query.where(func.lower(EmailMessage.sender) == normalized_client_email)
+        )
+        if client_anchor is not None:
+            return client_anchor
+    return await session.scalar(base_query)
+
+
+async def deliver_customer_thread_email(
+    session: AsyncSession,
+    *,
+    shipment: Shipment,
+    client_email: str,
+    subject: str,
+    body: str,
+    dry_run: bool,
+) -> dict:
+    """Send customer email as a reply to the first inbound message when possible."""
+    anchor = await _find_customer_reply_anchor(
+        session,
+        shipment=shipment,
+        client_email=client_email,
+    )
+    delivery_payload = {
+        "delivery_mode": "reply" if anchor is not None else "send_mail_fallback",
+        "reply_to_provider_message_id": (
+            anchor.provider_message_id if anchor is not None else None
+        ),
+    }
+    if dry_run:
+        return delivery_payload
+
+    outlook = OutlookGraphClient()
+    if anchor is not None:
+        await outlook.reply_to_message(
+            message_id=anchor.provider_message_id,
+            body=body,
+            recipients=[client_email],
+        )
+    else:
+        await outlook.send_mail(subject=subject, body=body, recipients=[client_email])
+    return delivery_payload
 
 
 def _humanize_status_value(value: str | None, default: str = "Unknown") -> str:
@@ -895,9 +961,14 @@ async def send_client_acknowledgement(
     body_lines.extend(["", "We'll follow up shortly with the best option available."])
     body = "\n".join(body_lines)
 
-    if not dry_run:
-        outlook = OutlookGraphClient()
-        await outlook.send_mail(subject=subject, body=body, recipients=[client.email])
+    delivery_payload = await deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email=client.email,
+        subject=subject,
+        body=body,
+        dry_run=dry_run,
+    )
 
     if shipment.email_thread_id:
         session.add(
@@ -908,7 +979,11 @@ async def send_client_acknowledgement(
                 direction="outbound",
                 subject=subject,
                 body_preview=body[:1000],
-                raw_payload_json={"type": "customer_ack", "dry_run": dry_run},
+                raw_payload_json={
+                    "type": "customer_ack",
+                    "dry_run": dry_run,
+                    **delivery_payload,
+                },
                 received_at=datetime.now(timezone.utc),
             )
         )
@@ -923,6 +998,7 @@ async def send_client_acknowledgement(
             "client_email": client.email,
             "dry_run": dry_run,
             "wait_window_minutes": wait_window,
+            **delivery_payload,
         },
     )
     session.add(ack_evt)
@@ -935,6 +1011,7 @@ async def send_client_acknowledgement(
         subject=subject,
         body=body,
         dry_run=dry_run,
+        **delivery_payload,
     )
 
 
@@ -1078,9 +1155,14 @@ async def send_customer_quote(
     body_lines.extend(["", "Reply OK to confirm booking."])
     body = "\n".join(body_lines)
 
-    if not dry_run:
-        outlook = OutlookGraphClient()
-        await outlook.send_mail(subject=subject, body=body, recipients=[client.email])
+    delivery_payload = await deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email=client.email,
+        subject=subject,
+        body=body,
+        dry_run=dry_run,
+    )
 
     if shipment.email_thread_id:
         session.add(
@@ -1091,7 +1173,11 @@ async def send_customer_quote(
                 direction="outbound",
                 subject=subject,
                 body_preview=body[:1000],
-                raw_payload_json={"type": "customer_quote", "dry_run": dry_run},
+                raw_payload_json={
+                    "type": "customer_quote",
+                    "dry_run": dry_run,
+                    **delivery_payload,
+                },
                 received_at=datetime.now(timezone.utc),
             )
         )
@@ -1109,6 +1195,7 @@ async def send_customer_quote(
             "client_email": client.email,
             "final_amount": final_amount,
             "dry_run": dry_run,
+            **delivery_payload,
         },
     )
     session.add(quote_evt)
@@ -1125,6 +1212,7 @@ async def send_customer_quote(
         margin_amount=margin_amount,
         final_amount=final_amount,
         dry_run=dry_run,
+        **delivery_payload,
     )
 
 
@@ -1345,12 +1433,17 @@ async def send_booking_confirmation(
         )
         for existing_confirmation in result.scalars().all():
             if dict(existing_confirmation.raw_payload_json or {}).get("type") == "booking_confirmation":
+                existing_payload = dict(existing_confirmation.raw_payload_json or {})
                 return BookingConfirmationResponse(
                     shipment_id=str(shipment.id),
                     client_email=client.email,
                     subject=existing_confirmation.subject,
                     body=existing_confirmation.body_preview,
                     dry_run=False,
+                    delivery_mode=existing_payload.get("delivery_mode"),
+                    reply_to_provider_message_id=existing_payload.get(
+                        "reply_to_provider_message_id"
+                    ),
                 )
 
     subject = attach_quote_token(
@@ -1375,9 +1468,15 @@ async def send_booking_confirmation(
     body_lines.extend(["", "We'll keep you updated with the next status changes."])
     body = "\n".join(body_lines)
 
-    if not dry_run:
-        outlook = OutlookGraphClient()
-        await outlook.send_mail(subject=subject, body=body, recipients=[client.email])
+    delivery_payload = await deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email=client.email,
+        subject=subject,
+        body=body,
+        dry_run=dry_run,
+        **delivery_payload,
+    )
 
     if shipment.email_thread_id:
         session.add(
@@ -1388,7 +1487,11 @@ async def send_booking_confirmation(
                 direction="outbound",
                 subject=subject,
                 body_preview=body[:1000],
-                raw_payload_json={"type": "booking_confirmation", "dry_run": dry_run},
+                raw_payload_json={
+                    "type": "booking_confirmation",
+                    "dry_run": dry_run,
+                    **delivery_payload,
+                },
                 received_at=datetime.now(timezone.utc),
             )
         )
@@ -1491,12 +1594,17 @@ async def send_customer_status_reply(
                 "milestone": existing_status.get("milestone"),
             }
             if comparable == latest_status:
+                existing_delivery = {
+                    "delivery_mode": payload.get("delivery_mode"),
+                    "reply_to_provider_message_id": payload.get("reply_to_provider_message_id"),
+                }
                 return CustomerStatusReplyResponse(
                     shipment_id=str(shipment.id),
                     client_email=client.email,
                     subject=existing_reply.subject,
                     body=existing_reply.body_preview,
                     dry_run=False,
+                    **existing_delivery,
                 )
 
     subject = attach_quote_token(
@@ -1525,9 +1633,15 @@ async def send_customer_status_reply(
     if body_override:
         body = body_override.strip()
 
-    if not dry_run:
-        outlook = OutlookGraphClient()
-        await outlook.send_mail(subject=subject, body=body, recipients=[client.email])
+    delivery_payload = await deliver_customer_thread_email(
+        session,
+        shipment=shipment,
+        client_email=client.email,
+        subject=subject,
+        body=body,
+        dry_run=dry_run,
+        **delivery_payload,
+    )
 
     if shipment.email_thread_id:
         session.add(
@@ -1545,6 +1659,7 @@ async def send_customer_status_reply(
                     "custom_message": custom_message,
                     "subject": subject,
                     "body": body,
+                    **delivery_payload,
                 },
                 received_at=datetime.now(timezone.utc),
             )
@@ -1566,6 +1681,7 @@ async def send_customer_status_reply(
                 "subject": subject,
                 "body": body,
                 "custom_message": custom_message,
+                **delivery_payload,
                 **status_payload,
             },
         ),

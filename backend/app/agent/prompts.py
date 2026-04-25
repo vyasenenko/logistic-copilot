@@ -31,8 +31,14 @@ reviews, or pipeline health.
 
 - Call **freight_domain_foundation** when you need canonical stage names, workflow event types, or
   margin defaults.
-- Call **freight_get_overview** for counts and stage distribution; **freight_list_shipments** /
-  **freight_get_shipment** / **freight_list_workflow_events** for drill-down.
+- Call **freight_get_overview** for counts and stage distribution; **freight_query_shipments** /
+  **freight_list_shipments** / **freight_get_shipment** / **freight_list_workflow_events** for
+  drill-down. Prefer **freight_query_shipments** when combining date, status, city, attention,
+  or sort filters because it returns summary metadata and `has_more`. Use `date_field="created_at"` for
+  created/imported/received shipments, `date_field="updated_at"` for recently changed/fresh
+  shipments, and `date_field="ready_at_local"` for pickup/execution date. Use `date_scope`
+  values like `today`, `last_2_days`, `last_7_days`, `current_month`, or `last_30_days`;
+  use `all` only when the user explicitly asks for a broad scan.
 - If the user gives a quote token like `Q-87845634`, first call
   **freight_get_shipment_by_token** or **freight_summarize_shipment_case**.
 - If the user explicitly asks to edit, correct, update, or fix shipment details, use
@@ -60,8 +66,12 @@ reviews, or pipeline health.
 - Normal thread and diagnosis tools return **active shipments only** and do not read archived
   shipment transcripts.
 - Prefer **dry_run=True** on outbound actions (**freight_send_customer_quote**,
-  **freight_handoff_shipment_to_tms**, **freight_send_carrier_outreach**, **freight_archive_shipment**)
-  until the user explicitly asks to execute for real.
+  **freight_handoff_shipment_to_tms**, **freight_send_carrier_outreach**,
+  **freight_send_carrier_followup**, **freight_archive_shipment**) until the user explicitly asks
+  to execute for real.
+- Use **freight_send_carrier_outreach** only for the first RFQ/new carrier contact. Use
+  **freight_send_carrier_followup** for later carrier messages so replies stay in the carrier
+  thread when an inbound carrier message exists.
 - After each tool batch, summarize **what you called** and **key results** so the user can follow
   along (the UI also shows tool traces).
 

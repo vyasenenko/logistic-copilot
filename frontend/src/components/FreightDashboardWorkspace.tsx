@@ -3046,7 +3046,7 @@ export function FreightDashboardWorkspace() {
           <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
           <div className="pointer-events-none absolute inset-y-0 right-[26%] w-px bg-cyan-200/8" />
 
-          <div className="relative grid gap-4 xl:grid-cols-[minmax(0,1fr),minmax(680px,1.12fr)] xl:items-center">
+          <div className="relative grid gap-4 lg:grid-cols-[minmax(0,1fr),minmax(560px,1.02fr)] lg:items-center xl:grid-cols-[minmax(0,1fr),minmax(680px,1.12fr)]">
             <div className="min-w-0 space-y-3">
               <div className="flex flex-wrap items-center gap-3">
                 <div className="inline-flex h-9 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[11px] uppercase tracking-[0.24em] text-cyan-100">
@@ -3067,7 +3067,7 @@ export function FreightDashboardWorkspace() {
               </div>
             </div>
 
-            <div className="grid gap-1.5 sm:grid-cols-2 xl:grid-cols-6">
+            <div className="grid grid-cols-3 gap-1.5 xl:grid-cols-6">
                 {metrics.map((metric) => (
                   <div key={metric.label} className="min-h-[68px] rounded-[13px] border border-cyan-200/10 bg-slate-950/26 px-2.5 py-2 backdrop-blur">
                     <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/48">{metric.label}</p>
@@ -3120,7 +3120,7 @@ export function FreightDashboardWorkspace() {
         {notice && <div className="glass-panel-strong border-cyan-400/20 px-5 py-4 text-sm text-cyan-100">{notice}</div>}
 
         <section className="glass-panel p-4">
-          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
             {[
               { key: "shipments", label: "Shipments", icon: Package2 },
               { key: "clients", label: "Customers", icon: Users },
@@ -3152,14 +3152,14 @@ export function FreightDashboardWorkspace() {
           <section className="space-y-4">
             <div className="glass-panel overflow-visible px-4 py-4">
               <div className="flex flex-col gap-4">
-                <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                   <div>
                     <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Board controls</p>
                     <p className="mt-1 text-sm text-slate-300">
                       Search shipments, switch created month, and control the live board from one surface.
                     </p>
                   </div>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-wrap gap-2 lg:ml-4 lg:justify-end">
                     {(["today", "attention", "all"] as const).map((filter) => (
                       <button
                         key={filter}
