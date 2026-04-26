@@ -22,6 +22,7 @@ import {
   ClipboardCheck,
   Clock3,
   Loader2,
+  LucideIcon,
   Mail,
   MapPin,
   MoreHorizontal,
@@ -40,7 +41,7 @@ import {
 } from "lucide-react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const OUTLOOK_STATUS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const OUTLOOK_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers" | "archive";
 type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
@@ -48,11 +49,15 @@ type DrawerMode = "overview" | "edit";
 type DrawerMobileTab = "details" | "thread";
 type ThreadTab = "timeline" | "client" | "carrier_quotes" | "system";
 type ArchiveReasonCode = "duplicate" | "cancelled" | "parsed_error" | "fraud" | "test" | "non_delivery_bounce" | "other";
+type FraudBlockScope = "sender_email" | "sender_domain";
+type SenderIdentityRole = "customer" | "carrier";
+type SenderTrustScope = FraudBlockScope;
 type EditFocusTarget = "client_id" | "equipment_type" | "origin" | "destination" | "pallets" | "weight_lb" | "ready_at" | "delivery_at" | "notes";
 type StatusQueueAction = "preview" | "approve_and_send" | "approve_and_push" | "rebuild_draft" | "retry_push" | "dismiss";
 type OperatorAction =
   | "resume_workflow"
   | "approve_and_continue"
+  | "request_customer_details"
   | "rerun_parsing"
   | "rerun_outreach"
   | "rerun_evaluation"
@@ -62,6 +67,8 @@ type OperatorAction =
   | "rerun_document_extraction"
   | "approve_document_values"
   | "ignore_document_warning"
+  | "verify_sender"
+  | "mark_sender_fraud"
   | "archive_shipment";
 
 interface OverviewResponse {
@@ -135,6 +142,7 @@ interface ShipmentRecord {
   ai_missing_fields: string[];
   ai_ambiguity_reasons: string[];
   ai_next_action: string | null;
+  customer_clarification_requested: boolean;
   booking_state: string | null;
   booking_error: string | null;
   tms_handoff_status: string | null;
@@ -160,6 +168,18 @@ interface ShipmentRecord {
   status_stale: boolean;
   status_sla_hours: number | null;
   manual_review_required: boolean;
+  sender_known: boolean;
+  sender_verification_required: boolean;
+  fraud_risk_level: string | null;
+  fraud_risk_reasons: string[];
+  fraud_score: number | null;
+  sender_email: string | null;
+  sender_domain: string | null;
+  sender_verified_at: string | null;
+  sender_verified_for_email: string | null;
+  sender_verified_for_domain: string | null;
+  sender_verified_role: SenderIdentityRole | null;
+  sender_verified_scope: SenderTrustScope | null;
   board_stage: string | null;
   attention_state: string;
   attention_reason: string | null;
@@ -288,10 +308,25 @@ interface OutlookWebhookStatusResponse {
 }
 
 interface ShipmentOperatorActionResponse {
+  shipment_id?: string;
+  action?: OperatorAction;
+  status?: string;
   message: string;
+  next_action?: string;
+  manual_review_required?: boolean;
   archived?: boolean;
   suppression_applied?: boolean;
   suppressed_thread_id?: string | null;
+  denylist_entry_id?: string | null;
+  denylist_scope?: FraudBlockScope | null;
+  denylist_value?: string | null;
+  sender_identity_role?: SenderIdentityRole | null;
+  sender_trust_scope?: SenderTrustScope | null;
+  verified_sender_email?: string | null;
+  verified_sender_domain?: string | null;
+  verified_client_id?: string | null;
+  verified_carrier_id?: string | null;
+  decision?: Record<string, unknown>;
 }
 
 interface ShipmentMagicFillResponse {
@@ -318,6 +353,8 @@ interface ShipmentThreadMessageRecord {
   body_preview: string;
   display_body: string;
   has_raw_payload: boolean;
+  dry_run: boolean;
+  message_type: string | null;
 }
 
 interface ShipmentThreadResponse {
@@ -369,6 +406,12 @@ function threadMessageVisual(message: ShipmentThreadMessageRecord) {
     };
   }
   if (message.direction === "outbound") {
+    if (message.dry_run) {
+      return {
+        card: "border-amber-300/18 bg-amber-300/10 shadow-[0_0_0_1px_rgba(252,211,77,0.04)]",
+        label: "Preview",
+      };
+    }
     return {
       card: "border-cyan-300/18 bg-cyan-300/10 shadow-[0_0_0_1px_rgba(134,239,255,0.04)]",
       label: "Outbound",
@@ -474,6 +517,7 @@ interface ShipmentActionModel {
 interface ArchiveDialogState {
   shipmentId: string;
   shipmentLabel: string;
+  fraudBlockScope?: FraudBlockScope;
 }
 
 const ARCHIVE_REASON_OPTIONS: Array<{ value: ArchiveReasonCode | "all"; label: string; helper: string }> = [
@@ -687,6 +731,11 @@ function formatRoute(shipment: ShipmentRecord) {
   return `${shipment.origin || "Origin TBD"} -> ${shipment.destination || "Destination TBD"}`;
 }
 
+function suggestedContactNameFromEmail(email: string | null) {
+  const localPart = (email || "").split("@", 1)[0] || "";
+  return localPart.replace(/[._-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase()) || "New contact";
+}
+
 function toDateTimeLocal(value: string | null) {
   if (!value) return "";
   const date = new Date(value);
@@ -714,7 +763,13 @@ function statusPillClass(status: string) {
 }
 
 function shipmentNeedsAttention(shipment: ShipmentRecord) {
-  return shipment.attention_state !== "none" || shipment.has_active_review;
+  return (
+    shipment.sender_verification_required ||
+    shipment.fraud_risk_level === "high" ||
+    shipment.fraud_risk_level === "medium" ||
+    shipment.attention_state !== "none" ||
+    shipment.has_active_review
+  );
 }
 
 function shipmentShowsDeliveryTime(shipment: ShipmentRecord | null) {
@@ -722,7 +777,19 @@ function shipmentShowsDeliveryTime(shipment: ShipmentRecord | null) {
   return ["booking_in_progress", "booking_failed", "booked"].includes(shipment.status);
 }
 
+/** Inbound identity still blocks automation until operator confirms trust. */
+function senderTrustGateActive(shipment: ShipmentRecord): boolean {
+  return (
+    shipment.sender_verification_required ||
+    shipment.fraud_risk_level === "high" ||
+    shipment.fraud_risk_level === "medium"
+  );
+}
+
 function shipmentBlockingBadge(shipment: ShipmentRecord) {
+  if (shipment.fraud_risk_level === "high") return "Probable fraud";
+  if (shipment.fraud_risk_level === "medium") return "Verify sender";
+  if (shipment.sender_verification_required) return "Verify sender";
   if (shipment.attention_state === "missing_details") return "Missing details";
   if (shipment.attention_state === "ambiguous") return "Ambiguous";
   if (shipment.attention_state === "review") return "Needs review";
@@ -731,6 +798,60 @@ function shipmentBlockingBadge(shipment: ShipmentRecord) {
   if (shipment.attention_state === "stale") return "Status stale";
   if (shipment.status === "waiting_bids") return "Waiting bids";
   return "Ready";
+}
+
+function shipmentFraudIndicators(shipment: ShipmentRecord) {
+  const indicators: Array<{
+    key: string;
+    icon: LucideIcon;
+    className: string;
+    title: string;
+  }> = [];
+
+  if (shipment.sender_verified_at) {
+    indicators.push({
+      key: "sender-verified",
+      icon: CheckCircle2,
+      className: "border-emerald-300/30 bg-emerald-300/12 text-emerald-100",
+      title: `Sender trust confirmed${
+        shipment.sender_verified_for_email ? ` for ${shipment.sender_verified_for_email}` : ""
+      } on ${formatDate(shipment.sender_verified_at)}.`,
+    });
+  }
+
+  if (shipment.fraud_risk_level === "high") {
+    indicators.push({
+      key: "probable-fraud",
+      icon: AlertTriangle,
+      className: "border-rose-300/25 bg-rose-300/12 text-rose-100",
+      title: `Probable fraud${shipment.fraud_risk_reasons.length ? `: ${shipment.fraud_risk_reasons.join(", ").replaceAll("_", " ")}` : ""}`,
+    });
+  } else if (shipment.sender_verification_required || shipment.fraud_risk_level === "medium") {
+    indicators.push({
+      key: "verify-sender",
+      icon: Mail,
+      className: "border-amber-300/25 bg-amber-300/12 text-amber-100",
+      title: "Sender verification required before automation continues.",
+    });
+  } else if (shipment.sender_known) {
+    indicators.push({
+      key: "known-sender",
+      icon: ShieldCheck,
+      className: "border-emerald-300/25 bg-emerald-300/12 text-emerald-100",
+      title: "Sender matches a known identity.",
+    });
+  }
+
+  if (shipment.manual_review_required && shipment.fraud_risk_level !== "high" && !shipment.sender_verification_required) {
+    indicators.push({
+      key: "manual-review",
+      icon: AlertTriangle,
+      className: "border-amber-300/20 bg-amber-300/10 text-amber-100",
+      title: shipment.attention_reason || "Operator review required.",
+    });
+  }
+
+  return indicators;
 }
 
 function hasMinimumFields(editor: ShipmentEditorState) {
@@ -756,6 +877,18 @@ function deriveShipmentActionModel(
     { key: "edit", label: "Edit details" },
     { key: "rerun_parsing", label: "Re-run parsing", operatorAction: "rerun_parsing" },
   ];
+  const canRequestCustomerDetails =
+    !shipment.customer_clarification_requested &&
+    (shipment.status === "waiting_customer_details" || shipment.ai_missing_fields.length > 0);
+
+  if (canRequestCustomerDetails) {
+    baseActions.push({
+      key: "request_customer_details",
+      label: "Request additional details",
+      operatorAction: "request_customer_details",
+      tone: "warning",
+    });
+  }
 
   if (shipment.status === "waiting_bids" || shipment.status === "outreaching") {
     baseActions.push({ key: "rerun_outreach", label: "Re-run outreach", operatorAction: "rerun_outreach" });
@@ -774,15 +907,30 @@ function deriveShipmentActionModel(
   }
   baseActions.push({ key: "archive_shipment", label: "Archive and ignore source", operatorAction: "archive_shipment", tone: "warning" });
 
+  if (senderTrustGateActive(shipment)) {
+    return {
+      label: "Resolve sender identity",
+      reason: "Inbound identity was flagged. Use the Sender trust panel below to identify the sender as a customer or carrier, or block it as fraud.",
+      blockingReason: "Choose Customer or Carrier in the Sender trust panel before automation can continue.",
+      operatorAction: null,
+      requiresSave: true,
+      contextActions: baseActions,
+    };
+  }
+
   if (!hasMinimumFields(editor)) {
     const missing = ["origin", "destination", "pallets", "weight_lb", "equipment_type", "ready_at"].filter(
       (field) => !editor[field as keyof ShipmentEditorState],
     );
     return {
-      label: null,
-      reason: "Fill in the missing shipment fields first. Until then, the system should not continue automation.",
-      blockingReason: `Missing: ${missing.map((field) => field.replaceAll("_", " ")).join(", ")}`,
-      operatorAction: null,
+      label: canRequestCustomerDetails ? "Request additional details" : null,
+      reason: shipment.customer_clarification_requested
+        ? "Additional details were already requested from the customer. Waiting for their reply."
+        : "Fill in the missing shipment fields first, or ask the customer for the missing details.",
+      blockingReason: shipment.customer_clarification_requested
+        ? "Customer details already requested."
+        : `Missing: ${missing.map((field) => field.replaceAll("_", " ")).join(", ")}`,
+      operatorAction: canRequestCustomerDetails ? "request_customer_details" : null,
       requiresSave: false,
       contextActions: baseActions,
     };
@@ -1057,6 +1205,11 @@ export function FreightDashboardWorkspace() {
   const [deliveryPickerOpenSignal, setDeliveryPickerOpenSignal] = useState(0);
   const [clientForm, setClientForm] = useState({ name: "", email: "", default_margin_percent: "15", default_margin_floor: "0" });
   const [carrierForm, setCarrierForm] = useState({ name: "", email: "", rating: "0", regions: "midwest,northeast", equipment: "dry van" });
+  const [senderIdentityRole, setSenderIdentityRole] = useState<SenderIdentityRole>("customer");
+  const [senderTrustScope, setSenderTrustScope] = useState<SenderTrustScope>("sender_email");
+  const [senderClientId, setSenderClientId] = useState("");
+  const [senderCarrierId, setSenderCarrierId] = useState("");
+  const [senderContactName, setSenderContactName] = useState("");
   const drawerScrollRef = useRef<HTMLDivElement | null>(null);
   const monthPickerRef = useRef<HTMLDivElement | null>(null);
   const overviewRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1095,6 +1248,38 @@ export function FreightDashboardWorkspace() {
   const selectedClient = useMemo(
     () => (selectedShipment?.client_id ? clients.find((client) => client.id === selectedShipment.client_id) || null : null),
     [clients, selectedShipment],
+  );
+  const senderEmailNormalized = (selectedShipment?.sender_email || "").trim().toLowerCase();
+  const senderDomainNormalized = (selectedShipment?.sender_domain || "").trim().toLowerCase();
+  const matchingSenderClients = useMemo(
+    () =>
+      clients.filter((client) => {
+        const email = client.email.trim().toLowerCase();
+        const domain = email.includes("@") ? email.split("@", 2)[1] : "";
+        return senderTrustScope === "sender_domain"
+          ? Boolean(senderDomainNormalized && domain === senderDomainNormalized)
+          : Boolean(senderEmailNormalized && email === senderEmailNormalized);
+      }),
+    [clients, senderDomainNormalized, senderEmailNormalized, senderTrustScope],
+  );
+  const matchingSenderCarriers = useMemo(
+    () =>
+      carriers.filter((carrier) => {
+        const email = carrier.email.trim().toLowerCase();
+        const domain = email.includes("@") ? email.split("@", 2)[1] : "";
+        return senderTrustScope === "sender_domain"
+          ? Boolean(senderDomainNormalized && domain === senderDomainNormalized)
+          : Boolean(senderEmailNormalized && email === senderEmailNormalized);
+      }),
+    [carriers, senderDomainNormalized, senderEmailNormalized, senderTrustScope],
+  );
+  const selectedSenderClient = useMemo(
+    () => (senderClientId ? clients.find((client) => client.id === senderClientId) || null : null),
+    [clients, senderClientId],
+  );
+  const selectedSenderCarrier = useMemo(
+    () => (senderCarrierId ? carriers.find((carrier) => carrier.id === senderCarrierId) || null : null),
+    [carriers, senderCarrierId],
   );
   const threadData = useMemo(
     () => (selectedShipmentId ? threadCache[selectedShipmentId] || null : null),
@@ -1882,6 +2067,14 @@ export function FreightDashboardWorkspace() {
   }, [selectedShipment]);
 
   useEffect(() => {
+    setSenderIdentityRole(selectedShipment?.sender_verified_role || "customer");
+    setSenderTrustScope(selectedShipment?.sender_verified_scope || "sender_email");
+    setSenderClientId(selectedShipment?.client_id || "");
+    setSenderCarrierId("");
+    setSenderContactName(suggestedContactNameFromEmail(selectedShipment?.sender_email || null));
+  }, [selectedShipment?.id, selectedShipment?.sender_email, selectedShipment?.sender_verified_role, selectedShipment?.sender_verified_scope, selectedShipment?.client_id]);
+
+  useEffect(() => {
     if (drawerMode !== "edit" || !pendingEditFocus) return;
     requestAnimationFrame(() => {
       if (pendingEditFocus === "ready_at") {
@@ -1988,6 +2181,24 @@ export function FreightDashboardWorkspace() {
     }
   }
 
+  function openFraudArchiveDialog(shipmentId?: string, fraudBlockScope: FraudBlockScope = "sender_email") {
+    const targetShipmentId = shipmentId || selectedShipment?.id;
+    if (!targetShipmentId) return;
+    const targetShipment = shipments.find((shipment) => shipment.id === targetShipmentId) || selectedShipment;
+    setContextMenu(null);
+    setArchiveReasonCode("fraud");
+    setArchiveReasonNote(
+      fraudBlockScope === "sender_domain"
+        ? "sender domain flagged as fraud by operator"
+        : "sender email flagged as fraud by operator",
+    );
+    setArchiveDialog({
+      shipmentId: targetShipmentId,
+      shipmentLabel: targetShipment ? formatRoute(targetShipment) : "this shipment",
+      fraudBlockScope,
+    });
+  }
+
   function updateBoardMonth(nextMonth: string) {
     setSelectedBoardMonth(nextMonth);
   }
@@ -2004,10 +2215,11 @@ export function FreightDashboardWorkspace() {
       const response = await fetchJson<ShipmentOperatorActionResponse>(`/api/freight/shipments/${archiveDialog.shipmentId}/operator-action`, {
         method: "POST",
         body: JSON.stringify({
-          action: "archive_shipment",
+          action: archiveDialog.fraudBlockScope && archiveReasonCode === "fraud" ? "mark_sender_fraud" : "archive_shipment",
           reason_code: archiveReasonCode,
           reason_note: archiveReasonNote.trim() || null,
           suppress_source_thread: true,
+          fraud_block_scope: archiveDialog.fraudBlockScope || null,
         }),
       });
       setNotice(response.message);
@@ -2240,12 +2452,79 @@ export function FreightDashboardWorkspace() {
     }
   }
 
+  async function handleVerifySenderIdentity() {
+    if (!selectedShipment?.sender_email) {
+      setError("No inbound sender email is available for verification.");
+      return;
+    }
+    setSubmitting("verify_sender");
+    setError(null);
+    try {
+      let clientId = senderClientId || "";
+      let carrierId = senderCarrierId || "";
+      if (senderIdentityRole === "customer" && !clientId) {
+        const createdClient = await fetchJson<ClientRecord>("/api/freight/clients", {
+          method: "POST",
+          body: JSON.stringify({
+            name: senderContactName.trim() || suggestedContactNameFromEmail(selectedShipment.sender_email),
+            email: selectedShipment.sender_email,
+            is_active: true,
+            default_margin_percent: Number(clientForm.default_margin_percent || 15),
+            default_margin_floor: Number(clientForm.default_margin_floor || 0),
+          }),
+        });
+        clientId = createdClient.id;
+        setClients((current) => [createdClient, ...current]);
+        setSenderClientId(createdClient.id);
+      }
+      if (senderIdentityRole === "carrier" && !carrierId) {
+        const createdCarrier = await fetchJson<CarrierRecord>("/api/freight/carriers", {
+          method: "POST",
+          body: JSON.stringify({
+            name: senderContactName.trim() || suggestedContactNameFromEmail(selectedShipment.sender_email),
+            email: selectedShipment.sender_email,
+            rating: 0,
+            is_active: true,
+            regions: [],
+            equipment: [],
+            metadata: {},
+          }),
+        });
+        carrierId = createdCarrier.id;
+        setCarriers((current) => [createdCarrier, ...current]);
+        setSenderCarrierId(createdCarrier.id);
+      }
+      const response = await fetchJson<ShipmentOperatorActionResponse>(`/api/freight/shipments/${selectedShipment.id}/operator-action`, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "verify_sender",
+          sender_identity_role: senderIdentityRole,
+          sender_trust_scope: senderTrustScope,
+          client_id: senderIdentityRole === "customer" ? clientId : null,
+          carrier_id: senderIdentityRole === "carrier" ? carrierId : null,
+        }),
+      });
+      setNotice(response.message);
+      await Promise.all([
+        refreshSelectedShipment(selectedShipment.id),
+        refreshOverview(),
+        refreshFinancialSummary(),
+        refreshReviewQueue(),
+        refreshStatusQueue(),
+      ]);
+      await refreshSelectedShipmentContext(selectedShipment.id);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to verify sender identity.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
   async function loadWebhookStatus(options?: { silent?: boolean; allowCache?: boolean }) {
     if (options?.allowCache) {
       const cachedStatus = readCachedOutlookStatus(OUTLOOK_STATUS_STORAGE_KEY);
       if (cachedStatus) {
         setWebhookStatus(cachedStatus);
-        return;
       }
     }
     setOutlookStatusLoading(true);
@@ -2268,7 +2547,7 @@ export function FreightDashboardWorkspace() {
 
   async function handleEnsureWebhook() {
     setSubmitting("webhook");
-    setSyncMenuOpen(false);
+    setError(null);
     try {
       const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/ensure", {
         method: "POST",
@@ -2352,6 +2631,30 @@ export function FreightDashboardWorkspace() {
       setNotice(`Customer quote preview ready at $${response.final_amount.toFixed(2)}.`);
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to build quote preview.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleSendCustomerQuote() {
+    if (!selectedShipment) return;
+    setSubmitting("send_quote");
+    try {
+      const response = await fetchJson<CustomerQuoteResponse>(`/api/freight/shipments/${selectedShipment.id}/quote`, {
+        method: "POST",
+        body: JSON.stringify({ bid_id: evaluation?.selected_bid_id || selectedWinningBid?.id || null, dry_run: false }),
+      });
+      setQuotePreview(response);
+      setNotice(`Customer quote sent at $${response.final_amount.toFixed(2)}.`);
+      await Promise.all([
+        refreshSelectedShipment(selectedShipment.id),
+        refreshOverview(),
+        refreshFinancialSummary(),
+      ]);
+      await refreshSelectedShipmentContext(selectedShipment.id);
+      await loadShipmentThread(selectedShipment.id, true);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to send customer quote.");
     } finally {
       setSubmitting(null);
     }
@@ -2752,7 +3055,7 @@ export function FreightDashboardWorkspace() {
               <div>
                 <h2 className="text-2xl font-semibold tracking-[-0.04em] text-white">{formatRoute(selectedShipment)}</h2>
                 <p className="mt-2 text-sm text-[var(--text-muted)]">
-                  Customer {selectedShipment.client_id ? "linked" : "not linked"} • Created {formatDate(selectedShipment.created_at)} • Confidence {formatConfidence(selectedShipment.ai_confidence)} • Last agent decision {selectedShipment.next_step_label || selectedShipment.ai_next_action || "pending"}
+                  Customer {selectedShipment.client_id ? "linked" : "not linked"} • Sender {selectedShipment.sender_verification_required ? "needs verification" : selectedShipment.sender_known ? "known" : "not linked"} • Created {formatDate(selectedShipment.created_at)} • Confidence {formatConfidence(selectedShipment.ai_confidence)} • Last agent decision {selectedShipment.next_step_label || selectedShipment.ai_next_action || "pending"}
                 </p>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
@@ -2844,6 +3147,11 @@ export function FreightDashboardWorkspace() {
                           ))}
                         </div>
                       )}
+                      {selectedShipment.customer_clarification_requested && (
+                        <p className="mt-3 rounded-2xl border border-emerald-300/15 bg-emerald-300/10 px-3 py-2 text-xs text-emerald-100">
+                          Additional details already requested from the customer.
+                        </p>
+                      )}
                     </div>
                     <div className="rounded-2xl bg-white/5 p-4">
                       <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Operator context</p>
@@ -2856,6 +3164,271 @@ export function FreightDashboardWorkspace() {
                           ))}
                         </div>
                       )}
+                    </div>
+                    <div
+                      className={`rounded-[24px] border p-5 md:col-span-2 ${
+                        senderTrustGateActive(selectedShipment)
+                          ? "border-amber-300/35 bg-gradient-to-br from-amber-300/14 via-slate-950/50 to-rose-300/12 shadow-[0_20px_60px_rgba(0,0,0,0.35)]"
+                          : selectedShipment.sender_verified_at
+                            ? "border-emerald-300/28 bg-gradient-to-br from-emerald-300/10 via-slate-950/45 to-cyan-300/8"
+                            : "border-white/10 bg-white/[0.04]"
+                      }`}
+                    >
+                      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            {senderTrustGateActive(selectedShipment) ? (
+                              <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-300/30 bg-amber-300/15 px-3 py-1 text-xs font-medium text-amber-50">
+                                <AlertTriangle size={14} className="shrink-0" />
+                                Action required
+                              </span>
+                            ) : selectedShipment.sender_verified_at ? (
+                              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-300/30 bg-emerald-300/15 px-3 py-1 text-xs font-medium text-emerald-50">
+                                <CheckCircle2 size={14} className="shrink-0" />
+                                Sender verified
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/8 px-3 py-1 text-xs font-medium text-white/90">
+                                <ShieldCheck size={14} className="shrink-0 text-emerald-200" />
+                                Identity
+                              </span>
+                            )}
+                            <span className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Inbound sender</span>
+                          </div>
+                          <p className="break-all text-lg font-semibold tracking-tight text-white">{selectedShipment.sender_email || "Unknown sender"}</p>
+                          <p className="text-sm text-[var(--text-muted)]">
+                            Domain <span className="text-white/90">{selectedShipment.sender_domain || "—"}</span>
+                            {" • "}
+                            Risk <span className="text-white/90">{selectedShipment.fraud_risk_level || "none"}</span>
+                            {selectedShipment.fraud_score !== null && selectedShipment.fraud_score !== undefined ? (
+                              <>
+                                {" • "}
+                                Score{" "}
+                                <span className="text-white/90">{`${Math.round(Number(selectedShipment.fraud_score) * 100)}%`}</span>
+                              </>
+                            ) : null}
+                          </p>
+                        </div>
+                        <div className="min-w-[240px] max-w-md rounded-2xl border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)]">
+                          <p className="text-xs uppercase tracking-[0.16em] text-white/50">Verification status</p>
+                          <p className="mt-2 text-white">
+                            {selectedShipment.sender_verified_at
+                              ? `Verified as ${selectedShipment.sender_verified_role || "sender"}`
+                              : senderTrustGateActive(selectedShipment)
+                                ? "Identity not confirmed"
+                                : "No verification blocker"}
+                          </p>
+                          {selectedShipment.sender_verified_scope ? (
+                            <p className="mt-1 break-all text-xs text-[var(--text-muted)]">
+                              Scope: {selectedShipment.sender_verified_scope === "sender_domain" ? selectedShipment.sender_verified_for_domain : selectedShipment.sender_verified_for_email}
+                            </p>
+                          ) : (
+                            <p className="mt-1 text-xs text-[var(--text-muted)]">
+                              Choose Customer or Carrier below, then verify email/domain.
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      {selectedShipment.sender_verified_at ? (
+                        <p className="mt-4 border-t border-white/10 pt-4 text-sm text-emerald-100/90">
+                          Trust recorded on {formatDate(selectedShipment.sender_verified_at)}
+                          {selectedShipment.sender_verified_for_email ? (
+                            <span className="block break-all text-xs text-[var(--text-muted)]">Address: {selectedShipment.sender_verified_for_email}</span>
+                          ) : null}
+                        </p>
+                      ) : senderTrustGateActive(selectedShipment) ? (
+                        <div className="mt-4 space-y-4 border-t border-white/10 pt-4">
+                          <div className="rounded-[22px] border border-cyan-300/18 bg-cyan-300/[0.06] p-4">
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                              <div>
+                                <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/70">Verify sender</p>
+                                <h4 className="mt-1 text-lg font-semibold text-white">Identify who owns this email</h4>
+                                <p className="mt-2 text-sm leading-6 text-cyan-50/80">
+                                  Confirm the sender as a customer or carrier, choose whether trust applies to this email only or the whole domain, then continue automation.
+                                </p>
+                              </div>
+                              <span className="w-fit rounded-full border border-amber-300/25 bg-amber-300/10 px-3 py-1 text-xs text-amber-100">
+                                Required
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="grid gap-3 xl:grid-cols-3">
+                            <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+                              <div className="flex items-center gap-2">
+                                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-white/10 text-xs font-semibold text-white">1</span>
+                                <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Sender type</p>
+                              </div>
+                              <div className="mt-3 grid gap-2">
+                                {(["customer", "carrier"] as SenderIdentityRole[]).map((role) => (
+                                  <button
+                                    key={role}
+                                    type="button"
+                                    onClick={() => {
+                                      setSenderIdentityRole(role);
+                                      setSenderClientId(role === "customer" ? selectedShipment.client_id || "" : "");
+                                      setSenderCarrierId("");
+                                    }}
+                                    className={`rounded-2xl border px-4 py-3 text-left transition ${
+                                      senderIdentityRole === role
+                                        ? "border-cyan-300/45 bg-cyan-300/14 text-cyan-50"
+                                        : "border-white/10 bg-white/5 text-white hover:bg-white/10"
+                                    }`}
+                                  >
+                                    <span className="block text-sm font-semibold">{role === "customer" ? "Customer" : "Carrier"}</span>
+                                    <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                                      {role === "customer" ? "Shipper, broker, or buyer requesting a quote." : "Carrier replying with bids or shipment updates."}
+                                    </span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+                              <div className="flex items-center gap-2">
+                                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-white/10 text-xs font-semibold text-white">2</span>
+                                <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Trust scope</p>
+                              </div>
+                              <div className="mt-3 grid gap-2">
+                                {([
+                                  ["sender_email", "Only this email", selectedShipment.sender_email || "Unknown sender"],
+                                  ["sender_domain", "Entire domain", selectedShipment.sender_domain || "Unknown domain"],
+                                ] as const).map(([scope, label, detail]) => (
+                                  <button
+                                    key={scope}
+                                    type="button"
+                                    onClick={() => {
+                                      setSenderTrustScope(scope);
+                                      setSenderClientId(selectedShipment.client_id || "");
+                                      setSenderCarrierId("");
+                                    }}
+                                    className={`rounded-2xl border px-4 py-3 text-left transition ${
+                                      senderTrustScope === scope
+                                        ? "border-cyan-300/45 bg-cyan-300/14 text-cyan-50"
+                                        : "border-white/10 bg-white/5 text-white hover:bg-white/10"
+                                    }`}
+                                  >
+                                    <span className="block text-sm font-semibold">{label}</span>
+                                    <span className="mt-1 block break-all text-xs text-[var(--text-muted)]">{detail}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+                              <div className="flex items-center gap-2">
+                                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-white/10 text-xs font-semibold text-white">3</span>
+                                <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Contact record</p>
+                              </div>
+                              {(() => {
+                                const matches = senderIdentityRole === "customer" ? matchingSenderClients : matchingSenderCarriers;
+                                const selectedContact = senderIdentityRole === "customer" ? selectedSenderClient : selectedSenderCarrier;
+                                const selectedId = senderIdentityRole === "customer" ? senderClientId : senderCarrierId;
+                                return (
+                                  <div className="mt-3 space-y-3">
+                                    <select
+                                      className="field-input"
+                                      value={selectedId}
+                                      onChange={(event) => {
+                                        if (senderIdentityRole === "customer") setSenderClientId(event.target.value);
+                                        else setSenderCarrierId(event.target.value);
+                                      }}
+                                    >
+                                      <option value="">Create new from sender email</option>
+                                      {matches.map((contact) => (
+                                        <option key={contact.id} value={contact.id}>
+                                          {contact.name} - {contact.email}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    {selectedContact ? (
+                                      <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/10 p-3 text-sm text-emerald-50">
+                                        <p className="font-medium">{selectedContact.name}</p>
+                                        <p className="mt-1 break-all text-xs text-emerald-100/75">{selectedContact.email}</p>
+                                      </div>
+                                    ) : (
+                                      <label className="block">
+                                        <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">New {senderIdentityRole} name</span>
+                                        <input
+                                          className="field-input"
+                                          value={senderContactName}
+                                          onChange={(event) => setSenderContactName(event.target.value)}
+                                          placeholder={suggestedContactNameFromEmail(selectedShipment.sender_email)}
+                                        />
+                                        <span className="mt-2 block break-all text-xs text-[var(--text-muted)]">
+                                          Will create {senderIdentityRole} with email {selectedShipment.sender_email || "unknown sender"}.
+                                        </span>
+                                      </label>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                            </div>
+                          </div>
+
+                          <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+                            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                              <div>
+                                <p className="text-sm font-semibold text-white">
+                                  {senderIdentityRole === "customer" ? (senderClientId ? "Link customer" : "Create customer") : senderCarrierId ? "Link carrier" : "Create carrier"} and verify{" "}
+                                  {senderTrustScope === "sender_domain" ? "domain" : "email"}
+                                </p>
+                                <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">
+                                  This records operator trust and resumes the safe automation flow.
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => void handleVerifySenderIdentity()}
+                                disabled={submitting !== null || !selectedShipment.sender_email}
+                                className="action-button bg-cyan-300 px-5 text-slate-950 hover:brightness-110 disabled:opacity-50"
+                              >
+                                {submitting === "verify_sender" ? "Verifying..." : "Verify sender"}
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="rounded-2xl border border-rose-300/20 bg-rose-300/8 p-4">
+                            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                              <div>
+                                <p className="text-sm font-semibold text-rose-50">Fraud or spam?</p>
+                                <p className="mt-1 text-xs leading-5 text-rose-100/75">
+                                  Blocking creates a denylist entry and archives this thread.
+                                </p>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                <button
+                                  onClick={() => openFraudArchiveDialog(selectedShipment.id, "sender_email")}
+                                  disabled={submitting !== null}
+                                  className="action-button border border-rose-300/35 bg-rose-300/15 px-4 py-2.5 text-sm font-semibold text-rose-100 hover:bg-rose-300/20 disabled:opacity-50"
+                                >
+                                  Block this email
+                                </button>
+                                <button
+                                  onClick={() => openFraudArchiveDialog(selectedShipment.id, "sender_domain")}
+                                  disabled={submitting !== null}
+                                  className="action-button border border-rose-300/25 bg-white/8 px-4 py-2.5 text-sm font-medium text-rose-50 hover:bg-rose-300/10 disabled:opacity-50"
+                                >
+                                  Block entire domain
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <p className="mt-4 border-t border-white/10 pt-4 text-sm text-[var(--text-muted)]">
+                          {selectedShipment.sender_known
+                            ? "Sender matches a known customer or carrier identity."
+                            : "No elevated risk flags on this shipment right now."}
+                        </p>
+                      )}
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        {(selectedShipment.fraud_risk_reasons.length > 0 ? selectedShipment.fraud_risk_reasons : ["no_specific_signals"]).map((reason) => (
+                          <span key={reason} className="rounded-full bg-white/8 px-3 py-1 text-xs text-white/85">
+                            {reason.replaceAll("_", " ")}
+                          </span>
+                        ))}
+                      </div>
                     </div>
                   </div>
 
@@ -2879,17 +3452,27 @@ export function FreightDashboardWorkspace() {
 
               {workspaceSection === "bids" && (
                 <div className="space-y-4">
-                  <div className="grid gap-3 md:grid-cols-3">
+                  <div className="grid gap-3 md:grid-cols-4">
                     <button onClick={() => void handleEvaluateBids()} disabled={bids.length === 0 || submitting !== null} className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">
                       Evaluate bids
                     </button>
                     <button onClick={() => void handlePreviewCustomerQuote()} disabled={bids.length === 0 || submitting !== null} className="action-button bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">
                       Preview customer quote
                     </button>
+                    <button onClick={() => void handleSendCustomerQuote()} disabled={bids.length === 0 || submitting !== null} className="action-button bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">
+                      Send customer quote
+                    </button>
                     <button onClick={() => void handleBookShipment()} disabled={bids.length === 0 || submitting !== null} className="action-button bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">
                       Book shipment
                     </button>
                   </div>
+                  {quotePreview && (
+                    <div className="rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-4">
+                      <p className="text-xs uppercase tracking-[0.16em] text-cyan-100">Customer quote preview</p>
+                      <p className="mt-2 text-white">{quotePreview.subject}</p>
+                      <p className="mt-2 whitespace-pre-wrap text-sm text-cyan-50">{quotePreview.body}</p>
+                    </div>
+                  )}
                   {evaluation && (
                     <div className="rounded-2xl bg-cyan-300/10 p-4 text-sm">
                       Winner: {selectedWinningBid?.carrier_name || "selected bid"} at ${evaluation.selected_amount.toFixed(2)}. Customer quote: ${evaluation.recommended_quote_amount.toFixed(2)}.
@@ -3201,6 +3784,11 @@ export function FreightDashboardWorkspace() {
                         {message.recipients.length > 0 && (
                           <p className="mt-1 break-all text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">
                             To: {message.recipients.join(", ")}
+                          </p>
+                        )}
+                        {message.dry_run && (
+                          <p className="mt-1 text-xs uppercase tracking-[0.14em] text-amber-100">
+                            Preview only. This email was not sent.
                           </p>
                         )}
                         <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">
@@ -3563,6 +4151,7 @@ export function FreightDashboardWorkspace() {
                         )}
                         {items.map((shipment) => {
                           const isSelected = shipment.id === selectedShipmentId;
+                          const fraudIndicators = shipmentFraudIndicators(shipment);
                           return (
                             <div
                               key={shipment.id}
@@ -3602,6 +4191,22 @@ export function FreightDashboardWorkspace() {
                                       }`}>
                                         {shipmentBlockingBadge(shipment)}
                                       </span>
+                                      {fraudIndicators.length > 0 && (
+                                        <div className="flex items-center gap-1">
+                                          {fraudIndicators.map((indicator) => {
+                                            const Icon = indicator.icon;
+                                            return (
+                                              <span
+                                                key={indicator.key}
+                                                title={indicator.title}
+                                                className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${indicator.className}`}
+                                              >
+                                                <Icon size={11} />
+                                              </span>
+                                            );
+                                          })}
+                                        </div>
+                                      )}
                                     </div>
                                     <span className="shrink-0 rounded-full bg-cyan-300/10 px-2 py-0.5 text-[10px] text-cyan-100">
                                       {formatConfidence(shipment.ai_confidence)}
@@ -4320,7 +4925,10 @@ export function FreightDashboardWorkspace() {
               <Package2 size={16} /> Open shipment
             </button>
             {actionModel.label && actionModel.operatorAction && (
-              <button onClick={() => void runStatefulPrimaryAction()} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-cyan-100 transition hover:bg-cyan-300/10">
+              <button
+                onClick={() => void runStatefulPrimaryAction()}
+                className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-cyan-100 transition hover:bg-cyan-300/10"
+              >
                 <CheckCircle2 size={16} /> {actionModel.label}
               </button>
             )}
@@ -4370,8 +4978,22 @@ export function FreightDashboardWorkspace() {
                       and its email source thread will be ignored during future syncs so it does not get recreated again.
                     </p>
                     <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm leading-6 text-slate-300">
-                      Use this for bounced emails, malformed AI-created shipments, duplicate noise, or any thread you want the automation loop to stop processing.
+                      {archiveDialog?.fraudBlockScope
+                        ? `This will block future messages from this ${
+                            archiveDialog.fraudBlockScope === "sender_domain" ? "domain" : "email address"
+                          }, archive the current shipment, and ignore the current source thread.`
+                        : "Use this for bounced emails, malformed AI-created shipments, duplicate noise, or any thread you want the automation loop to stop processing."}
                     </div>
+                    {archiveDialog?.fraudBlockScope && (
+                      <div className="mt-4 rounded-2xl border border-rose-300/25 bg-rose-300/10 p-4 text-sm leading-6 text-rose-50">
+                        <p className="font-semibold">
+                          Fraud denylist: {archiveDialog.fraudBlockScope === "sender_domain" ? "Block entire domain" : "Block this email"}
+                        </p>
+                        <p className="mt-1 text-rose-100/80">
+                          New matching emails will be saved for audit, tagged as fraud, archived, and will not start automation.
+                        </p>
+                      </div>
+                    )}
                     <div className="mt-4">
                       <label className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Archive reason</label>
                       <select
@@ -4406,7 +5028,11 @@ export function FreightDashboardWorkspace() {
                         disabled={submitting !== null}
                         className="action-button bg-amber-300 text-slate-950 hover:brightness-105 disabled:opacity-50"
                       >
-                        {submitting === "archive_shipment" ? "Archiving..." : "Archive and ignore source"}
+                        {submitting === "archive_shipment"
+                          ? "Working..."
+                          : archiveDialog?.fraudBlockScope
+                            ? "Block and archive"
+                            : "Archive and ignore source"}
                       </button>
                     </div>
                   </div>

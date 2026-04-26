@@ -93,6 +93,19 @@ class Carrier(Base):
     bids = relationship("CarrierBid", back_populates="carrier")
 
 
+class FraudDenylistEntry(Base):
+    __tablename__ = "fraud_denylist_entries"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope = Column(String(50), nullable=False)
+    value = Column(String(320), nullable=False)
+    reason = Column(String(500), nullable=True)
+    source_shipment_id = Column(UUID(as_uuid=True), ForeignKey("shipments.id"), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class EmailThread(Base):
     __tablename__ = "email_threads"
 
@@ -315,6 +328,31 @@ async def init_db() -> None:
         )
         await conn.execute(
             text("ALTER TABLE email_threads ADD COLUMN IF NOT EXISTS shipment_ingest_suppressed_at TIMESTAMP WITH TIME ZONE")
+        )
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS fraud_denylist_entries (
+                    id UUID PRIMARY KEY,
+                    scope VARCHAR(50) NOT NULL,
+                    value VARCHAR(320) NOT NULL,
+                    reason VARCHAR(500),
+                    source_shipment_id UUID REFERENCES shipments(id),
+                    is_active BOOLEAN DEFAULT TRUE NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+                )
+                """
+            )
+        )
+        await conn.execute(
+            text("ALTER TABLE fraud_denylist_entries ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()")
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_fraud_denylist_scope_value_active "
+                "ON fraud_denylist_entries(scope, value, is_active)"
+            )
         )
 
 

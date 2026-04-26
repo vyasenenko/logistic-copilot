@@ -11,6 +11,7 @@ import httpx
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+OUTLOOK_WEBHOOK_MAX_EXPIRATION_MINUTES = 10070
 
 
 def _graph_error_body(response: httpx.Response) -> str:
@@ -114,8 +115,12 @@ class OutlookGraphClient:
     def webhook_subscription_payload(self) -> dict:
         if not self.webhook_is_configured():
             raise RuntimeError("Outlook webhook subscription is not fully configured")
+        expiration_minutes = min(
+            max(45, settings.microsoft_webhook_expiration_minutes),
+            OUTLOOK_WEBHOOK_MAX_EXPIRATION_MINUTES,
+        )
         expiration = datetime.now(timezone.utc) + timedelta(
-            minutes=max(45, settings.microsoft_webhook_expiration_minutes)
+            minutes=expiration_minutes
         )
         return {
             "changeType": settings.microsoft_webhook_change_type,
@@ -690,8 +695,12 @@ class OutlookGraphClient:
         """Renew an existing inbox-message Graph webhook subscription."""
         if not subscription_id:
             raise RuntimeError("Subscription id is required for renewal")
+        expiration_minutes = min(
+            max(45, settings.microsoft_webhook_expiration_minutes),
+            OUTLOOK_WEBHOOK_MAX_EXPIRATION_MINUTES,
+        )
         expiration = datetime.now(timezone.utc) + timedelta(
-            minutes=max(45, settings.microsoft_webhook_expiration_minutes)
+            minutes=expiration_minutes
         )
         payload = {"expirationDateTime": expiration.isoformat().replace("+00:00", "Z")}
         url = f"{self.base_url}/subscriptions/{subscription_id}"
@@ -722,7 +731,8 @@ class OutlookGraphClient:
         expected_url = settings.microsoft_webhook_notification_url
         expected_resource = settings.microsoft_webhook_effective_resource
         expected_change_type = settings.microsoft_webhook_change_type
-        renew_before = datetime.now(timezone.utc) + timedelta(
+        now = datetime.now(timezone.utc)
+        renew_before = now + timedelta(
             minutes=max(15, settings.microsoft_webhook_renewal_buffer_minutes)
         )
         logger.info(
@@ -746,8 +756,39 @@ class OutlookGraphClient:
 
         if matching:
             logger.info("Graph webhook: found %d matching subscription(s)", len(matching))
-            primary = matching[0]
-            for duplicate in matching[1:]:
+            active_or_unknown: list[tuple[dict, datetime | None]] = []
+            for item in matching:
+                expiration = None
+                expiration_raw = item.get("expirationDateTime")
+                if isinstance(expiration_raw, str) and expiration_raw:
+                    try:
+                        expiration = datetime.fromisoformat(expiration_raw.replace("Z", "+00:00"))
+                    except ValueError:
+                        expiration = None
+
+                subscription_id = item.get("id")
+                if expiration is not None and expiration <= now:
+                    if isinstance(subscription_id, str) and subscription_id:
+                        try:
+                            logger.info(
+                                "Graph webhook: deleting expired matching subscription id=%s expiration=%s",
+                                subscription_id,
+                                expiration_raw,
+                            )
+                            await self.delete_subscription(subscription_id)
+                        except Exception:
+                            logger.warning("Failed to delete expired Graph subscription %s", subscription_id, exc_info=True)
+                    continue
+                active_or_unknown.append((item, expiration))
+
+            if not active_or_unknown:
+                logger.info("Graph webhook: only expired matching subscriptions found, creating a new one.")
+                created = await self.create_webhook_subscription()
+                created["subscriptionAction"] = "created"
+                return created
+
+            primary, expiration = active_or_unknown[0]
+            for duplicate, _duplicate_expiration in active_or_unknown[1:]:
                 duplicate_id = duplicate.get("id")
                 if isinstance(duplicate_id, str) and duplicate_id:
                     try:
@@ -755,14 +796,7 @@ class OutlookGraphClient:
                     except Exception:
                         logger.warning("Failed to delete duplicate Graph subscription %s", duplicate_id, exc_info=True)
 
-            expiration = None
             expiration_raw = primary.get("expirationDateTime")
-            if isinstance(expiration_raw, str) and expiration_raw:
-                try:
-                    expiration = datetime.fromisoformat(expiration_raw.replace("Z", "+00:00"))
-                except ValueError:
-                    expiration = None
-
             subscription_id = primary.get("id")
             if isinstance(subscription_id, str) and subscription_id and (expiration is None or expiration <= renew_before):
                 logger.info(
@@ -770,7 +804,18 @@ class OutlookGraphClient:
                     subscription_id,
                     expiration_raw,
                 )
-                renewed = await self.renew_webhook_subscription(subscription_id)
+                try:
+                    renewed = await self.renew_webhook_subscription(subscription_id)
+                except RuntimeError as exc:
+                    if "Microsoft Graph HTTP 404" not in str(exc):
+                        raise
+                    logger.warning(
+                        "Graph webhook: matching subscription disappeared during renewal; creating a new one.",
+                        exc_info=True,
+                    )
+                    created = await self.create_webhook_subscription()
+                    created["subscriptionAction"] = "created"
+                    return created
                 renewed["subscriptionAction"] = "renewed"
                 return renewed
 

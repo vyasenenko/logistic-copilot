@@ -60,7 +60,9 @@ READY_AT_PATTERN = re.compile(
 TIME_ONLY_PATTERN = re.compile(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", re.IGNORECASE)
 QUOTE_REQUEST_HINTS = ("quote", "need to move", "need moved", "move", "load", "pickup", "delivery", "pallet", "lb", "lbs")
 BID_HINTS = ("all in", "can do", "rate", "quote back", "our quote", "best rate", "$")
-CONFIRM_HINTS = ("ok book", "please book", "book it", "go ahead and book", "approved")
+CONFIRM_HINTS = ("ok book", "please book", "book it", "go ahead and book", "approved", "confirmed", "confirm booking")
+SHORT_CONFIRM_PATTERN = re.compile(r"^\s*(?:ok|okay|yes|yep|approved|confirmed|confirm|book it)\s*[.!]?\s*$", re.IGNORECASE)
+CONFIRMABLE_SHIPMENT_STATUSES = {"quoted", "awaiting_confirmation"}
 STATUS_REQUEST_HINTS = ("eta", "status", "update", "where is", "where's", "location", "arrive", "delivery status")
 CARRIER_STATUS_HINTS = ("arrived", "loaded", "empty", "unloaded", "detained", "running late", "eta", "currently in", "gps", "location")
 ISSUE_HINTS = ("delay", "delayed", "problem", "issue", "damaged", "missed", "late", "breakdown", "detention")
@@ -272,7 +274,9 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
             "Classify the freight inbox email intent. "
             "Allowed intents: new_quote_request, carrier_bid_reply, "
             "customer_quote_confirmation, customer_clarification, customer_status_request, carrier_status_update, exception_or_issue, noise_or_unhandled. "
-            "Return high confidence only when the intent is clear.\n\n"
+            "Return high confidence only when the intent is clear. "
+            "When sender_role is client and shipment_status is quoted or awaiting_confirmation, "
+            "a short affirmative body such as OK, Okay, Yes, Confirm, Approved, or Book it means customer_quote_confirmation.\n\n"
             f"{_context_blob(email_context)}"
         )
         result = await _invoke_structured_with_fallback(
@@ -444,7 +448,8 @@ async def extract_carrier_status_update(email_context: dict) -> CarrierStatusUpd
 
 
 def _classify_with_heuristics(email_context: dict) -> IntentResult:
-    text = f"{email_context.get('subject', '')}\n{email_context.get('body_preview', '')}".lower()
+    body_text = str(email_context.get("body_preview", "") or "")
+    text = f"{email_context.get('subject', '')}\n{body_text}".lower()
     sender_role = email_context.get("sender_role")
     shipment_status = email_context.get("shipment_status") or ""
 
@@ -455,7 +460,11 @@ def _classify_with_heuristics(email_context: dict) -> IntentResult:
     if sender_role == "carrier" and any(token in text for token in BID_HINTS):
         amount = _extract_bid_amount(text)
         return IntentResult(intent="carrier_bid_reply", confidence=0.85 if amount is not None else 0.68)
-    if any(token in text for token in CONFIRM_HINTS):
+    if (
+        sender_role == "client"
+        and shipment_status in CONFIRMABLE_SHIPMENT_STATUSES
+        and (SHORT_CONFIRM_PATTERN.match(body_text) or any(token in text for token in CONFIRM_HINTS))
+    ):
         return IntentResult(intent="customer_quote_confirmation", confidence=0.85)
     if sender_role == "client" and shipment_status in {"booked", "booking_in_progress"} and any(token in text for token in STATUS_REQUEST_HINTS):
         return IntentResult(intent="customer_status_request", confidence=0.8)
@@ -595,7 +604,16 @@ def _merge_intent_results(
         primary.intent = fallback_intent or "noise_or_unhandled"
         primary.confidence = fallback.confidence
         return primary
-    # AI remains source of truth. Heuristics only rescue obviously weak/noisy outputs.
+    # AI is always invoked when available, but deterministic workflow confirmations should
+    # still advance the shipment when a customer replies with a clear short approval.
+    if (
+        fallback_intent == "customer_quote_confirmation"
+        and fallback.confidence >= 0.85
+        and primary_intent
+        in {"noise_or_unhandled", "new_quote_request", "customer_clarification", "customer_status_request"}
+    ):
+        return fallback
+    # Otherwise AI remains source of truth. Heuristics only rescue obviously weak/noisy outputs.
     if (
         primary_intent == "noise_or_unhandled"
         and fallback_intent

@@ -41,6 +41,38 @@ class ArchiveReasonCode(str, Enum):
     OTHER = "other"
 
 
+class FraudRiskLevel(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class FraudRecommendedAction(str, Enum):
+    ALLOW = "allow"
+    VERIFY = "verify"
+    BLOCK_AUTOMATION = "block_automation"
+
+
+class FraudReviewType(str, Enum):
+    SENDER_VERIFICATION = "sender_verification"
+    PROBABLE_FRAUD = "probable_fraud"
+
+
+class FraudDenylistScope(str, Enum):
+    SENDER_EMAIL = "sender_email"
+    SENDER_DOMAIN = "sender_domain"
+
+
+class SenderIdentityRole(str, Enum):
+    CUSTOMER = "customer"
+    CARRIER = "carrier"
+
+
+class SenderTrustScope(str, Enum):
+    SENDER_EMAIL = "sender_email"
+    SENDER_DOMAIN = "sender_domain"
+
+
 class WorkflowEventType(str, Enum):
     EMAIL_RECEIVED = "email_received"
     EMAIL_MARKED_READ = "email_marked_read"
@@ -51,6 +83,7 @@ class WorkflowEventType(str, Enum):
     SHIPMENT_FIELDS_UPDATED = "shipment_fields_updated"
     SHIPMENT_PARSE_FAILED = "shipment_parse_failed"
     CLIENT_ACK_SENT = "client_ack_sent"
+    CUSTOMER_DETAILS_REQUESTED = "customer_details_requested"
     CARRIER_OUTREACH_SENT = "carrier_outreach_sent"
     CARRIER_FOLLOWUP_SENT = "carrier_followup_sent"
     BID_RECEIVED = "bid_received"
@@ -59,6 +92,8 @@ class WorkflowEventType(str, Enum):
     CLIENT_QUOTE_SENT = "client_quote_sent"
     CUSTOMER_CONFIRMED = "customer_confirmed"
     MANUAL_REVIEW_REQUIRED = "manual_review_required"
+    SENDER_VERIFIED = "sender_verified"
+    SENDER_FRAUD_MARKED = "sender_fraud_marked"
     DOCUMENT_ANALYZED = "document_analyzed"
     DOCUMENT_VALUES_APPROVED = "document_values_approved"
     DOCUMENT_WARNING_IGNORED = "document_warning_ignored"
@@ -213,6 +248,7 @@ class ShipmentRecord(BaseModel):
     ai_missing_fields: list[str] = Field(default_factory=list)
     ai_ambiguity_reasons: list[str] = Field(default_factory=list)
     ai_next_action: str | None = None
+    customer_clarification_requested: bool = False
     booking_state: str | None = None
     booking_error: str | None = None
     tms_handoff_status: str | None = None
@@ -238,6 +274,18 @@ class ShipmentRecord(BaseModel):
     status_stale: bool = False
     status_sla_hours: int | None = None
     manual_review_required: bool = False
+    sender_known: bool = False
+    sender_verification_required: bool = False
+    fraud_risk_level: FraudRiskLevel | None = None
+    fraud_risk_reasons: list[str] = Field(default_factory=list)
+    fraud_score: float | None = None
+    sender_email: str | None = None
+    sender_domain: str | None = None
+    sender_verified_at: datetime | None = None
+    sender_verified_for_email: str | None = None
+    sender_verified_for_domain: str | None = None
+    sender_verified_role: SenderIdentityRole | None = None
+    sender_verified_scope: SenderTrustScope | None = None
     board_stage: str | None = None
     attention_state: str = "none"
     attention_reason: str | None = None
@@ -316,6 +364,8 @@ class ShipmentThreadMessageRecord(BaseModel):
     body_preview: str = ""
     display_body: str = ""
     has_raw_payload: bool = False
+    dry_run: bool = False
+    message_type: str | None = None
 
 
 class ShipmentThreadResponse(BaseModel):
@@ -554,6 +604,19 @@ class OutlookWebhookRequest(BaseModel):
     value: list[OutlookWebhookNotification] = Field(default_factory=list)
 
 
+class FraudAssessmentResult(BaseModel):
+    risk_level: FraudRiskLevel = FraudRiskLevel.LOW
+    reasons: list[str] = Field(default_factory=list)
+    recommended_action: FraudRecommendedAction = FraudRecommendedAction.ALLOW
+    sender_known: bool = False
+    verification_required: bool = False
+    score: float = Field(0, ge=0, le=1)
+    sender_email: str | None = None
+    sender_domain: str | None = None
+    matched_domain: str | None = None
+    matched_identity: str | None = None
+
+
 class OutlookIngestResult(BaseModel):
     thread_id: str
     email_message_id: str
@@ -589,6 +652,13 @@ class OutlookIngestResult(BaseModel):
     suppressed: bool = False
     suppression_reason: str | None = None
     shipment_creation_skipped: bool = False
+    sender_known: bool = False
+    sender_verification_required: bool = False
+    fraud_risk_level: FraudRiskLevel | None = None
+    fraud_risk_reasons: list[str] = Field(default_factory=list)
+    fraud_score: float | None = None
+    sender_email: str | None = None
+    sender_domain: str | None = None
     event_type: WorkflowEventType = WorkflowEventType.EMAIL_RECEIVED
 
 
@@ -819,6 +889,7 @@ class TmsStatusIngestResponse(BaseModel):
 class OperatorAction(str, Enum):
     RESUME_WORKFLOW = "resume_workflow"
     APPROVE_AND_CONTINUE = "approve_and_continue"
+    REQUEST_CUSTOMER_DETAILS = "request_customer_details"
     RERUN_PARSING = "rerun_parsing"
     RERUN_OUTREACH = "rerun_outreach"
     RERUN_EVALUATION = "rerun_evaluation"
@@ -828,6 +899,8 @@ class OperatorAction(str, Enum):
     RERUN_DOCUMENT_EXTRACTION = "rerun_document_extraction"
     APPROVE_DOCUMENT_VALUES = "approve_document_values"
     IGNORE_DOCUMENT_WARNING = "ignore_document_warning"
+    VERIFY_SENDER = "verify_sender"
+    MARK_SENDER_FRAUD = "mark_sender_fraud"
     ARCHIVE_SHIPMENT = "archive_shipment"
 
 
@@ -837,12 +910,18 @@ class ShipmentOperatorActionRequest(BaseModel):
     reason_code: ArchiveReasonCode | None = None
     reason_note: str | None = None
     suppress_source_thread: bool = True
+    fraud_block_scope: FraudDenylistScope | None = None
+    sender_identity_role: SenderIdentityRole | None = None
+    sender_trust_scope: SenderTrustScope | None = None
+    client_id: str | None = None
+    carrier_id: str | None = None
 
 
 class ShipmentArchiveRequest(BaseModel):
     reason_code: ArchiveReasonCode = ArchiveReasonCode.OTHER
     reason_note: str | None = None
     suppress_source_thread: bool = True
+    fraud_block_scope: FraudDenylistScope | None = None
 
 
 class ShipmentOperatorActionResponse(BaseModel):
@@ -859,6 +938,15 @@ class ShipmentOperatorActionResponse(BaseModel):
     archived: bool = False
     suppression_applied: bool = False
     suppressed_thread_id: str | None = None
+    denylist_entry_id: str | None = None
+    denylist_scope: FraudDenylistScope | None = None
+    denylist_value: str | None = None
+    sender_identity_role: SenderIdentityRole | None = None
+    sender_trust_scope: SenderTrustScope | None = None
+    verified_sender_email: str | None = None
+    verified_sender_domain: str | None = None
+    verified_client_id: str | None = None
+    verified_carrier_id: str | None = None
     decision: WorkflowDecisionResult | None = None
 
 

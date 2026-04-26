@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 from io import BytesIO
+import logging
 import re
 from datetime import datetime, timezone
 from uuid import UUID
@@ -65,6 +66,7 @@ PICKUP_NUMBER_PATTERNS = (
 BOL_NUMBER_PATTERNS = (
     re.compile(r"(?:b\/l|bol|bill of lading)(?:\s+number|\s+no\.?)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})", re.IGNORECASE),
 )
+logger = logging.getLogger(__name__)
 REFERENCE_NUMBER_PATTERNS = (
     re.compile(r"(?:reference|ref|load)(?:\s+number|\s+no\.?|\s*#)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{3,})", re.IGNORECASE),
 )
@@ -108,7 +110,7 @@ async def _find_customer_reply_anchor(
         )
         if client_anchor is not None:
             return client_anchor
-    return await session.scalar(base_query)
+    return None
 
 
 async def deliver_customer_thread_email(
@@ -137,11 +139,26 @@ async def deliver_customer_thread_email(
 
     outlook = OutlookGraphClient()
     if anchor is not None:
-        await outlook.reply_to_message(
-            message_id=anchor.provider_message_id,
-            body=body,
-            recipients=[client_email],
-        )
+        try:
+            await outlook.reply_to_message(
+                message_id=anchor.provider_message_id,
+                body=body,
+                recipients=[client_email],
+            )
+            return delivery_payload
+        except Exception:
+            logger.exception(
+                "customer_email.reply_failed_falling_back shipment_id=%s client_email=%s anchor_message_id=%s",
+                shipment.id,
+                client_email,
+                anchor.provider_message_id,
+            )
+            delivery_payload = {
+                "delivery_mode": "send_mail_fallback",
+                "reply_to_provider_message_id": anchor.provider_message_id,
+                "reply_fallback_reason": "reply_failed",
+            }
+            await outlook.send_mail(subject=subject, body=body, recipients=[client_email])
     else:
         await outlook.send_mail(subject=subject, body=body, recipients=[client_email])
     return delivery_payload
@@ -1164,7 +1181,7 @@ async def send_customer_quote(
         dry_run=dry_run,
     )
 
-    if shipment.email_thread_id:
+    if shipment.email_thread_id and not dry_run:
         session.add(
             EmailMessage(
                 thread_id=shipment.email_thread_id,

@@ -17,6 +17,7 @@ from app.memory.database import (
     Client,
     EmailMessage,
     EmailThread,
+    FraudDenylistEntry,
     Shipment,
     WorkflowEvent,
     async_session,
@@ -48,6 +49,9 @@ from app.schemas import (
     FreightFoundationResponse,
     FreightFinancialShipmentSummary,
     FreightFinancialSummaryResponse,
+    FraudDenylistScope,
+    FraudReviewType,
+    FraudRiskLevel,
     OutlookIngestRequest,
     OutlookIngestResult,
     OutlookSyncRequest,
@@ -73,6 +77,8 @@ from app.schemas import (
     ShipmentArchiveRequest,
     ShipmentOperatorActionRequest,
     ShipmentOperatorActionResponse,
+    SenderIdentityRole,
+    SenderTrustScope,
     ShipmentDocumentRecord,
     ShipmentMagicField,
     ShipmentMagicFillRequest,
@@ -102,10 +108,17 @@ from app.services.freight_execution import (
     summarize_booking_documents,
 )
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
+from app.services.email_fraud import (
+    apply_operator_sender_trust_to_fraud_projection,
+    extract_sender_domain,
+    normalize_sender_email,
+)
 from app.services.freight_inbox_agent import (
+    customer_clarification_already_requested,
     continue_phase1_workflow,
     evaluate_expired_quote_windows,
     run_freight_inbox_orchestrator,
+    send_customer_clarification,
 )
 from app.services.freight_ai import extract_carrier_status_update, extract_shipment_field_from_thread
 from app.services.freight_realtime import freight_realtime_hub
@@ -123,6 +136,7 @@ from app.services.outlook_mail_actions import (
     mark_email_message_read_after_ai_success,
     move_shipment_thread_messages_to_archive,
     outlook_categories_for_ai_decision,
+    outlook_categories_for_fraud_assessment,
 )
 from app.services.freight_read import build_freight_overview, is_status_stale as _is_status_stale, list_notification_feed
 
@@ -221,12 +235,14 @@ def _shipment_matches_month_filter(
 
 async def _serialize_shipment_detail(session: AsyncSession, shipment: Shipment) -> ShipmentRecord:
     ai_payloads = await _latest_ai_payloads(session, [shipment.id])
+    fraud_payloads = await _merged_fraud_projections(session, [shipment.id])
     booking_payloads = await _latest_booking_payloads(session, [shipment.id])
     status_payloads = await _latest_status_payloads(session, [shipment.id])
     status_review_payloads = await _latest_status_review_payloads(session, [shipment.id])
     tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id])
     status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id])
     document_action_payloads = await _latest_document_action_payloads(session, [shipment.id])
+    clarification_flags = await _customer_clarification_requested_flags(session, [shipment])
     attachment_counts = await _attachment_counts(session, [shipment])
     document_summaries = await _document_booking_summaries(session, [shipment], document_action_payloads)
     now = datetime.now(timezone.utc)
@@ -239,6 +255,7 @@ async def _serialize_shipment_detail(session: AsyncSession, shipment: Shipment) 
         shipment,
         {
             **(ai_payloads.get(shipment.id) or {}),
+            **(fraud_payloads.get(shipment.id) or {}),
             **(booking_payloads.get(shipment.id) or {}),
             **(status_payloads.get(shipment.id) or {}),
             **(status_review_payloads.get(shipment.id) or {}),
@@ -260,6 +277,7 @@ async def _serialize_shipment_detail(session: AsyncSession, shipment: Shipment) 
                 status_workflow_state=(status_workflow_payloads.get(shipment.id) or {}).get("status_workflow_state"),
             ),
             "status_sla_hours": settings.status_sla_hours_default,
+            "customer_clarification_requested": clarification_flags.get(shipment.id, False),
         },
     )
 
@@ -297,6 +315,7 @@ def _message_display_body(message: EmailMessage) -> str:
 
 
 def _serialize_thread_message(message: EmailMessage) -> ShipmentThreadMessageRecord:
+    payload = dict(message.raw_payload_json or {})
     return ShipmentThreadMessageRecord(
         id=str(message.id),
         thread_id=str(message.thread_id),
@@ -309,6 +328,8 @@ def _serialize_thread_message(message: EmailMessage) -> ShipmentThreadMessageRec
         body_preview=message.body_preview or "",
         display_body=_message_display_body(message),
         has_raw_payload=bool(message.raw_payload_json),
+        dry_run=bool(payload.get("dry_run", False)),
+        message_type=payload.get("type"),
     )
 
 
@@ -400,6 +421,122 @@ def _decision_should_mark_email_read(decision: WorkflowDecisionResult) -> bool:
     )
 
 
+async def _has_open_review_for_reason(
+    session: AsyncSession,
+    *,
+    shipment_id: str,
+    reason: str,
+    source_email_id: str | None,
+) -> bool:
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == UUID(shipment_id),
+            WorkflowEvent.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    for event in result.scalars().all():
+        payload = dict(event.payload_json or {})
+        if str(payload.get("reason") or "") != reason:
+            continue
+        if source_email_id is not None and payload.get("source_email_id") not in {None, source_email_id}:
+            continue
+        return True
+    return False
+
+
+async def _create_sender_review_event(
+    session: AsyncSession,
+    *,
+    result: OutlookIngestResult,
+) -> None:
+    if not result.shipment_id:
+        return
+    fraud_level = str(result.fraud_risk_level or "")
+    review_type = (
+        FraudReviewType.PROBABLE_FRAUD.value
+        if fraud_level == FraudRiskLevel.HIGH.value
+        else FraudReviewType.SENDER_VERIFICATION.value
+    )
+    reason = (
+        "Probable fraud detected for sender domain verification."
+        if review_type == FraudReviewType.PROBABLE_FRAUD.value
+        else "Sender verification is required before automation continues."
+    )
+    if await _has_open_review_for_reason(
+        session,
+        shipment_id=result.shipment_id,
+        reason=reason,
+        source_email_id=result.email_message_id,
+    ):
+        return
+    event = WorkflowEvent(
+        shipment_id=UUID(result.shipment_id),
+        event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+        stage=ShipmentStage.PARSING.value,
+        payload_json={
+            "reason": reason,
+            "intent": "sender_risk_assessment",
+            "review_type": review_type,
+            "confidence": result.fraud_score or 0,
+            "next_action": "probable_fraud_review"
+            if review_type == FraudReviewType.PROBABLE_FRAUD.value
+            else "sender_verification_required",
+            "ambiguity_reasons": list(result.fraud_risk_reasons or []),
+            "structured_payload": {
+                "sender_email": result.sender_email,
+                "sender_domain": result.sender_domain,
+                "fraud_risk_level": result.fraud_risk_level,
+                "fraud_risk_reasons": list(result.fraud_risk_reasons or []),
+                "sender_known": result.sender_known,
+                "sender_verification_required": result.sender_verification_required,
+            },
+            "source_email_id": result.email_message_id,
+            "manual_review_required": True,
+        },
+    )
+    session.add(event)
+    await session.commit()
+    await freight_realtime_hub.notify_workflow_event(event)
+
+
+async def _apply_sender_risk_gate(
+    session: AsyncSession,
+    *,
+    result: OutlookIngestResult,
+) -> None:
+    fraud_level = str(result.fraud_risk_level or "")
+    if not (
+        result.sender_verification_required
+        or fraud_level in {FraudRiskLevel.MEDIUM.value, FraudRiskLevel.HIGH.value}
+    ):
+        return
+
+    result.manual_review_required = True
+    result.next_action = (
+        "probable_fraud_review"
+        if fraud_level == FraudRiskLevel.HIGH.value
+        else "sender_verification_required"
+    )
+    result.intent = result.intent or "sender_risk_assessment"
+    result.confidence = result.confidence if result.confidence is not None else result.fraud_score
+    await _create_sender_review_event(session, result=result)
+
+    categories = outlook_categories_for_fraud_assessment(
+        sender_verification_required=result.sender_verification_required,
+        fraud_risk_level=fraud_level or None,
+    )
+    if categories:
+        await add_email_message_categories(
+            session,
+            email_message_id=result.email_message_id,
+            shipment_id=result.shipment_id,
+            categories=categories,
+            reason=f"fraud_gate:{result.fraud_risk_level or 'verification'}:{result.next_action}",
+        )
+
+
 def _build_automation_policy(
     *,
     auto_acknowledgement: bool,
@@ -440,7 +577,35 @@ async def _process_outlook_mailbox_message(
         return None
 
     if result.shipment_creation_skipped or result.suppressed:
-        result.next_action = "suppressed"
+        fraud_level = str(result.fraud_risk_level or "")
+        result.next_action = "fraud_suppressed" if fraud_level == FraudRiskLevel.HIGH.value else "suppressed"
+        categories = outlook_categories_for_fraud_assessment(
+            sender_verification_required=result.sender_verification_required,
+            fraud_risk_level=fraud_level or None,
+        )
+        if categories and result.email_message_id and result.shipment_id:
+            await add_email_message_categories(
+                session,
+                email_message_id=result.email_message_id,
+                shipment_id=result.shipment_id,
+                categories=categories,
+                reason=f"suppressed:{result.next_action}",
+            )
+        if result.next_action == "fraud_suppressed" and result.shipment_id:
+            shipment = await session.get(Shipment, UUID(result.shipment_id))
+            if shipment is not None:
+                await move_shipment_thread_messages_to_archive(
+                    session,
+                    shipment=shipment,
+                    reason=result.suppression_reason or "fraud denylist",
+                )
+        return result
+
+    if result.sender_verification_required or str(result.fraud_risk_level or "") in {
+        FraudRiskLevel.MEDIUM.value,
+        FraudRiskLevel.HIGH.value,
+    }:
+        await _apply_sender_risk_gate(session, result=result)
         return result
 
     if result.created_message:
@@ -602,12 +767,18 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
     ai_missing_fields = list(ai_payload.get("missing_fields", []) or [])
     ai_ambiguity_reasons = list(ai_payload.get("ambiguity_reasons", []) or [])
     manual_review_required = bool(ai_payload.get("manual_review_required", False))
+    sender_verification_required = bool(ai_payload.get("sender_verification_required", False))
+    fraud_risk_level = ai_payload.get("fraud_risk_level")
+    fraud_risk_reasons = list(ai_payload.get("fraud_risk_reasons", []) or [])
     booking_review_required = bool(ai_payload.get("booking_review_required", False))
     status_review_required = bool(ai_payload.get("status_review_required", False))
     status_stale = bool(ai_payload.get("status_stale", False))
     board_stage = _board_stage_from_status(shipment.status)
     attention_state, attention_reason, attention_level = _derive_attention_projection(
         manual_review_required=manual_review_required,
+        sender_verification_required=sender_verification_required,
+        fraud_risk_level=fraud_risk_level,
+        fraud_risk_reasons=fraud_risk_reasons,
         ai_missing_fields=ai_missing_fields,
         ai_ambiguity_reasons=ai_ambiguity_reasons,
         status_review_required=status_review_required,
@@ -643,6 +814,7 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         ai_missing_fields=ai_missing_fields,
         ai_ambiguity_reasons=ai_ambiguity_reasons,
         ai_next_action=ai_payload.get("next_action"),
+        customer_clarification_requested=bool(ai_payload.get("customer_clarification_requested", False)),
         booking_state=ai_payload.get("booking_state"),
         booking_error=ai_payload.get("booking_error"),
         tms_handoff_status=ai_payload.get("tms_handoff_status"),
@@ -668,6 +840,18 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         status_stale=status_stale,
         status_sla_hours=ai_payload.get("status_sla_hours"),
         manual_review_required=manual_review_required,
+        sender_verification_required=sender_verification_required,
+        fraud_risk_level=fraud_risk_level,
+        fraud_risk_reasons=fraud_risk_reasons,
+        fraud_score=ai_payload.get("fraud_score"),
+        sender_known=bool(ai_payload.get("sender_known", False)),
+        sender_email=ai_payload.get("sender_email"),
+        sender_domain=ai_payload.get("sender_domain"),
+        sender_verified_at=ai_payload.get("sender_verified_at"),
+        sender_verified_for_email=ai_payload.get("sender_verified_for_email"),
+        sender_verified_for_domain=ai_payload.get("sender_verified_for_domain"),
+        sender_verified_role=ai_payload.get("sender_verified_role"),
+        sender_verified_scope=ai_payload.get("sender_verified_scope"),
         board_stage=board_stage,
         attention_state=attention_state,
         attention_reason=attention_reason,
@@ -751,12 +935,27 @@ def _shipment_next_step_label(
 def _derive_attention_projection(
     *,
     manual_review_required: bool,
+    sender_verification_required: bool,
+    fraud_risk_level: str | None,
+    fraud_risk_reasons: list[str],
     ai_missing_fields: list[str],
     ai_ambiguity_reasons: list[str],
     status_review_required: bool,
     booking_review_required: bool,
     status_stale: bool,
 ) -> tuple[str, str | None, str]:
+    if fraud_risk_level == FraudRiskLevel.HIGH.value:
+        return (
+            "review",
+            "Probable fraud: verify sender before any automation",
+            "critical",
+        )
+    if sender_verification_required:
+        return (
+            "review",
+            "Sender verification required before automation continues",
+            "high",
+        )
     if ai_missing_fields:
         return (
             "missing_details",
@@ -776,7 +975,10 @@ def _derive_attention_projection(
     if booking_review_required:
         return ("docs_warning", "Document review is blocking safe booking flow", "high")
     if manual_review_required:
-        return ("review", "Operator review is required before automation continues", "high")
+        review_reason = "Operator review is required before automation continues"
+        if fraud_risk_reasons:
+            review_reason = f"{review_reason} ({fraud_risk_reasons[0].replace('_', ' ')})"
+        return ("review", review_reason, "high")
     return ("none", None, "normal")
 
 
@@ -923,6 +1125,12 @@ def _serialize_review_queue_item(
     elif review_type in {"ocr_review_required", "document_parse_low_confidence"}:
         priority = "high"
         alert_label = "Document review"
+    elif review_type == FraudReviewType.SENDER_VERIFICATION.value:
+        priority = "high"
+        alert_label = "Verify sender"
+    elif review_type == FraudReviewType.PROBABLE_FRAUD.value:
+        priority = "critical"
+        alert_label = "Probable fraud"
     elif payload.get("booking_review_warning"):
         priority = "high"
         alert_label = "Booking warning"
@@ -1054,6 +1262,198 @@ async def _latest_ai_payloads(
         ):
             payloads[event.shipment_id] = payload
     return payloads
+
+
+async def _customer_clarification_requested_flags(
+    session: AsyncSession,
+    shipments: list[Shipment],
+) -> dict[UUID, bool]:
+    thread_to_shipment = {
+        shipment.email_thread_id: shipment.id
+        for shipment in shipments
+        if shipment.email_thread_id is not None
+    }
+    if not thread_to_shipment:
+        return {}
+    result = await session.execute(
+        select(EmailMessage).where(
+            EmailMessage.thread_id.in_(list(thread_to_shipment.keys())),
+            EmailMessage.direction == "outbound",
+        )
+    )
+    flags: dict[UUID, bool] = {}
+    for message in result.scalars().all():
+        payload = dict(message.raw_payload_json or {})
+        if payload.get("type") != "customer_clarification":
+            continue
+        shipment_id = thread_to_shipment.get(message.thread_id)
+        if shipment_id is not None:
+            flags[shipment_id] = True
+    return flags
+
+
+async def _latest_missing_fields_for_shipment(
+    session: AsyncSession,
+    shipment: Shipment,
+) -> list[str]:
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(WorkflowEvent.shipment_id == shipment.id)
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    for event in result.scalars().all():
+        payload = dict(event.payload_json or {})
+        missing_fields = list(payload.get("missing_fields", []) or [])
+        if missing_fields:
+            return missing_fields
+        structured = dict(payload.get("structured_payload", {}) or {})
+        missing_fields = list(structured.get("missing_fields", []) or [])
+        if missing_fields:
+            return missing_fields
+    return []
+
+
+async def _latest_fraud_payloads(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id.in_(shipment_ids),
+            WorkflowEvent.event_type.in_(
+                [
+                    WorkflowEventType.EMAIL_RECEIVED.value,
+                    WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+                ]
+            ),
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    payloads: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        if event.shipment_id in payloads:
+            continue
+        payload = dict(event.payload_json or {})
+        fraud = dict(payload.get("fraud", {}) or {})
+        structured = dict(payload.get("structured_payload", {}) or {})
+        risk_level = fraud.get("risk_level") or structured.get("fraud_risk_level")
+        verification_required = fraud.get("verification_required")
+        if risk_level is None and verification_required is None:
+            continue
+        payloads[event.shipment_id] = {
+            "sender_known": bool(fraud.get("sender_known", structured.get("sender_known", False))),
+            "sender_verification_required": bool(
+                fraud.get("verification_required", structured.get("sender_verification_required", False))
+            ),
+            "fraud_risk_level": risk_level,
+            "fraud_risk_reasons": list(
+                fraud.get("reasons", structured.get("fraud_risk_reasons", [])) or []
+            ),
+            "fraud_score": fraud.get("score", payload.get("confidence")),
+            "sender_email": fraud.get("sender_email", structured.get("sender_email")),
+            "sender_domain": fraud.get("sender_domain", structured.get("sender_domain")),
+        }
+    return payloads
+
+
+async def _latest_sender_verification_by_shipment(
+    session: AsyncSession,
+    shipment_ids: list[UUID],
+) -> dict[UUID, dict]:
+    """Latest operator sender-trust confirmation per shipment (for fraud projection)."""
+    if not shipment_ids:
+        return {}
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id.in_(shipment_ids),
+            WorkflowEvent.event_type == WorkflowEventType.SENDER_VERIFIED.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    out: dict[UUID, dict] = {}
+    for event in result.scalars().all():
+        if event.shipment_id in out:
+            continue
+        payload = dict(event.payload_json or {})
+        out[event.shipment_id] = {
+            "verified_sender_email": payload.get("sender_email"),
+            "verified_sender_domain": payload.get("sender_domain"),
+            "trust_scope": payload.get("trust_scope", SenderTrustScope.SENDER_EMAIL.value),
+            "sender_role": payload.get("sender_role"),
+            "verified_at": event.created_at,
+            "client_id": payload.get("client_id"),
+            "carrier_id": payload.get("carrier_id"),
+        }
+    return out
+
+
+async def _merged_fraud_projections(session: AsyncSession, shipment_ids: list[UUID]) -> dict[UUID, dict]:
+    if not shipment_ids:
+        return {}
+    fraud = await _latest_fraud_payloads(session, shipment_ids)
+    ver = await _latest_sender_verification_by_shipment(session, shipment_ids)
+    return {
+        sid: apply_operator_sender_trust_to_fraud_projection(fraud.get(sid), ver.get(sid))
+        for sid in shipment_ids
+    }
+
+
+async def _latest_inbound_sender_email_for_shipment(session: AsyncSession, shipment: Shipment) -> str | None:
+    """Normalized sender address from the latest inbound message on the shipment thread."""
+    if shipment.email_thread_id is None:
+        return None
+    sender = await session.scalar(
+        select(EmailMessage.sender)
+        .where(
+            EmailMessage.thread_id == shipment.email_thread_id,
+            EmailMessage.direction == "inbound",
+        )
+        .order_by(EmailMessage.received_at.desc())
+        .limit(1)
+    )
+    if not sender:
+        return None
+    return str(sender).strip().lower()
+
+
+async def _upsert_fraud_denylist_entry(
+    session: AsyncSession,
+    *,
+    scope: FraudDenylistScope,
+    value: str,
+    reason: str | None,
+    source_shipment_id: UUID | None,
+) -> tuple[FraudDenylistEntry, bool]:
+    normalized_value = (
+        extract_sender_domain(value)
+        if scope == FraudDenylistScope.SENDER_DOMAIN and "@" in value
+        else str(value or "").strip().lower().rstrip(".")
+    )
+    if not normalized_value:
+        raise HTTPException(status_code=400, detail="Cannot create fraud denylist entry without a sender value.")
+    entry = await session.scalar(
+        select(FraudDenylistEntry).where(
+            FraudDenylistEntry.scope == scope.value,
+            FraudDenylistEntry.value == normalized_value,
+            FraudDenylistEntry.is_active.is_(True),
+        )
+    )
+    if entry is not None:
+        return entry, False
+    entry = FraudDenylistEntry(
+        scope=scope.value,
+        value=normalized_value,
+        reason=reason,
+        source_shipment_id=source_shipment_id,
+        is_active=True,
+    )
+    session.add(entry)
+    await session.flush()
+    return entry, True
 
 
 async def _latest_booking_payloads(
@@ -2050,12 +2450,14 @@ async def list_shipments(
         if _shipment_matches_month_filter(shipment, month=month)
     ]
     ai_payloads = await _latest_ai_payloads(session, [shipment.id for shipment in shipments])
+    fraud_payloads = await _merged_fraud_projections(session, [shipment.id for shipment in shipments])
     booking_payloads = await _latest_booking_payloads(session, [shipment.id for shipment in shipments])
     status_payloads = await _latest_status_payloads(session, [shipment.id for shipment in shipments])
     status_review_payloads = await _latest_status_review_payloads(session, [shipment.id for shipment in shipments])
     tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id for shipment in shipments])
     status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id for shipment in shipments])
     document_action_payloads = await _latest_document_action_payloads(session, [shipment.id for shipment in shipments])
+    clarification_flags = await _customer_clarification_requested_flags(session, shipments)
     attachment_counts = await _attachment_counts(session, shipments)
     document_summaries = await _document_booking_summaries(session, shipments, document_action_payloads)
     now = datetime.now(timezone.utc)
@@ -2064,6 +2466,7 @@ async def list_shipments(
             shipment,
             {
                 **(ai_payloads.get(shipment.id) or {}),
+                **(fraud_payloads.get(shipment.id) or {}),
                 **(booking_payloads.get(shipment.id) or {}),
                 **(status_payloads.get(shipment.id) or {}),
                 **(status_review_payloads.get(shipment.id) or {}),
@@ -2093,6 +2496,7 @@ async def list_shipments(
                     status_workflow_state=(status_workflow_payloads.get(shipment.id) or {}).get("status_workflow_state"),
                 ),
                 "status_sla_hours": settings.status_sla_hours_default,
+                "customer_clarification_requested": clarification_flags.get(shipment.id, False),
             },
         )
         for shipment in shipments
@@ -2978,7 +3382,7 @@ async def freight_operator_action(
     if shipment is None:
         raise HTTPException(status_code=404, detail="Shipment not found.")
 
-    if shipment.is_archived and request.action != OperatorAction.ARCHIVE_SHIPMENT:
+    if shipment.is_archived and request.action not in {OperatorAction.ARCHIVE_SHIPMENT, OperatorAction.MARK_SENDER_FRAUD}:
         raise HTTPException(status_code=409, detail="Shipment is archived and cannot continue active workflow actions.")
 
     policy = _build_automation_policy(
@@ -2993,24 +3397,180 @@ async def freight_operator_action(
     )
 
     try:
-        if request.action == OperatorAction.ARCHIVE_SHIPMENT:
+        if request.action in {OperatorAction.ARCHIVE_SHIPMENT, OperatorAction.MARK_SENDER_FRAUD}:
+            denylist_entry: FraudDenylistEntry | None = None
+            if request.action == OperatorAction.MARK_SENDER_FRAUD or (
+                request.reason_code == ArchiveReasonCode.FRAUD and request.fraud_block_scope is not None
+            ):
+                inbound_sender = await _latest_inbound_sender_email_for_shipment(session, shipment)
+                if not inbound_sender:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="No inbound sender is linked to this shipment, so a fraud denylist entry cannot be created.",
+                    )
+                block_scope = request.fraud_block_scope or FraudDenylistScope.SENDER_EMAIL
+                denylist_value = (
+                    extract_sender_domain(inbound_sender)
+                    if block_scope == FraudDenylistScope.SENDER_DOMAIN
+                    else normalize_sender_email(inbound_sender)
+                )
+                denylist_entry, created_denylist = await _upsert_fraud_denylist_entry(
+                    session,
+                    scope=block_scope,
+                    value=denylist_value,
+                    reason=request.reason_note or request.reason or "sender flagged as fraud by operator",
+                    source_shipment_id=shipment.id,
+                )
+                fraud_evt = WorkflowEvent(
+                    shipment_id=shipment.id,
+                    event_type=WorkflowEventType.SENDER_FRAUD_MARKED.value,
+                    stage=shipment.status,
+                    payload_json={
+                        "sender_email": inbound_sender,
+                        "denylist_scope": denylist_entry.scope,
+                        "denylist_value": denylist_entry.value,
+                        "denylist_entry_id": str(denylist_entry.id),
+                        "denylist_created": created_denylist,
+                        "reason": request.reason_note or request.reason or "sender flagged as fraud by operator",
+                    },
+                )
+                session.add(fraud_evt)
+
+            archive_reason_code = request.reason_code or (
+                ArchiveReasonCode.FRAUD if request.action == OperatorAction.MARK_SENDER_FRAUD else None
+            )
+            archive_reason_note = request.reason_note or (
+                "sender flagged as fraud by operator" if request.action == OperatorAction.MARK_SENDER_FRAUD else None
+            )
             shipment, thread = await _archive_shipment_and_optionally_suppress_source(
                 session,
                 shipment=shipment,
                 reason=request.reason,
-                reason_code=request.reason_code,
-                reason_note=request.reason_note,
+                reason_code=archive_reason_code,
+                reason_note=archive_reason_note,
                 suppress_source_thread=request.suppress_source_thread,
             )
             return ShipmentOperatorActionResponse(
                 shipment_id=str(shipment.id),
                 action=request.action,
                 status="completed",
-                message="Shipment archived and source thread ignored for future sync.",
+                message=(
+                    "Sender fraud denylist entry saved. Shipment archived and source thread ignored."
+                    if denylist_entry is not None
+                    else "Shipment archived and source thread ignored for future sync."
+                ),
                 next_action="archived",
                 archived=True,
                 suppression_applied=bool(thread is not None and request.suppress_source_thread),
                 suppressed_thread_id=str(thread.id) if thread is not None and request.suppress_source_thread else None,
+                denylist_entry_id=str(denylist_entry.id) if denylist_entry is not None else None,
+                denylist_scope=FraudDenylistScope(denylist_entry.scope) if denylist_entry is not None else None,
+                denylist_value=denylist_entry.value if denylist_entry is not None else None,
+            )
+
+        if request.action == OperatorAction.VERIFY_SENDER:
+            inbound_sender = await _latest_inbound_sender_email_for_shipment(session, shipment)
+            if not inbound_sender:
+                raise HTTPException(
+                    status_code=409,
+                    detail="No inbound customer message is linked to this shipment yet.",
+                )
+            sender_role = request.sender_identity_role
+            if sender_role is None:
+                sender_role = SenderIdentityRole.CUSTOMER if shipment.client_id else None
+            if sender_role is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Choose whether this sender is a customer or a carrier before confirming trust.",
+                )
+            trust_scope = request.sender_trust_scope or SenderTrustScope.SENDER_EMAIL
+            inbound_domain = extract_sender_domain(inbound_sender)
+            client: Client | None = None
+            carrier: Carrier | None = None
+            contact_email = ""
+            contact_domain = ""
+
+            if sender_role == SenderIdentityRole.CUSTOMER:
+                client_id = UUID(request.client_id) if request.client_id else shipment.client_id
+                if client_id is None:
+                    raise HTTPException(status_code=400, detail="Select or create a customer before confirming sender trust.")
+                client = await session.get(Client, client_id)
+                if client is None:
+                    raise HTTPException(status_code=404, detail="Selected customer record was not found.")
+                contact_email = (client.email or "").strip().lower()
+                contact_domain = extract_sender_domain(contact_email)
+                shipment.client_id = client.id
+            elif sender_role == SenderIdentityRole.CARRIER:
+                if not request.carrier_id:
+                    raise HTTPException(status_code=400, detail="Select or create a carrier before confirming sender trust.")
+                carrier = await session.get(Carrier, UUID(request.carrier_id))
+                if carrier is None:
+                    raise HTTPException(status_code=404, detail="Selected carrier record was not found.")
+                contact_email = (carrier.email or "").strip().lower()
+                contact_domain = extract_sender_domain(contact_email)
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported sender identity role.")
+
+            if trust_scope == SenderTrustScope.SENDER_EMAIL and contact_email != inbound_sender:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Contact email must exactly match the inbound sender address for email trust. "
+                        f"Selected contact uses {contact_email!r}; latest inbound sender is {inbound_sender!r}."
+                    ),
+                )
+            if trust_scope == SenderTrustScope.SENDER_DOMAIN and (not contact_domain or contact_domain != inbound_domain):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Contact domain must match the inbound sender domain for domain trust. "
+                        f"Selected contact domain is {contact_domain!r}; latest inbound sender domain is {inbound_domain!r}."
+                    ),
+                )
+            verify_evt = WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.SENDER_VERIFIED.value,
+                stage=shipment.status,
+                payload_json={
+                    "sender_email": inbound_sender,
+                    "sender_domain": inbound_domain,
+                    "sender_role": sender_role.value,
+                    "trust_scope": trust_scope.value,
+                    "client_id": str(client.id) if client is not None else None,
+                    "client_name": client.name if client is not None else None,
+                    "carrier_id": str(carrier.id) if carrier is not None else None,
+                    "carrier_name": carrier.name if carrier is not None else None,
+                    "contact_email": contact_email,
+                    "contact_domain": contact_domain,
+                },
+            )
+            session.add(verify_evt)
+            shipment.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(shipment)
+            await freight_realtime_hub.notify_workflow_event(verify_evt)
+            decision = await continue_phase1_workflow(session, shipment_id=shipment.id, policy=policy)
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed",
+                message=(
+                    f"Sender trust confirmed for this {trust_scope.value.replace('sender_', '')} "
+                    f"as {sender_role.value}. Workflow continued."
+                ),
+                next_action=decision.next_action,
+                manual_review_required=decision.manual_review_required,
+                acknowledgement_sent=decision.acknowledgement_drafted,
+                outreach_sent=decision.outreach_drafted,
+                evaluation_triggered=decision.evaluation_triggered,
+                quote_sent=decision.quote_auto_sent,
+                sender_identity_role=sender_role,
+                sender_trust_scope=trust_scope,
+                verified_sender_email=inbound_sender,
+                verified_sender_domain=inbound_domain,
+                verified_client_id=str(client.id) if client is not None else None,
+                verified_carrier_id=str(carrier.id) if carrier is not None else None,
+                decision=decision,
             )
 
         if request.action in {OperatorAction.RESUME_WORKFLOW, OperatorAction.APPROVE_AND_CONTINUE}:
@@ -3027,6 +3587,33 @@ async def freight_operator_action(
                 evaluation_triggered=decision.evaluation_triggered,
                 quote_sent=decision.quote_auto_sent,
                 decision=decision,
+            )
+
+        if request.action == OperatorAction.REQUEST_CUSTOMER_DETAILS:
+            if await customer_clarification_already_requested(session, shipment):
+                return ShipmentOperatorActionResponse(
+                    shipment_id=str(shipment.id),
+                    action=request.action,
+                    status="already_done",
+                    message="Customer details were already requested for this shipment.",
+                    next_action="waiting_customer_details",
+                )
+            missing_fields = await _latest_missing_fields_for_shipment(session, shipment)
+            sent = await send_customer_clarification(
+                session,
+                shipment_id=shipment.id,
+                missing_fields=missing_fields,
+            )
+            return ShipmentOperatorActionResponse(
+                shipment_id=str(shipment.id),
+                action=request.action,
+                status="completed" if sent else "already_done",
+                message=(
+                    "Requested additional details from the customer."
+                    if sent
+                    else "Customer details were already requested for this shipment."
+                ),
+                next_action="waiting_customer_details",
             )
 
         if request.action == OperatorAction.RERUN_PARSING:
@@ -3279,6 +3866,8 @@ async def freight_operator_action(
                 next_action="document_warning_ignored",
                 manual_review_required=False,
             )
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         logger.exception(
             "shipment_operator.action_failed shipment_id=%s action=%s",
@@ -3313,6 +3902,7 @@ async def archive_shipment(
             reason_code=request.reason_code,
             reason_note=request.reason_note,
             suppress_source_thread=request.suppress_source_thread,
+            fraud_block_scope=request.fraud_block_scope,
         ),
         session,
     )

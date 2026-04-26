@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+from app.services import freight_ai
 from app.services.freight_ai import (
     _invoke_structured_with_fallback,
     _classify_with_heuristics,
@@ -11,7 +12,8 @@ from app.services.freight_ai import (
     _extract_shipment_with_heuristics,
     _merge_shipment_results,
 )
-from app.schemas import ShipmentExtractionResult
+from app.services.freight_inbox_agent import _sender_role_for_inbox_context
+from app.schemas import IntentResult, ShipmentExtractionResult, ShipmentStage
 
 
 def test_extract_shipment_from_arrow_route_and_k_weight():
@@ -111,6 +113,45 @@ def test_classify_carrier_reply_without_quote_request_conflict():
     assert result.confidence >= 0.8
 
 
+def test_classify_short_ok_as_customer_quote_confirmation():
+    result = _classify_with_heuristics(
+        {
+            "subject": "Re: Quote Fresno, CA to Los Angeles, CA [Q-DC836F74]",
+            "body_preview": "Ok",
+            "sender_role": "client",
+            "shipment_status": "awaiting_confirmation",
+        }
+    )
+    assert result.intent == "customer_quote_confirmation"
+    assert result.confidence >= 0.85
+
+
+def test_classify_short_ok_does_not_confirm_before_quote_is_sent():
+    result = _classify_with_heuristics(
+        {
+            "subject": "Re: Quote Fresno, CA to Los Angeles, CA [Q-DC836F74]",
+            "body_preview": "Ok",
+            "sender_role": "client",
+            "shipment_status": "waiting_bids",
+        }
+    )
+    assert result.intent != "customer_quote_confirmation"
+
+
+def test_sender_role_prefers_client_while_awaiting_confirmation():
+    shipment = SimpleNamespace(status=ShipmentStage.AWAITING_CONFIRMATION.value)
+    client = SimpleNamespace(email="customer@example.com")
+    carrier = SimpleNamespace(email="customer@example.com")
+
+    role = _sender_role_for_inbox_context(
+        shipment=shipment,
+        client=client,
+        carrier=carrier,
+    )
+
+    assert role == "client"
+
+
 def test_extract_shipment_marks_multiple_routes_as_ambiguous():
     result = _extract_shipment_with_heuristics(
         {
@@ -202,6 +243,38 @@ class _FallbackJsonLlm(_BrokenStructuredLlm):
 
 
 import pytest
+
+
+class _NoiseIntentLlm:
+    def __init__(self):
+        self.called = False
+
+    def with_structured_output(self, _schema):
+        return self
+
+    async def ainvoke(self, prompt):
+        self.called = True
+        assert "short affirmative body such as OK" in prompt
+        return IntentResult(intent="noise_or_unhandled", confidence=0.9)
+
+
+@pytest.mark.asyncio
+async def test_classify_short_ok_calls_ai_and_keeps_confirmation(monkeypatch):
+    llm = _NoiseIntentLlm()
+    monkeypatch.setattr(freight_ai, "_choose_llm", lambda: llm)
+
+    result = await freight_ai.classify_email_intent(
+        {
+            "subject": "Re: Quote Fresno, CA to Los Angeles, CA [Q-DC836F74]",
+            "body_preview": "Ok",
+            "sender_role": "client",
+            "shipment_status": "awaiting_confirmation",
+        }
+    )
+
+    assert llm.called is True
+    assert result.intent == "customer_quote_confirmation"
+    assert result.confidence >= 0.85
 
 
 @pytest.mark.asyncio

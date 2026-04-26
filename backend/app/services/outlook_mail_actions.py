@@ -24,6 +24,9 @@ OUTLOOK_CATEGORY_NEEDS_REVIEW = "LC: Needs Review"
 OUTLOOK_CATEGORY_ARCHIVED = "LC: Archived"
 OUTLOOK_CATEGORY_EXCEPTION = "LC: Exception"
 OUTLOOK_CATEGORY_OTHER = "LC: Other"
+OUTLOOK_CATEGORY_NEW_SENDER = "LC: New Sender"
+OUTLOOK_CATEGORY_VERIFY_SENDER = "LC: Verify Sender"
+OUTLOOK_CATEGORY_PROBABLE_FRAUD = "LC: Probable Fraud"
 
 OUTLOOK_CATEGORY_COLORS = {
     OUTLOOK_CATEGORY_NEW_QUOTE: "preset4",
@@ -35,6 +38,9 @@ OUTLOOK_CATEGORY_COLORS = {
     OUTLOOK_CATEGORY_ARCHIVED: "preset8",
     OUTLOOK_CATEGORY_EXCEPTION: "preset0",
     OUTLOOK_CATEGORY_OTHER: "preset14",
+    OUTLOOK_CATEGORY_NEW_SENDER: "preset3",
+    OUTLOOK_CATEGORY_VERIFY_SENDER: "preset12",
+    OUTLOOK_CATEGORY_PROBABLE_FRAUD: "preset0",
 }
 
 
@@ -87,6 +93,21 @@ def outlook_categories_for_ai_decision(
     if manual_review_required:
         categories.append(OUTLOOK_CATEGORY_NEEDS_REVIEW)
 
+    return list(dict.fromkeys(categories))
+
+
+def outlook_categories_for_fraud_assessment(
+    *,
+    sender_verification_required: bool,
+    fraud_risk_level: str | None,
+) -> list[str]:
+    categories: list[str] = []
+    if sender_verification_required:
+        categories.extend([OUTLOOK_CATEGORY_NEW_SENDER, OUTLOOK_CATEGORY_VERIFY_SENDER])
+    if fraud_risk_level == "medium":
+        categories.extend([OUTLOOK_CATEGORY_VERIFY_SENDER, OUTLOOK_CATEGORY_NEEDS_REVIEW])
+    elif fraud_risk_level == "high":
+        categories.extend([OUTLOOK_CATEGORY_PROBABLE_FRAUD, OUTLOOK_CATEGORY_NEEDS_REVIEW])
     return list(dict.fromkeys(categories))
 
 

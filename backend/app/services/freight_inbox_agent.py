@@ -15,6 +15,8 @@ from app.schemas import (
     AutomationPolicy,
     BidIntakeRequest,
     CarrierBidExtractionResult,
+    FraudRiskLevel,
+    FraudReviewType,
     IntentResult,
     ShipmentExtractionResult,
     ShipmentStage,
@@ -46,6 +48,40 @@ from app.services.freight_outreach import create_carrier_outreach
 CRITICAL_SHIPMENT_FIELDS = {"origin", "destination"}
 RECOMMENDED_SHIPMENT_FIELDS = {"pallets", "weight_lb", "equipment_type", "ready_at"}
 AUTO_INTENT_CONFIDENCE = 0.6
+
+
+async def operator_sender_trust_confirmed(
+    session: AsyncSession,
+    *,
+    shipment_id: UUID | None,
+    sender_email: str | None,
+) -> bool:
+    """True when an operator recorded sender trust for this shipment and inbound address."""
+    if shipment_id is None or not sender_email:
+        return False
+    normalized = str(sender_email).strip().lower()
+    if not normalized:
+        return False
+    sender_domain = normalized.split("@", 1)[1] if "@" in normalized else ""
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment_id,
+            WorkflowEvent.event_type == WorkflowEventType.SENDER_VERIFIED.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+        .limit(40)
+    )
+    for event in result.scalars().all():
+        payload = dict(event.payload_json or {})
+        trust_scope = str(payload.get("trust_scope") or "sender_email")
+        trusted_email = str(payload.get("sender_email", "")).strip().lower()
+        trusted_domain = str(payload.get("sender_domain", "")).strip().lower().rstrip(".")
+        if trust_scope == "sender_domain" and trusted_domain and trusted_domain == sender_domain:
+            return True
+        if trust_scope == "sender_email" and trusted_email == normalized:
+            return True
+    return False
 AUTO_PARSE_CONFIDENCE = 0.65
 AUTO_BID_CONFIDENCE = 0.6
 logger = logging.getLogger(__name__)
@@ -129,6 +165,31 @@ async def resolve_carrier_for_inbound_thread_reply(
     return None, "unresolved", "no_carrier_match_from_thread"
 
 
+def _sender_role_for_inbox_context(
+    *,
+    shipment: Shipment | None,
+    client: Client | None,
+    carrier: Carrier | None,
+) -> str:
+    """Resolve ambiguous identities for workflow intent classification."""
+    if (
+        shipment is not None
+        and shipment.status
+        in {
+            ShipmentStage.WAITING_CUSTOMER_DETAILS.value,
+            ShipmentStage.QUOTED.value,
+            ShipmentStage.AWAITING_CONFIRMATION.value,
+        }
+        and client is not None
+    ):
+        return "client"
+    if carrier is not None:
+        return "carrier"
+    if client is not None:
+        return "client"
+    return "unknown"
+
+
 async def run_freight_inbox_orchestrator(
     session: AsyncSession,
     *,
@@ -145,6 +206,65 @@ async def run_freight_inbox_orchestrator(
     shipment = await session.scalar(
         select(Shipment).where(Shipment.email_thread_id == email_message.thread_id)
     )
+    fraud_payload = dict((email_message.raw_payload_json or {}).get("fraud", {}) or {})
+    fraud_level = fraud_payload.get("risk_level")
+    fraud_reasons = {str(reason) for reason in list(fraud_payload.get("reasons", []) or [])}
+    trust_confirmed = await operator_sender_trust_confirmed(
+        session,
+        shipment_id=shipment.id if shipment else None,
+        sender_email=email_message.sender,
+    )
+    if fraud_reasons & {"denylisted_sender_email", "denylisted_sender_domain"}:
+        trust_confirmed = False
+    if not trust_confirmed and (
+        fraud_payload.get("verification_required")
+        or fraud_level
+        in {
+            FraudRiskLevel.MEDIUM.value,
+            FraudRiskLevel.HIGH.value,
+        }
+    ):
+        if shipment is not None:
+            reason = (
+                "Probable fraud detected for sender domain verification."
+                if fraud_level == FraudRiskLevel.HIGH.value
+                else "Sender verification is required before automation continues."
+            )
+            await _log_manual_review(
+                session,
+                shipment.id,
+                reason,
+                intent_result=IntentResult(
+                    intent="sender_risk_assessment",
+                    confidence=float(fraud_payload.get("score") or 0),
+                ),
+                review_type=(
+                    FraudReviewType.PROBABLE_FRAUD.value
+                    if fraud_level == FraudRiskLevel.HIGH.value
+                    else FraudReviewType.SENDER_VERIFICATION.value
+                ),
+                next_action=(
+                    "probable_fraud_review"
+                    if fraud_level == FraudRiskLevel.HIGH.value
+                    else "sender_verification_required"
+                ),
+                ambiguity_reasons=list(fraud_payload.get("reasons", []) or []),
+                structured_payload=fraud_payload,
+                source_email_id=str(email_message.id),
+                allow_repeat=False,
+            )
+        return WorkflowDecisionResult(
+            email_message_id=str(email_message.id),
+            shipment_id=str(shipment.id) if shipment is not None else None,
+            intent="sender_risk_assessment",
+            confidence=float(fraud_payload.get("score") or 0),
+            next_action=(
+                "probable_fraud_review"
+                if fraud_level == FraudRiskLevel.HIGH.value
+                else "sender_verification_required"
+            ),
+            manual_review_required=True,
+        )
     client = await _resolve_client_by_email(session, sender_email=email_message.sender)
     carrier, carrier_resolution_mode, carrier_resolution_reason = await resolve_carrier_for_inbound_thread_reply(
         session,
@@ -165,7 +285,11 @@ async def run_freight_inbox_orchestrator(
 
     email_context = {
         "sender_email": email_message.sender,
-        "sender_role": "carrier" if carrier is not None else "client" if client is not None else "unknown",
+        "sender_role": _sender_role_for_inbox_context(
+            shipment=shipment,
+            client=client,
+            carrier=carrier,
+        ),
         "subject": email_message.subject,
         "body_preview": email_message.body_preview,
         "thread_subject": email_message.subject,
@@ -651,33 +775,44 @@ async def _handle_new_quote_request(
     if clarification_needed:
         shipment.status = ShipmentStage.WAITING_CUSTOMER_DETAILS.value
         shipment.updated_at = datetime.now(timezone.utc)
+        clarification_reason = (
+            "Missing critical shipment fields"
+            if critical_missing
+            else "Missing recommended shipment fields"
+        )
         await _log_event(
             session,
             shipment.id,
             WorkflowEventType.SHIPMENT_PARSE_FAILED.value,
             shipment.status,
             {
-                "reason": (
-                    "Missing critical shipment fields"
-                    if critical_missing
-                    else "Missing recommended shipment fields"
-                ),
+                "reason": clarification_reason,
                 "missing_fields": extraction.missing_fields,
                 "ambiguity_reasons": extraction.ambiguity_reasons,
                 "confidence": extraction.confidence,
                 "intent": intent_result.intent,
-                "next_action": "request_missing_info",
-                "manual_review_required": manual_review,
+                "next_action": "request_customer_details",
+                "manual_review_required": True,
                 "source_email_id": str(email_message.id),
             },
         )
         if client is not None:
-            if not await _has_open_review(session, shipment.id, "Missing critical shipment fields"):
-                await send_customer_clarification(
-                    session,
-                    shipment_id=shipment.id,
-                    missing_fields=extraction.missing_fields,
-                )
+            await _log_manual_review(
+                session,
+                shipment.id,
+                clarification_reason,
+                intent_result=intent_result,
+                review_type="customer_clarification_required",
+                next_action="request_customer_details",
+                structured_payload={
+                    "missing_fields": extraction.missing_fields,
+                    "critical_missing": critical_missing,
+                    "recommended_missing": recommended_missing,
+                },
+                source_email_id=str(email_message.id),
+                allow_repeat=policy.allow_repeat_manual_review,
+            )
+            manual_review = True
         else:
             await _log_manual_review(
                 session,
@@ -692,11 +827,11 @@ async def _handle_new_quote_request(
             shipment_id=str(shipment.id),
             intent=intent_result.intent,
             confidence=extraction.confidence,
-            next_action="request_missing_info",
+            next_action="request_customer_details",
             shipment_extracted=True,
             missing_fields=extraction.missing_fields,
             ambiguity_reasons=extraction.ambiguity_reasons,
-            manual_review_required=manual_review,
+            manual_review_required=True,
         )
 
     if manual_review or client is None:
@@ -1401,16 +1536,19 @@ async def send_customer_clarification(
     *,
     shipment_id: UUID,
     missing_fields: list[str],
-) -> None:
+) -> bool:
     shipment = await session.get(Shipment, shipment_id)
     if shipment is None or shipment.client_id is None or shipment.email_thread_id is None:
         raise RuntimeError("Shipment is not ready for customer clarification")
+    if await customer_clarification_already_requested(session, shipment):
+        return False
     client = await session.get(Client, shipment.client_id)
     if client is None:
         raise RuntimeError("Client not found for clarification")
+    effective_missing_fields = missing_fields or ["shipment details"]
     body = (
         "We need a few more details before we can price this load.\n\n"
-        f"Missing fields: {', '.join(missing_fields)}\n\n"
+        f"Missing fields: {', '.join(effective_missing_fields)}\n\n"
         "Please reply with the missing information and we will continue right away."
     )
     subject = f"Need more details for your quote [{shipment.quote_token or 'Q-UNKNOWN'}]"
@@ -1432,7 +1570,7 @@ async def send_customer_clarification(
             body_preview=body[:1000],
             raw_payload_json={
                 "type": "customer_clarification",
-                "missing_fields": missing_fields,
+                "missing_fields": effective_missing_fields,
                 **delivery_payload,
             },
             received_at=datetime.now(timezone.utc),
@@ -1440,8 +1578,42 @@ async def send_customer_clarification(
     )
     shipment.status = ShipmentStage.WAITING_CUSTOMER_DETAILS.value
     shipment.updated_at = datetime.now(timezone.utc)
+    session.add(
+        WorkflowEvent(
+            shipment_id=shipment.id,
+            event_type=WorkflowEventType.CUSTOMER_DETAILS_REQUESTED.value,
+            stage=shipment.status,
+            payload_json={
+                "missing_fields": effective_missing_fields,
+                "dry_run": False,
+                **delivery_payload,
+            },
+        )
+    )
     await session.commit()
     await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+    return True
+
+
+async def customer_clarification_already_requested(
+    session: AsyncSession,
+    shipment: Shipment,
+) -> bool:
+    if shipment.email_thread_id is None:
+        return False
+    result = await session.execute(
+        select(EmailMessage)
+        .where(
+            EmailMessage.thread_id == shipment.email_thread_id,
+            EmailMessage.direction == "outbound",
+        )
+        .order_by(EmailMessage.received_at.desc())
+    )
+    for message in result.scalars().all():
+        payload = dict(message.raw_payload_json or {})
+        if payload.get("type") == "customer_clarification":
+            return True
+    return False
 
 
 async def _has_event(session: AsyncSession, shipment_id: UUID, event_type: str) -> bool:
@@ -1489,6 +1661,7 @@ async def _log_manual_review(
 ) -> None:
     if not allow_repeat and await _has_open_review(session, shipment_id, reason):
         return
+    structured_payload = structured_payload or {}
     await _log_event(
         session,
         shipment_id,
@@ -1501,7 +1674,8 @@ async def _log_manual_review(
             "confidence": intent_result.confidence,
             "next_action": next_action,
             "ambiguity_reasons": ambiguity_reasons or [],
-            "structured_payload": structured_payload or {},
+            "missing_fields": list(structured_payload.get("missing_fields", []) or []),
+            "structured_payload": structured_payload,
             "source_email_id": source_email_id,
             "status_audit_kind": "status_review_required" if review_type and "status" in review_type else "manual_review_required",
             "manual_review_required": True,

@@ -4,7 +4,10 @@ from uuid import uuid4
 import pytest
 
 from app.memory.database import EmailMessage, Shipment
+from app.memory.database import Carrier, Client
+from app.schemas import ShipmentStage
 from app.services import freight_execution
+from app.services.freight_inbox_agent import _sender_role_for_inbox_context
 
 
 class FakeScalarSession:
@@ -37,6 +40,40 @@ def _inbound_message(*, thread_id, message_id, sender="client@example.com", rece
         body_preview="Please quote this shipment",
         received_at=received_at or datetime.now(timezone.utc),
     )
+
+
+def test_sender_role_prefers_client_when_waiting_for_customer_details():
+    shipment = Shipment(
+        id=uuid4(),
+        status=ShipmentStage.WAITING_CUSTOMER_DETAILS.value,
+    )
+    client = Client(id=uuid4(), name="Client", email="same@example.com")
+    carrier = Carrier(id=uuid4(), name="Carrier", email="same@example.com")
+
+    role = _sender_role_for_inbox_context(
+        shipment=shipment,
+        client=client,
+        carrier=carrier,
+    )
+
+    assert role == "client"
+
+
+def test_sender_role_keeps_carrier_for_normal_carrier_replies():
+    shipment = Shipment(
+        id=uuid4(),
+        status=ShipmentStage.WAITING_BIDS.value,
+    )
+    client = Client(id=uuid4(), name="Client", email="same@example.com")
+    carrier = Carrier(id=uuid4(), name="Carrier", email="same@example.com")
+
+    role = _sender_role_for_inbox_context(
+        shipment=shipment,
+        client=client,
+        carrier=carrier,
+    )
+
+    assert role == "carrier"
 
 
 @pytest.mark.asyncio

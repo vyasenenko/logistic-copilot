@@ -9,9 +9,15 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.memory.database import Carrier, Client, EmailMessage, EmailThread, Shipment, WorkflowEvent
-from app.schemas import OutlookIngestResult, ShipmentStage, WorkflowEventType
+from app.memory.database import Carrier, Client, EmailMessage, EmailThread, FraudDenylistEntry, Shipment, WorkflowEvent
+from app.schemas import FraudDenylistScope, OutlookIngestResult, ShipmentStage, WorkflowEventType
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
+from app.services.email_fraud import (
+    assess_sender_risk,
+    extract_sender_domain,
+    fraud_assessment_from_denylist_match,
+    normalize_sender_email,
+)
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.outlook import OutlookMailboxMessage
 
@@ -103,13 +109,12 @@ async def _find_or_create_thread(
         if message_id
     ]
     if thread is None and reply_like and reply_message_ids:
-        referenced_message = await session.scalar(
-            select(EmailMessage)
+        thread = await session.scalar(
+            select(EmailThread)
+            .join(EmailMessage, EmailMessage.thread_id == EmailThread.id)
             .where(EmailMessage.internet_message_id.in_(reply_message_ids))
             .order_by(EmailMessage.received_at.desc())
         )
-        if referenced_message is not None:
-            thread = referenced_message.thread
 
     if thread is None and subject_quote_token:
         thread = await session.scalar(
@@ -208,6 +213,32 @@ async def _find_or_create_shipment(
     await session.flush()
     return shipment, True
 
+
+async def _find_active_fraud_denylist_entry(
+    session: AsyncSession,
+    *,
+    sender_email: str,
+) -> FraudDenylistEntry | None:
+    normalized_email = normalize_sender_email(sender_email)
+    sender_domain = extract_sender_domain(normalized_email)
+    if not normalized_email:
+        return None
+    result = await session.execute(
+        select(FraudDenylistEntry)
+        .where(FraudDenylistEntry.is_active.is_(True))
+        .where(
+            or_(
+                (FraudDenylistEntry.scope == FraudDenylistScope.SENDER_EMAIL.value)
+                & (FraudDenylistEntry.value == normalized_email),
+                (FraudDenylistEntry.scope == FraudDenylistScope.SENDER_DOMAIN.value)
+                & (FraudDenylistEntry.value == sender_domain),
+            )
+        )
+        .order_by(FraudDenylistEntry.created_at.desc())
+    )
+    return result.scalars().first()
+
+
 async def ingest_outlook_message(
     session: AsyncSession,
     mailbox_message: OutlookMailboxMessage,
@@ -227,6 +258,7 @@ async def ingest_outlook_message(
         shipment = await session.scalar(
             select(Shipment).where(Shipment.email_thread_id == existing_message.thread_id).order_by(Shipment.created_at.desc())
         )
+        fraud_payload = dict((existing_message.raw_payload_json or {}).get("fraud", {}) or {})
         if shipment is None:
             return None
         return OutlookIngestResult(
@@ -241,6 +273,13 @@ async def ingest_outlook_message(
             suppressed=bool(shipment.is_archived and shipment.email_thread_id),
             suppression_reason=shipment.archived_reason if shipment.is_archived else None,
             shipment_creation_skipped=bool(shipment.is_archived),
+            sender_known=bool(fraud_payload.get("sender_known", False)),
+            sender_verification_required=bool(fraud_payload.get("verification_required", False)),
+            fraud_risk_level=fraud_payload.get("risk_level"),
+            fraud_risk_reasons=list(fraud_payload.get("reasons", []) or []),
+            fraud_score=fraud_payload.get("score"),
+            sender_email=fraud_payload.get("sender_email"),
+            sender_domain=fraud_payload.get("sender_domain"),
         )
 
     quote_reference = generate_quote_reference()
@@ -282,17 +321,59 @@ async def ingest_outlook_message(
     session.add(email_message)
     await session.flush()
 
-    carrier = await session.scalar(select(Carrier).where(Carrier.email == mailbox_message.sender_email))
-
-    client = None
-    created_client = False
-    if carrier is None and not thread.shipment_ingest_suppressed:
-        client, created_client = await _find_or_create_client(
-            session,
+    denylist_entry = await _find_active_fraud_denylist_entry(
+        session,
+        sender_email=mailbox_message.sender_email,
+    )
+    if denylist_entry is not None:
+        fraud_assessment = fraud_assessment_from_denylist_match(
+            sender_email=mailbox_message.sender_email,
+            scope=denylist_entry.scope,
+            value=denylist_entry.value,
+        )
+    else:
+        known_sender_rows = await session.execute(select(Client.email))
+        known_carrier_rows = await session.execute(select(Carrier.email))
+        known_senders = {
+            str(value).strip().lower()
+            for value in [*known_sender_rows.scalars().all(), *known_carrier_rows.scalars().all()]
+            if str(value).strip()
+        }
+        known_domains = {
+            email.split("@", 1)[1]
+            for email in known_senders
+            if "@" in email
+        }
+        fraud_assessment = assess_sender_risk(
             sender_email=mailbox_message.sender_email,
             sender_name=mailbox_message.sender_name,
-            create_if_missing=create_client_if_missing,
+            known_senders=known_senders,
+            known_domains=known_domains,
         )
+    email_payload = dict(email_message.raw_payload_json or {})
+    fraud_payload = fraud_assessment.model_dump(mode="json")
+    if denylist_entry is not None:
+        fraud_payload["denylist_entry_id"] = str(denylist_entry.id)
+        fraud_payload["denylist_scope"] = denylist_entry.scope
+        fraud_payload["denylist_value"] = denylist_entry.value
+    email_payload["fraud"] = fraud_payload
+    email_message.raw_payload_json = email_payload
+    session.add(email_message)
+    await session.flush()
+
+    carrier = await session.scalar(select(Carrier).where(Carrier.email == mailbox_message.sender_email))
+    client = await session.scalar(select(Client).where(Client.email == mailbox_message.sender_email))
+
+    created_client = False
+    if carrier is None and client is None and not thread.shipment_ingest_suppressed and denylist_entry is None:
+        # New senders are ingested for review, but are not auto-trusted as customers.
+        if not fraud_assessment.verification_required and create_client_if_missing:
+            client, created_client = await _find_or_create_client(
+                session,
+                sender_email=mailbox_message.sender_email,
+                sender_name=mailbox_message.sender_name,
+                create_if_missing=create_client_if_missing,
+            )
 
     shipment = None
     created_shipment = False
@@ -304,13 +385,25 @@ async def ingest_outlook_message(
             client=client,
             body_preview=mailbox_message.body_preview,
         )
+        if denylist_entry is not None:
+            now = datetime.now(timezone.utc)
+            suppression_reason = f"fraud_denylist:{denylist_entry.scope}:{denylist_entry.value}"
+            shipment.is_archived = True
+            shipment.archive_reason_code = "fraud"
+            shipment.archive_reason_note = suppression_reason
+            shipment.archived_reason = suppression_reason
+            shipment.archived_at = now
+            shipment.updated_at = now
+            thread.shipment_ingest_suppressed = True
+            thread.shipment_ingest_suppressed_reason = suppression_reason
+            thread.shipment_ingest_suppressed_at = now
     else:
         shipment_creation_skipped = True
         shipment = await session.scalar(
             select(Shipment).where(Shipment.email_thread_id == thread.id).order_by(Shipment.created_at.desc())
         )
 
-    workflow_event = None
+    workflow_events: list[WorkflowEvent] = []
     if shipment is not None:
         workflow_event = WorkflowEvent(
             shipment_id=shipment.id,
@@ -322,12 +415,39 @@ async def ingest_outlook_message(
                 "sender": mailbox_message.sender_email,
                 "subject": mailbox_message.subject,
                 "suppressed": bool(thread.shipment_ingest_suppressed),
+                "fraud": fraud_payload,
             },
         )
         session.add(workflow_event)
+        workflow_events.append(workflow_event)
+        if denylist_entry is not None:
+            archive_payload = {
+                "reason": thread.shipment_ingest_suppressed_reason,
+                "reason_code": "fraud",
+                "reason_note": thread.shipment_ingest_suppressed_reason,
+                "email_thread_id": str(thread.id),
+                "denylist_entry_id": str(denylist_entry.id),
+                "denylist_scope": denylist_entry.scope,
+                "denylist_value": denylist_entry.value,
+            }
+            archive_event = WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.SHIPMENT_ARCHIVED.value,
+                stage=shipment.status,
+                payload_json={**archive_payload, "suppress_source_thread": True},
+            )
+            suppress_event = WorkflowEvent(
+                shipment_id=shipment.id,
+                event_type=WorkflowEventType.SHIPMENT_SOURCE_SUPPRESSED.value,
+                stage=shipment.status,
+                payload_json={**archive_payload, "suppressed": True},
+            )
+            session.add(archive_event)
+            session.add(suppress_event)
+            workflow_events.extend([archive_event, suppress_event])
     await session.commit()
-    if workflow_event is not None:
-        await freight_realtime_hub.notify_workflow_event(workflow_event)
+    if workflow_events:
+        await freight_realtime_hub.notify_workflow_events(workflow_events)
 
     return OutlookIngestResult(
         thread_id=str(thread.id),
@@ -341,4 +461,11 @@ async def ingest_outlook_message(
         suppressed=bool(thread.shipment_ingest_suppressed),
         suppression_reason=thread.shipment_ingest_suppressed_reason,
         shipment_creation_skipped=shipment_creation_skipped,
+        sender_known=fraud_assessment.sender_known,
+        sender_verification_required=fraud_assessment.verification_required,
+        fraud_risk_level=fraud_assessment.risk_level,
+        fraud_risk_reasons=list(fraud_assessment.reasons),
+        fraud_score=fraud_assessment.score,
+        sender_email=fraud_assessment.sender_email,
+        sender_domain=fraud_assessment.sender_domain,
     )

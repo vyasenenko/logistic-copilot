@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     microsoft_webhook_startup_delay_seconds: int = 8
     microsoft_webhook_renew_interval_seconds: int = 43200
     microsoft_webhook_renewal_buffer_minutes: int = 2880
-    microsoft_webhook_expiration_minutes: int = 10080
+    microsoft_webhook_expiration_minutes: int = 10070
 
     # TMS integration
     tms_base_url: str = ""
