@@ -32,6 +32,7 @@ import {
   Search,
   Send,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Truck,
   Users,
@@ -39,6 +40,7 @@ import {
 } from "lucide-react";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const OUTLOOK_STATUS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers" | "archive";
 type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
@@ -269,6 +271,22 @@ interface OutlookSyncResponse {
   results: OutlookIngestResult[];
 }
 
+interface OutlookWebhookStatusResponse {
+  configured: boolean;
+  status: string;
+  missing_fields: string[];
+  expected_notification_url: string | null;
+  expected_resource: string | null;
+  expected_change_type: string | null;
+  subscription_id: string | null;
+  subscription_action: string | null;
+  expires_at: string | null;
+  matching_count: number;
+  active_matching_count: number;
+  total_subscriptions: number;
+  last_checked_at: string | null;
+}
+
 interface ShipmentOperatorActionResponse {
   message: string;
   archived?: boolean;
@@ -378,6 +396,24 @@ interface EvaluationResponse {
   selected_bid_id: string;
   selected_amount: number;
   recommended_quote_amount: number;
+}
+
+interface FinancialShipmentSummary {
+  shipment_id: string;
+  best_bid_amount: number | null;
+  best_bid_id: string | null;
+  bid_count: number;
+  priced_bid_count: number;
+  margin_amount: number;
+  margin_percent: number;
+  recommended_quote_amount: number | null;
+  selected_bid_amount: number | null;
+  selected_quote_amount: number | null;
+  currency: string;
+}
+
+interface FinancialSummaryResponse {
+  shipments: FinancialShipmentSummary[];
 }
 
 interface CustomerQuoteResponse {
@@ -511,6 +547,29 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+function readCachedOutlookStatus(cacheKey: string) {
+  if (typeof window === "undefined") return null;
+  try {
+    const rawValue = window.localStorage.getItem(cacheKey);
+    if (!rawValue) return null;
+    const cached = JSON.parse(rawValue) as { cached_at?: number; data?: OutlookWebhookStatusResponse };
+    if (!cached.cached_at || !cached.data) return null;
+    if (Date.now() - cached.cached_at > OUTLOOK_STATUS_CACHE_TTL_MS) return null;
+    return cached.data;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedOutlookStatus(cacheKey: string, data: OutlookWebhookStatusResponse) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(cacheKey, JSON.stringify({ cached_at: Date.now(), data }));
+  } catch {
+    // Cache writes are best-effort; Outlook status should never block the board.
+  }
+}
+
 function formatDate(value: string | null) {
   if (!value) return "Not scheduled";
   return new Intl.DateTimeFormat("en", {
@@ -519,6 +578,22 @@ function formatDate(value: string | null) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function webhookStatusLabel(status: string | null | undefined) {
+  if (status === "active") return "Active";
+  if (status === "expiring_soon") return "Renew soon";
+  if (status === "expired") return "Expired";
+  if (status === "not_installed") return "Not installed";
+  if (status === "missing_configuration") return "Config missing";
+  return "Unknown";
+}
+
+function webhookStatusClasses(status: string | null | undefined) {
+  if (status === "active") return "border-emerald-300/24 bg-emerald-300/12 text-emerald-50";
+  if (status === "expiring_soon") return "border-amber-300/24 bg-amber-300/12 text-amber-50";
+  if (status === "expired" || status === "not_installed") return "border-rose-300/24 bg-rose-300/12 text-rose-50";
+  return "border-white/10 bg-white/5 text-slate-300";
 }
 
 function formatShipmentSchedule(displayValue: string | null, localValue: string | null) {
@@ -596,6 +671,16 @@ function formatAge(value: string | null) {
 function formatConfidence(value: number | null) {
   if (value === null || value === undefined) return "--";
   return `${Math.round(value * 100)}%`;
+}
+
+function formatCurrency(value: number | null | undefined, options?: { compact?: boolean }) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "--";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: options?.compact ? 1 : 0,
+    notation: options?.compact ? "compact" : "standard",
+  }).format(value);
 }
 
 function formatRoute(shipment: ShipmentRecord) {
@@ -902,6 +987,7 @@ export function FreightDashboardWorkspace() {
   const BOARD_FILTER_STORAGE_KEY = "logistic-copilot-board-filter";
   const BOARD_MONTH_STORAGE_KEY = "logistic-copilot-board-month";
   const BOARD_CONTROLS_STORAGE_KEY = "logistic-copilot-board-controls-expanded";
+  const OUTLOOK_STATUS_STORAGE_KEY = "logistic-copilot-outlook-webhook-status";
   const [tab, setTab] = useState<DashboardTab>("shipments");
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("overview");
   const [drawerMode, setDrawerMode] = useState<DrawerMode>("overview");
@@ -917,6 +1003,8 @@ export function FreightDashboardWorkspace() {
   const [clients, setClients] = useState<ClientRecord[]>([]);
   const [carriers, setCarriers] = useState<CarrierRecord[]>([]);
   const [shipments, setShipments] = useState<ShipmentRecord[]>([]);
+  const [financialSummary, setFinancialSummary] = useState<FinancialSummaryResponse>({ shipments: [] });
+  const [financialSummaryLoading, setFinancialSummaryLoading] = useState(false);
   const [archivedShipments, setArchivedShipments] = useState<ShipmentRecord[]>([]);
   const [archiveSearch, setArchiveSearch] = useState("");
   const [archiveReasonFilter, setArchiveReasonFilter] = useState<ArchiveReasonCode | "all">("all");
@@ -932,6 +1020,10 @@ export function FreightDashboardWorkspace() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [lastSyncSummary, setLastSyncSummary] = useState<OutlookSyncResponse | null>(null);
+  const [webhookStatus, setWebhookStatus] = useState<OutlookWebhookStatusResponse | null>(null);
+  const [outlookStatusLoading, setOutlookStatusLoading] = useState(false);
+  const [syncLimit, setSyncLimit] = useState(10);
+  const [syncMenuOpen, setSyncMenuOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
   const [notificationLoading, setNotificationLoading] = useState(false);
@@ -1111,6 +1203,52 @@ export function FreightDashboardWorkspace() {
     });
     return groups;
   }, [boardShipments]);
+  const financialByShipmentId = useMemo(() => {
+    return new Map(financialSummary.shipments.map((item) => [item.shipment_id, item]));
+  }, [financialSummary]);
+  const financialSnapshot = useMemo(() => {
+    const rows = boardShipments.map((shipment) => ({
+      shipment,
+      financial: financialByShipmentId.get(shipment.id) || null,
+    }));
+    const quoteRows = rows
+      .map((row) => ({
+        ...row,
+        projectedQuote: row.financial?.selected_quote_amount || row.financial?.recommended_quote_amount || 0,
+        projectedMargin: row.financial?.margin_amount || 0,
+        bestBid: row.financial?.selected_bid_amount || row.financial?.best_bid_amount || 0,
+      }))
+      .filter((row) => row.projectedQuote > 0);
+    const pipelineValue = quoteRows.reduce((total, row) => total + row.projectedQuote, 0);
+    const bookedValue = quoteRows
+      .filter((row) => row.shipment.board_stage === "booked")
+      .reduce((total, row) => total + row.projectedQuote, 0);
+    const quotedValue = quoteRows
+      .filter((row) => row.shipment.board_stage === "quoted")
+      .reduce((total, row) => total + row.projectedQuote, 0);
+    const waitingBidExposure = rows
+      .filter((row) => row.shipment.board_stage === "waiting_bids")
+      .reduce((total, row) => total + (row.financial?.best_bid_amount || 0), 0);
+    const atRiskValue = quoteRows
+      .filter((row) => shipmentNeedsAttention(row.shipment))
+      .reduce((total, row) => total + row.projectedQuote, 0);
+    const bidCostTotal = quoteRows.reduce((total, row) => total + row.bestBid, 0);
+    const marginTotal = quoteRows.reduce((total, row) => total + row.projectedMargin, 0);
+    const topOpportunity = [...quoteRows].sort((first, second) => second.projectedMargin - first.projectedMargin)[0] || null;
+
+    return {
+      rows,
+      pipelineValue,
+      bookedValue,
+      quotedValue,
+      waitingBidExposure,
+      atRiskValue,
+      avgMarginPercent: bidCostTotal > 0 ? Math.round((marginTotal / bidCostTotal) * 1000) / 10 : 0,
+      noBidCount: rows.filter((row) => (row.financial?.priced_bid_count || 0) === 0).length,
+      readyToQuoteCount: rows.filter((row) => (row.financial?.priced_bid_count || 0) > 0 && row.shipment.board_stage !== "booked").length,
+      topOpportunity,
+    };
+  }, [boardShipments, financialByShipmentId]);
   const unreadNotificationCount = useMemo(
     () => notifications.reduce((total, item) => total + (item.unread ? 1 : 0), 0),
     [notifications],
@@ -1267,6 +1405,20 @@ export function FreightDashboardWorkspace() {
     setOverview(overviewData);
   }
 
+  async function refreshFinancialSummary(month = selectedBoardMonth, options?: { silent?: boolean }) {
+    if (!options?.silent) {
+      setFinancialSummaryLoading(true);
+    }
+    try {
+      const financialData = await fetchJson<FinancialSummaryResponse>(`/api/freight/financial-summary?month=${encodeURIComponent(month)}`);
+      setFinancialSummary(financialData);
+    } finally {
+      if (!options?.silent) {
+        setFinancialSummaryLoading(false);
+      }
+    }
+  }
+
   async function refreshReviewQueue() {
     const reviewData = await fetchJson<ReviewQueueItem[]>("/api/freight/reviews");
     setReviewQueue(reviewData);
@@ -1355,6 +1507,8 @@ export function FreightDashboardWorkspace() {
           setBidForm((current) => ({ ...current, carrier_id: carrierData[0].id }));
         }
       });
+      void refreshFinancialSummary(selectedBoardMonth).catch(() => undefined);
+      void loadWebhookStatus({ silent: true, allowCache: true }).catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Failed to load dashboard.");
     } finally {
@@ -1520,6 +1674,7 @@ export function FreightDashboardWorkspace() {
         .finally(() => {
           setBackgroundRefreshing(false);
         });
+      void refreshFinancialSummary(undefined, { silent: true }).catch(() => undefined);
     }, 180);
   }
 
@@ -1577,6 +1732,7 @@ export function FreightDashboardWorkspace() {
     void refreshShipmentList(selectedBoardMonth).catch((loadError) => {
       setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipments for selected month.");
     });
+    void refreshFinancialSummary(selectedBoardMonth).catch(() => undefined);
   }, [selectedBoardMonth]);
 
   useEffect(() => {
@@ -1818,6 +1974,7 @@ export function FreightDashboardWorkspace() {
       await Promise.all([
         refreshSelectedShipment(targetShipmentId),
         refreshOverview(),
+        refreshFinancialSummary(),
         refreshReviewQueue(),
         refreshStatusQueue(),
       ]);
@@ -2083,13 +2240,59 @@ export function FreightDashboardWorkspace() {
     }
   }
 
-  async function handleOutlookSync() {
+  async function loadWebhookStatus(options?: { silent?: boolean; allowCache?: boolean }) {
+    if (options?.allowCache) {
+      const cachedStatus = readCachedOutlookStatus(OUTLOOK_STATUS_STORAGE_KEY);
+      if (cachedStatus) {
+        setWebhookStatus(cachedStatus);
+        return;
+      }
+    }
+    setOutlookStatusLoading(true);
+    try {
+      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/status");
+      setWebhookStatus(response);
+      writeCachedOutlookStatus(OUTLOOK_STATUS_STORAGE_KEY, response);
+      if (!options?.silent) {
+        setNotice(`Outlook webhook check: ${webhookStatusLabel(response.status)}.`);
+      }
+    } catch (statusError) {
+      if (!options?.silent) {
+        setWebhookStatus(null);
+        setError(statusError instanceof Error ? statusError.message : "Failed to check Outlook webhook.");
+      }
+    } finally {
+      setOutlookStatusLoading(false);
+    }
+  }
+
+  async function handleEnsureWebhook() {
+    setSubmitting("webhook");
+    setSyncMenuOpen(false);
+    try {
+      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/ensure", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setWebhookStatus(response);
+      writeCachedOutlookStatus(OUTLOOK_STATUS_STORAGE_KEY, response);
+      setNotice(`Outlook webhook ${response.subscription_action || "checked"}: ${webhookStatusLabel(response.status)}.`);
+      appendNotification(createSystemNotification("Outlook webhook checked", `Webhook is ${webhookStatusLabel(response.status).toLowerCase()}.`));
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to install Outlook webhook.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleOutlookSync(limit = syncLimit) {
     setSubmitting("sync");
+    setSyncMenuOpen(false);
     try {
       const response = await fetchJson<OutlookSyncResponse>("/api/freight/outlook/sync", {
         method: "POST",
         body: JSON.stringify({
-          limit: 10,
+          limit,
           auto_acknowledge_new_shipments: true,
           acknowledgement_dry_run: false,
           auto_prepare_outreach_for_new_shipments: true,
@@ -2127,6 +2330,7 @@ export function FreightDashboardWorkspace() {
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
+        refreshFinancialSummary(),
       ]);
       await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
@@ -2200,6 +2404,7 @@ export function FreightDashboardWorkspace() {
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
+        refreshFinancialSummary(),
         refreshStatusQueue(),
       ]);
       await refreshSelectedShipmentContext(selectedShipment.id);
@@ -2231,6 +2436,7 @@ export function FreightDashboardWorkspace() {
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
+        refreshFinancialSummary(),
       ]);
       await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
@@ -3078,7 +3284,10 @@ export function FreightDashboardWorkspace() {
                   </div>
                 ))}
                 <button
-                  onClick={() => setNotificationCenterOpen((open) => !open)}
+                  onClick={() => {
+                    setSyncMenuOpen(false);
+                    setNotificationCenterOpen((open) => !open);
+                  }}
                   className="relative min-h-[68px] overflow-hidden rounded-[13px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] px-2.5 py-2 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-cyan-200/24 hover:bg-cyan-200/10"
                 >
                   <span className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-[64px] font-black leading-none tracking-[-0.05em] text-cyan-100/[0.08]">
@@ -3096,21 +3305,31 @@ export function FreightDashboardWorkspace() {
                     </div>
                   </div>
                 </button>
-                <button
-                  onClick={() => void handleOutlookSync()}
-                  disabled={submitting !== null}
-                  className="min-h-[68px] rounded-[13px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-2.5 py-2 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Outlook</p>
-                      <span className="mt-0.5 inline-flex items-center gap-1.5 text-[15px] font-semibold text-white">
-                        <Mail size={16} /> {submitting === "sync" ? "Syncing..." : "Sync"}
+                <div className="relative">
+                  <button
+                    onClick={() => {
+                      setNotificationCenterOpen(false);
+                      setSyncMenuOpen((open) => !open);
+                    }}
+                    disabled={submitting !== null && submitting !== "sync" && submitting !== "webhook"}
+                    className="min-h-[68px] w-full rounded-[13px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-2.5 py-2 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
+                  >
+                    <div className="flex h-full min-w-0 flex-col justify-between gap-1">
+                      <div className="flex min-w-0 items-center justify-between gap-2">
+                        <p className="min-w-0 truncate text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Outlook</p>
+                        <span className={`h-2 w-2 shrink-0 rounded-full ${outlookStatusLoading ? "animate-pulse bg-cyan-200" : webhookStatus?.status === "active" ? "bg-emerald-200" : webhookStatus?.status === "expiring_soon" ? "bg-amber-200" : "bg-rose-200"}`} />
+                      </div>
+                      <span className="flex min-w-0 items-center gap-1.5 text-[14px] font-semibold leading-5 text-white">
+                          {submitting === "sync" ? <Loader2 className="animate-spin" size={16} /> : <SlidersHorizontal size={16} />}
+                          <span className="min-w-0 truncate">Ops</span>
+                        <ChevronDown size={15} className="ml-auto shrink-0 text-cyan-100/80" />
                       </span>
-                      <p className="mt-0.5 text-[10px] text-cyan-100/70">last 10 mails</p>
+                      <p className="min-w-0 truncate text-[10px] leading-4 text-cyan-100/70">
+                        {syncLimit} mails · {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
+                      </p>
                     </div>
-                  </div>
-                </button>
+                  </button>
+                </div>
             </div>
           </div>
 
@@ -3325,7 +3544,7 @@ export function FreightDashboardWorkspace() {
               </div>
             </div>
             <div className="overflow-x-auto rounded-[32px] border border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(75,211,255,0.08),transparent_32%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01))] p-4">
-              <div className="flex min-w-[1320px] gap-4">
+              <div className="flex min-w-[1414px] gap-4">
                 {boardColumns.map((column) => {
                   const items = groupedShipmentsByStatus[column.key] || [];
                   return (
@@ -3409,6 +3628,114 @@ export function FreightDashboardWorkspace() {
                     </div>
                   );
                 })}
+                <div className="flex min-h-[72vh] w-[310px] flex-col rounded-[28px] border border-white/10 bg-slate-950/25">
+                  <div className="sticky top-0 z-10 rounded-t-[28px] border-b border-white/10 bg-gradient-to-b from-cyan-300/12 to-slate-900/0 px-4 py-4 backdrop-blur">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium text-white">Financial Snapshot</p>
+                        <p className="mt-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">visible board value</p>
+                      </div>
+                      <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-cyan-300/10 text-cyan-100">
+                        {financialSummaryLoading ? <Loader2 className="animate-spin" size={16} /> : <CircleDollarSign size={17} />}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex-1 space-y-2 p-3">
+                    <div className="rounded-[18px] border border-white/10 bg-white/[0.05] px-3 pt-3 pb-2.5">
+                      <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">Pipeline value</p>
+                      <p className="mt-2 text-2xl font-semibold leading-none text-white">{formatCurrency(financialSnapshot.pipelineValue, { compact: true })}</p>
+                      <div className="mt-3 grid grid-cols-2 gap-2 text-[10px]">
+                        <div className="min-w-0 rounded-[12px] border border-white/10 bg-slate-950/24 p-2">
+                          <p className="text-[var(--text-muted)]">Quoted</p>
+                          <p className="mt-1 font-medium text-white">{formatCurrency(financialSnapshot.quotedValue, { compact: true })}</p>
+                        </div>
+                        <div className="min-w-0 rounded-[12px] border border-white/10 bg-slate-950/24 p-2">
+                          <p className="text-[var(--text-muted)]">Booked</p>
+                          <p className="mt-1 font-medium text-white">{formatCurrency(financialSnapshot.bookedValue, { compact: true })}</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="rounded-[18px] border border-white/10 bg-white/[0.05] p-3">
+                        <p className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Avg margin</p>
+                        <p className="mt-2 text-lg font-semibold text-white">{financialSnapshot.avgMarginPercent ? `${financialSnapshot.avgMarginPercent}%` : "--"}</p>
+                      </div>
+                      <div className="rounded-[18px] border border-white/10 bg-white/[0.05] p-3">
+                        <p className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Bid exposure</p>
+                        <p className="mt-2 text-lg font-semibold text-white">{formatCurrency(financialSnapshot.waitingBidExposure, { compact: true })}</p>
+                      </div>
+                      <div className="rounded-[18px] border border-amber-200/18 bg-amber-300/10 p-3">
+                        <p className="text-[10px] uppercase tracking-[0.16em] text-amber-100/78">At risk</p>
+                        <p className="mt-2 text-lg font-semibold text-white">{formatCurrency(financialSnapshot.atRiskValue, { compact: true })}</p>
+                      </div>
+                      <div className="rounded-[18px] border border-white/10 bg-white/[0.05] p-3">
+                        <p className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">No bid yet</p>
+                        <p className="mt-2 text-lg font-semibold text-white">{financialSnapshot.noBidCount}</p>
+                      </div>
+                    </div>
+
+                    {financialSnapshot.topOpportunity ? (
+                      <button
+                        type="button"
+                        onClick={() => selectShipment(financialSnapshot.topOpportunity?.shipment.id || "", { openDrawer: true })}
+                        className="group relative w-full overflow-hidden rounded-[18px] border border-white/10 bg-white/[0.05] px-3 pt-2.5 pb-3 text-left transition hover:-translate-y-0.5 hover:border-cyan-200/24 hover:bg-white/[0.08]"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-100/70">Top revenue move</p>
+                            <p className="mt-2 line-clamp-2 text-sm font-medium text-white">{formatRoute(financialSnapshot.topOpportunity.shipment)}</p>
+                          </div>
+                          <ArrowRight className="mt-1 shrink-0 text-[var(--text-muted)] transition group-hover:text-cyan-100" size={16} />
+                        </div>
+                        <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                          <div>
+                            <p className="text-[var(--text-muted)]">Quote</p>
+                            <p className="mt-1 font-medium text-white">{formatCurrency(financialSnapshot.topOpportunity.projectedQuote)}</p>
+                          </div>
+                          <div>
+                            <p className="text-[var(--text-muted)]">Margin</p>
+                            <p className="mt-1 font-medium text-cyan-100">{formatCurrency(financialSnapshot.topOpportunity.projectedMargin)}</p>
+                          </div>
+                        </div>
+                      </button>
+                    ) : (
+                      <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                        Priced bids will turn into margin opportunities here.
+                      </div>
+                    )}
+
+                    <div className="rounded-[18px] border border-white/10 bg-white/[0.05] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">Pipeline</p>
+                        <span className="rounded-full bg-white/10 px-2 py-1 text-[10px] text-white">{financialSnapshot.readyToQuoteCount} priced</span>
+                      </div>
+                      <div className="mt-3 space-y-2">
+                        {financialSnapshot.rows
+                          .filter((row) => row.financial?.recommended_quote_amount || shipmentNeedsAttention(row.shipment))
+                          .slice(0, 4)
+                          .map((row) => (
+                            <button
+                              key={row.shipment.id}
+                              type="button"
+                              onClick={() => selectShipment(row.shipment.id, { openDrawer: true })}
+                              className="flex w-full items-center justify-between gap-3 rounded-[14px] border border-white/10 bg-slate-950/20 px-3 py-2 text-left transition hover:border-white/20 hover:bg-white/[0.08]"
+                            >
+                              <div className="min-w-0">
+                                <p className="truncate text-xs font-medium text-white">{formatRoute(row.shipment)}</p>
+                                <p className="mt-0.5 text-[10px] uppercase tracking-[0.14em] text-[var(--text-muted)]">
+                                  {shipmentNeedsAttention(row.shipment) ? "risk review" : "priced lane"}
+                                </p>
+                              </div>
+                              <span className="shrink-0 text-xs font-medium text-cyan-100">
+                                {formatCurrency(row.financial?.recommended_quote_amount, { compact: true })}
+                              </span>
+                            </button>
+                          ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </section>
@@ -3647,6 +3974,120 @@ export function FreightDashboardWorkspace() {
                   </button>
                 )}
               </>
+            )}
+          </div>
+        </aside>
+
+        <div
+          className={`fixed inset-0 z-[88] bg-slate-950/30 backdrop-blur-[2px] transition ${
+            syncMenuOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+          }`}
+          onClick={() => setSyncMenuOpen(false)}
+        />
+        <aside
+          className={`fixed right-6 top-6 z-[89] flex h-[min(82vh,760px)] w-[min(390px,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-[28px] border border-cyan-200/14 bg-[linear-gradient(180deg,rgba(12,20,31,0.97),rgba(9,15,25,0.96))] shadow-[0_28px_120px_rgba(2,8,23,0.56)] backdrop-blur transition-all duration-300 ${
+            syncMenuOpen ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-4 opacity-0"
+          }`}
+        >
+          <div className="border-b border-cyan-200/10 px-5 py-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/52">Outlook operations</p>
+                <h3 className="mt-1 text-lg font-semibold text-white">Inbox sync and webhook</h3>
+                <p className="mt-1 text-sm text-slate-300">Run manual syncs and verify the current env subscription without leaving the dashboard.</p>
+              </div>
+              <button
+                onClick={() => setSyncMenuOpen(false)}
+                className="rounded-full p-2 text-slate-400 transition hover:bg-white/8 hover:text-white"
+                aria-label="Close Outlook operations"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <span className="rounded-full border border-cyan-200/12 bg-cyan-200/8 px-3 py-1 text-xs text-cyan-50">
+                {syncLimit} messages
+              </span>
+              <span className={`rounded-full border px-3 py-1 text-xs ${webhookStatusClasses(webhookStatus?.status)}`}>
+                Webhook {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
+              </span>
+            </div>
+          </div>
+          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+            <section className="min-w-0 overflow-hidden rounded-[22px] border border-white/10 bg-white/[0.035] p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-cyan-200/52">Inbox sync</p>
+                  <h4 className="mt-1 text-base font-semibold text-white">Pull recent messages</h4>
+                  <p className="mt-1 text-sm leading-6 text-slate-300">Choose how many recent Outlook messages should be ingested.</p>
+                </div>
+                <Mail className="mt-1 shrink-0 text-cyan-100/80" size={18} />
+              </div>
+              <div className="mt-4 grid grid-cols-4 gap-2">
+                {[5, 10, 25, 50].map((limit) => (
+                  <button
+                    key={limit}
+                    onClick={() => setSyncLimit(limit)}
+                    className={`rounded-[14px] px-2.5 py-2 text-sm transition ${syncLimit === limit ? "bg-white text-slate-950" : "bg-white/5 text-slate-300 hover:bg-white/10 hover:text-white"}`}
+                  >
+                    {limit}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => void handleOutlookSync(syncLimit)}
+                disabled={submitting === "sync"}
+                className="mt-4 flex w-full items-center justify-center gap-2 rounded-[16px] bg-cyan-300/15 px-4 py-3 font-medium text-cyan-100 transition hover:bg-cyan-300/20 disabled:opacity-60"
+              >
+                {submitting === "sync" ? <Loader2 className="animate-spin" size={16} /> : <RefreshCcw size={16} />} Sync inbox
+              </button>
+            </section>
+
+            <section className={`min-w-0 overflow-hidden rounded-[22px] border p-4 ${webhookStatusClasses(webhookStatus?.status)}`}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[10px] uppercase tracking-[0.2em] opacity-70">Webhook status</p>
+                  <h4 className="mt-1 flex items-center gap-2 text-base font-semibold text-white">
+                    {outlookStatusLoading && <Loader2 className="animate-spin" size={15} />}
+                    {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
+                  </h4>
+                </div>
+                <ShieldCheck className="mt-1 shrink-0" size={18} />
+              </div>
+              <div className="mt-3 min-w-0 space-y-2 text-xs opacity-85">
+                <p className="break-all [overflow-wrap:anywhere]">{webhookStatus?.expected_notification_url || "Webhook URL is not configured"}</p>
+                <p className="break-all [overflow-wrap:anywhere]">{webhookStatus?.expected_resource || "Resource is not configured"}</p>
+                {webhookStatus?.expires_at && <p>Expires {formatDate(webhookStatus.expires_at)}</p>}
+                <p>{webhookStatus?.matching_count ?? 0} matching / {webhookStatus?.total_subscriptions ?? 0} total subscriptions</p>
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => void loadWebhookStatus()}
+                  disabled={outlookStatusLoading}
+                  className="flex items-center justify-center gap-2 rounded-[16px] bg-white/5 px-3 py-2.5 text-sm text-white transition hover:bg-white/10"
+                >
+                  {outlookStatusLoading ? <Loader2 className="animate-spin" size={16} /> : <RadioTower size={16} />} Check
+                </button>
+                <button
+                  onClick={() => void handleEnsureWebhook()}
+                  disabled={submitting === "webhook"}
+                  className="flex items-center justify-center gap-2 rounded-[16px] bg-white px-3 py-2.5 text-sm font-medium text-slate-950 transition hover:bg-cyan-50 disabled:opacity-60"
+                >
+                  {submitting === "webhook" ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />} Ensure
+                </button>
+              </div>
+            </section>
+
+            {lastSyncSummary && (
+              <section className="rounded-[22px] border border-cyan-200/12 bg-cyan-200/[0.05] p-4">
+                <p className="text-[10px] uppercase tracking-[0.2em] text-cyan-200/52">Last sync</p>
+                <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Imported: {lastSyncSummary.imported}</div>
+                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Skipped: {lastSyncSummary.skipped}</div>
+                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Parsed: {lastSyncSummary.parsed_shipments}</div>
+                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Reviews: {lastSyncSummary.manual_reviews}</div>
+                </div>
+              </section>
             )}
           </div>
         </aside>

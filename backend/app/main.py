@@ -10,10 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-_webhook_bootstrap_task: asyncio.Task | None = None
+_webhook_renewal_task: asyncio.Task | None = None
 
 
-async def _ensure_outlook_webhook_subscription_on_startup() -> None:
+async def _ensure_outlook_webhook_subscription(reason: str) -> None:
     from app.services.outlook import OutlookGraphClient
 
     outlook = OutlookGraphClient()
@@ -28,8 +28,9 @@ async def _ensure_outlook_webhook_subscription_on_startup() -> None:
         return
 
     logger.info(
-        "Ensuring Outlook webhook subscription on startup "
+        "Ensuring Outlook webhook subscription (%s) "
         "(notification_url=%r resource=%r change_type=%r).",
+        reason,
         settings.microsoft_webhook_notification_url,
         settings.microsoft_webhook_effective_resource,
         settings.microsoft_webhook_change_type,
@@ -43,16 +44,23 @@ async def _ensure_outlook_webhook_subscription_on_startup() -> None:
             subscription.get("expirationDateTime"),
         )
     except Exception:
-        logger.exception("Failed to ensure Outlook webhook subscription on startup.")
+        logger.exception("Failed to ensure Outlook webhook subscription (%s).", reason)
 
 
-async def _delayed_outlook_webhook_subscription_bootstrap() -> None:
-    """Delay webhook bootstrap until server is ready to serve validation requests."""
+async def _outlook_webhook_subscription_renewal_loop() -> None:
+    """Ensure the Outlook webhook on startup, then keep it renewed periodically."""
     delay_seconds = max(0, settings.microsoft_webhook_startup_delay_seconds)
     if delay_seconds:
         logger.info("Outlook webhook bootstrap will run in %ss.", delay_seconds)
         await asyncio.sleep(delay_seconds)
-    await _ensure_outlook_webhook_subscription_on_startup()
+
+    await _ensure_outlook_webhook_subscription("startup")
+
+    interval_seconds = max(3600, settings.microsoft_webhook_renew_interval_seconds)
+    while True:
+        logger.info("Next Outlook webhook renewal check will run in %ss.", interval_seconds)
+        await asyncio.sleep(interval_seconds)
+        await _ensure_outlook_webhook_subscription("scheduled")
 
 
 @asynccontextmanager
@@ -70,19 +78,19 @@ async def lifespan(app: FastAPI):
     await init_vector_store()
     logger.info("Startup step 2/3 complete.")
 
-    logger.info("Startup step 3/3: scheduling Outlook webhook bootstrap task.")
-    global _webhook_bootstrap_task
-    _webhook_bootstrap_task = asyncio.create_task(
-        _delayed_outlook_webhook_subscription_bootstrap(),
-        name="outlook-webhook-bootstrap",
+    logger.info("Startup step 3/3: scheduling Outlook webhook renewal task.")
+    global _webhook_renewal_task
+    _webhook_renewal_task = asyncio.create_task(
+        _outlook_webhook_subscription_renewal_loop(),
+        name="outlook-webhook-renewal",
     )
     logger.info("Startup sequence complete.")
     yield
     # Shutdown: cleanup
-    if _webhook_bootstrap_task and not _webhook_bootstrap_task.done():
-        _webhook_bootstrap_task.cancel()
+    if _webhook_renewal_task and not _webhook_renewal_task.done():
+        _webhook_renewal_task.cancel()
         with suppress(asyncio.CancelledError):
-            await _webhook_bootstrap_task
+            await _webhook_renewal_task
 
 
 app = FastAPI(

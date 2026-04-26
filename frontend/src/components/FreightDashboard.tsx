@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   ArrowRight,
   Building2,
+  ChevronDown,
   CheckCircle2,
   CircleDollarSign,
   ClipboardCheck,
@@ -22,6 +23,7 @@ import {
   RadioTower,
   RefreshCcw,
   Send,
+  SlidersHorizontal,
   ShieldCheck,
   Sparkles,
   Truck,
@@ -253,6 +255,22 @@ interface OutlookSyncResponse {
   results: OutlookIngestResult[];
 }
 
+interface OutlookWebhookStatusResponse {
+  configured: boolean;
+  status: string;
+  missing_fields: string[];
+  expected_notification_url: string | null;
+  expected_resource: string | null;
+  expected_change_type: string | null;
+  subscription_id: string | null;
+  subscription_action: string | null;
+  expires_at: string | null;
+  matching_count: number;
+  active_matching_count: number;
+  total_subscriptions: number;
+  last_checked_at: string | null;
+}
+
 interface ReviewQueueItem {
   workflow_event_id: string;
   shipment_id: string;
@@ -472,6 +490,22 @@ function formatDate(value: string | null) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function webhookStatusLabel(status: string | null | undefined) {
+  if (status === "active") return "Active";
+  if (status === "expiring_soon") return "Renew soon";
+  if (status === "expired") return "Expired";
+  if (status === "not_installed") return "Not installed";
+  if (status === "missing_configuration") return "Config missing";
+  return "Unknown";
+}
+
+function webhookStatusClasses(status: string | null | undefined) {
+  if (status === "active") return "border-emerald-300/20 bg-emerald-300/10 text-emerald-50";
+  if (status === "expiring_soon") return "border-amber-300/20 bg-amber-300/10 text-amber-50";
+  if (status === "expired" || status === "not_installed") return "border-rose-300/20 bg-rose-300/10 text-rose-50";
+  return "border-white/10 bg-white/5 text-[var(--text-muted)]";
 }
 
 function formatShipmentSchedule(displayValue: string | null, localValue: string | null) {
@@ -866,6 +900,9 @@ function LegacyFreightDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [lastSyncSummary, setLastSyncSummary] = useState<OutlookSyncResponse | null>(null);
+  const [webhookStatus, setWebhookStatus] = useState<OutlookWebhookStatusResponse | null>(null);
+  const [syncLimit, setSyncLimit] = useState(10);
+  const [syncMenuOpen, setSyncMenuOpen] = useState(false);
 
   const [clientForm, setClientForm] = useState({
     name: "",
@@ -949,13 +986,14 @@ function LegacyFreightDashboard() {
     setLoading(true);
     setError(null);
     try {
-      const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData] = await Promise.all([
+      const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData, webhookData] = await Promise.all([
         fetchJson<OverviewResponse>("/api/freight/overview"),
         fetchJson<ClientRecord[]>("/api/freight/clients"),
         fetchJson<CarrierRecord[]>("/api/freight/carriers"),
         fetchJson<ShipmentRecord[]>("/api/freight/shipments"),
         fetchJson<ReviewQueueItem[]>("/api/freight/reviews"),
         fetchJson<StatusQueueItem[]>("/api/freight/status-queue?include_resolved=true"),
+        fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/status").catch(() => null),
       ]);
 
       startTransition(() => {
@@ -965,6 +1003,7 @@ function LegacyFreightDashboard() {
         setShipments(shipmentData);
         setReviewQueue(reviewData);
         setStatusQueue(statusQueueData);
+        setWebhookStatus(webhookData);
         setSelectedShipmentId((current) =>
           current && shipmentData.some((shipment) => shipment.id === current)
             ? current
@@ -1287,14 +1326,25 @@ function LegacyFreightDashboard() {
     }
   }
 
-  async function handleOutlookSync() {
+  async function loadWebhookStatus() {
+    try {
+      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/status");
+      setWebhookStatus(response);
+      setNotice(`Outlook webhook check: ${webhookStatusLabel(response.status)}.`);
+    } catch {
+      setWebhookStatus(null);
+    }
+  }
+
+  async function handleOutlookSync(limit = syncLimit) {
     setSubmitting("sync");
     setError(null);
+    setSyncMenuOpen(false);
     try {
       const response = await fetchJson<OutlookSyncResponse>("/api/freight/outlook/sync", {
         method: "POST",
         body: JSON.stringify({
-          limit: 10,
+          limit,
           auto_acknowledge_new_shipments: true,
           acknowledgement_dry_run: false,
           auto_prepare_outreach_for_new_shipments: true,
@@ -1311,6 +1361,26 @@ function LegacyFreightDashboard() {
     } catch (submitError) {
       setError(
         submitError instanceof Error ? submitError.message : "Failed to sync Outlook inbox.",
+      );
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleEnsureWebhook() {
+    setSubmitting("webhook");
+    setError(null);
+    setSyncMenuOpen(false);
+    try {
+      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/ensure", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setWebhookStatus(response);
+      setNotice(`Outlook webhook ${response.subscription_action || "checked"}: ${webhookStatusLabel(response.status)}.`);
+    } catch (submitError) {
+      setError(
+        submitError instanceof Error ? submitError.message : "Failed to install Outlook webhook.",
       );
     } finally {
       setSubmitting(null);
@@ -1646,9 +1716,10 @@ function LegacyFreightDashboard() {
             </div>
 
             <div className="mt-6 grid gap-3 sm:grid-cols-3">
-              <div className="rounded-[24px] border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)]">
-                <div className="flex items-center justify-between"><span>Inbox sync</span><ShieldCheck size={16} className="text-cyan-200" /></div>
-                <p className="mt-2 text-white">Ready</p>
+              <div className={`rounded-[24px] border p-4 text-sm ${webhookStatusClasses(webhookStatus?.status)}`}>
+                <div className="flex items-center justify-between"><span>Outlook webhook</span><ShieldCheck size={16} /></div>
+                <p className="mt-2 text-white">{webhookStatusLabel(webhookStatus?.status)}</p>
+                {webhookStatus?.expires_at && <p className="mt-1 text-xs opacity-80">Expires {formatDate(webhookStatus.expires_at)}</p>}
               </div>
               <div className="rounded-[24px] border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)]">
                 <div className="flex items-center justify-between"><span>Carrier outreach</span><Send size={16} className="text-amber-200" /></div>
@@ -1677,7 +1748,69 @@ function LegacyFreightDashboard() {
                         <h2 className="mt-1 text-2xl font-semibold text-white">Shipment lanes</h2>
                       </div>
                       <div className="flex items-center gap-3">
-                        <button onClick={() => void handleOutlookSync()} disabled={submitting === "sync"} className="action-button bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">{submitting === "sync" ? "Syncing..." : "Sync Outlook"}</button>
+                        <div className="relative">
+                          <button
+                            onClick={() => setSyncMenuOpen((open) => !open)}
+                            disabled={submitting === "sync" || submitting === "webhook"}
+                            className="action-button gap-2 bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50"
+                          >
+                            {submitting === "sync" ? <Loader2 className="animate-spin" size={16} /> : <SlidersHorizontal size={16} />}
+                            Outlook
+                            <ChevronDown size={16} />
+                          </button>
+                          {syncMenuOpen && (
+                            <div className="absolute right-0 z-30 mt-3 w-[min(320px,calc(100vw-2rem))] rounded-[24px] border border-white/10 bg-slate-950/95 p-4 text-sm shadow-2xl backdrop-blur-xl">
+                              <div className="flex items-center justify-between gap-3">
+                                <div>
+                                  <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Inbox sync</p>
+                                  <p className="mt-1 font-medium text-white">Pull recent messages</p>
+                                </div>
+                                <span className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">{syncLimit} msg</span>
+                              </div>
+                              <div className="mt-4 grid grid-cols-4 gap-2">
+                                {[5, 10, 25, 50].map((limit) => (
+                                  <button
+                                    key={limit}
+                                    onClick={() => setSyncLimit(limit)}
+                                    className={`rounded-2xl px-3 py-2 text-sm transition ${syncLimit === limit ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"}`}
+                                  >
+                                    {limit}
+                                  </button>
+                                ))}
+                              </div>
+                              <button
+                                onClick={() => void handleOutlookSync(syncLimit)}
+                                className="mt-3 flex w-full items-center justify-center gap-2 rounded-2xl bg-cyan-300/15 px-4 py-3 font-medium text-cyan-100 transition hover:bg-cyan-300/20"
+                              >
+                                <RefreshCcw size={16} /> Sync inbox
+                              </button>
+
+                              <div className={`mt-4 rounded-2xl border p-3 ${webhookStatusClasses(webhookStatus?.status)}`}>
+                                <div className="flex items-center justify-between gap-3">
+                                  <span className="flex items-center gap-2 font-medium"><ShieldCheck size={16} /> Webhook</span>
+                                  <span className="text-xs">{webhookStatusLabel(webhookStatus?.status)}</span>
+                                </div>
+                                <p className="mt-2 break-all text-xs opacity-80">{webhookStatus?.expected_notification_url || "Webhook URL is not configured"}</p>
+                                {webhookStatus?.expires_at && <p className="mt-2 text-xs opacity-80">Expires {formatDate(webhookStatus.expires_at)}</p>}
+                              </div>
+                              <div className="mt-3 grid grid-cols-2 gap-2">
+                                <button
+                                  onClick={() => void loadWebhookStatus()}
+                                  className="flex items-center justify-center gap-2 rounded-2xl bg-white/5 px-3 py-2 text-[var(--text-muted)] transition hover:bg-white/10 hover:text-white"
+                                >
+                                  <RadioTower size={16} /> Check
+                                </button>
+                                <button
+                                  onClick={() => void handleEnsureWebhook()}
+                                  disabled={submitting === "webhook"}
+                                  className="flex items-center justify-center gap-2 rounded-2xl bg-white px-3 py-2 font-medium text-slate-950 transition hover:bg-cyan-50 disabled:opacity-60"
+                                >
+                                  {submitting === "webhook" ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />} Ensure
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
                         <button onClick={() => void refreshAll()} className="action-button bg-white/10 text-sm text-white hover:bg-white/15">Refresh</button>
                       </div>
                     </div>
@@ -2367,7 +2500,7 @@ function LegacyFreightDashboard() {
             <div className="glass-panel p-5">
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Connected systems</p>
               <div className="mt-4 space-y-3 text-sm text-[var(--text-muted)]">
-                <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><Mail size={16} /> Outlook inbox</span><span className="text-white">Ready</span></div>
+                <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><Mail size={16} /> Outlook webhook</span><span className="text-white">{webhookStatusLabel(webhookStatus?.status)}</span></div>
                 <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><CircleDollarSign size={16} /> Margin defaults</span><span className="text-white">{overview.integrations.quote_wait_minutes_default || "20"} min window</span></div>
                 <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><ClipboardCheck size={16} /> TMS connector</span><span className="text-white">Preview-ready</span></div>
               </div>

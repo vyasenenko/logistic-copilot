@@ -93,7 +93,8 @@ class Settings(BaseSettings):
     microsoft_webhook_change_type: str = "created"
     microsoft_webhook_resource: str = ""
     microsoft_webhook_startup_delay_seconds: int = 8
-    microsoft_webhook_renewal_buffer_minutes: int = 120
+    microsoft_webhook_renew_interval_seconds: int = 43200
+    microsoft_webhook_renewal_buffer_minutes: int = 2880
     microsoft_webhook_expiration_minutes: int = 10080
 
     # TMS integration

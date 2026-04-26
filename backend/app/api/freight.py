@@ -7,7 +7,7 @@ import re
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -46,10 +46,13 @@ from app.schemas import (
     CustomerStatusReplyRequest,
     CustomerStatusReplyResponse,
     FreightFoundationResponse,
+    FreightFinancialShipmentSummary,
+    FreightFinancialSummaryResponse,
     OutlookIngestRequest,
     OutlookIngestResult,
     OutlookSyncRequest,
     OutlookSyncResponse,
+    OutlookWebhookStatusResponse,
     OutlookWebhookRequest,
     OutlookWebhookResponse,
     OperatorAction,
@@ -125,6 +128,82 @@ from app.services.freight_read import build_freight_overview, is_status_stale as
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _parse_graph_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _outlook_webhook_status_response(
+    *,
+    outlook: OutlookGraphClient,
+    subscriptions: list[dict],
+    subscription_action: str | None = None,
+) -> OutlookWebhookStatusResponse:
+    now = datetime.now(timezone.utc)
+    expected_url = settings.microsoft_webhook_notification_url or None
+    expected_resource = settings.microsoft_webhook_effective_resource or None
+    expected_change_type = settings.microsoft_webhook_change_type or None
+    missing_fields = outlook.missing_settings()
+    if not expected_url:
+        missing_fields.append("microsoft_webhook_public_base_url")
+    if not expected_resource:
+        missing_fields.append("microsoft_webhook_resource")
+
+    if missing_fields:
+        return OutlookWebhookStatusResponse(
+            configured=False,
+            status="missing_configuration",
+            missing_fields=sorted(set(missing_fields)),
+            expected_notification_url=expected_url,
+            expected_resource=expected_resource,
+            expected_change_type=expected_change_type,
+            total_subscriptions=len(subscriptions),
+            last_checked_at=now.isoformat().replace("+00:00", "Z"),
+        )
+
+    matching = [
+        item
+        for item in subscriptions
+        if item.get("notificationUrl") == expected_url
+        and item.get("resource") == expected_resource
+        and item.get("changeType") == expected_change_type
+    ]
+    active_matching = [
+        item
+        for item in matching
+        if (_parse_graph_datetime(str(item.get("expirationDateTime") or "")) or datetime.min.replace(tzinfo=timezone.utc)) > now
+    ]
+    primary = active_matching[0] if active_matching else (matching[0] if matching else None)
+    expires_at = str(primary.get("expirationDateTime")) if primary and primary.get("expirationDateTime") else None
+    expires = _parse_graph_datetime(expires_at)
+    renew_before = now + timedelta(minutes=max(15, settings.microsoft_webhook_renewal_buffer_minutes))
+
+    status = "not_installed"
+    if active_matching:
+        status = "expiring_soon" if expires and expires <= renew_before else "active"
+    elif matching:
+        status = "expired"
+
+    return OutlookWebhookStatusResponse(
+        configured=True,
+        status=status,
+        expected_notification_url=expected_url,
+        expected_resource=expected_resource,
+        expected_change_type=expected_change_type,
+        subscription_id=str(primary.get("id")) if primary and primary.get("id") else None,
+        subscription_action=subscription_action,
+        expires_at=expires_at,
+        matching_count=len(matching),
+        active_matching_count=len(active_matching),
+        total_subscriptions=len(subscriptions),
+        last_checked_at=now.isoformat().replace("+00:00", "Z"),
+    )
 
 
 def _shipment_matches_month_filter(
@@ -3589,6 +3668,105 @@ async def freight_overview(
     return await build_freight_overview(session)
 
 
+def _financial_margin_amount(base_amount: float, margin_policy: dict) -> tuple[float, float]:
+    percent = float(margin_policy.get("percent", settings.profit_margin_percent_default) or 0)
+    floor_amount = float(margin_policy.get("floor_amount", settings.profit_margin_floor_default) or 0)
+    margin_amount = round(max(base_amount * (percent / 100), floor_amount), 2)
+    margin_percent = round((margin_amount / base_amount) * 100, 1) if base_amount > 0 else 0
+    return margin_amount, margin_percent
+
+
+@router.get("/freight/financial-summary", response_model=FreightFinancialSummaryResponse)
+async def freight_financial_summary(
+    month: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}$"),
+    session: AsyncSession = Depends(get_session),
+) -> FreightFinancialSummaryResponse:
+    """Return bid-backed financial projections for the active shipment board."""
+    shipment_conditions = [Shipment.is_archived.is_(False)]
+    if month:
+        year, month_number = (int(part) for part in month.split("-"))
+        month_start = datetime(year, month_number, 1, tzinfo=timezone.utc)
+        if month_number == 12:
+            month_end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            month_end = datetime(year, month_number + 1, 1, tzinfo=timezone.utc)
+        shipment_conditions.extend([Shipment.created_at >= month_start, Shipment.created_at < month_end])
+
+    shipment_result = await session.execute(
+        select(Shipment.id, Shipment.margin_policy_json)
+        .where(*shipment_conditions)
+        .order_by(Shipment.updated_at.desc(), Shipment.created_at.desc())
+    )
+    shipments = shipment_result.all()
+    if not shipments:
+        return FreightFinancialSummaryResponse()
+
+    shipment_ids = [shipment_id for shipment_id, _margin_policy in shipments]
+    priced_amount = case((CarrierBid.amount > 0, CarrierBid.amount), else_=None)
+    selected_amount = case(((CarrierBid.status == "selected") & (CarrierBid.amount > 0), CarrierBid.amount), else_=None)
+    bid_summary_result = await session.execute(
+        select(
+            CarrierBid.shipment_id,
+            func.count(CarrierBid.id).label("bid_count"),
+            func.count(priced_amount).label("priced_bid_count"),
+            func.min(priced_amount).label("best_bid_amount"),
+            func.max(selected_amount).label("selected_bid_amount"),
+        )
+        .where(CarrierBid.shipment_id.in_(shipment_ids))
+        .group_by(CarrierBid.shipment_id)
+    )
+    bid_summaries = {
+        row.shipment_id: {
+            "bid_count": int(row.bid_count or 0),
+            "priced_bid_count": int(row.priced_bid_count or 0),
+            "best_bid_amount": float(row.best_bid_amount) if row.best_bid_amount is not None else None,
+            "selected_bid_amount": float(row.selected_bid_amount) if row.selected_bid_amount is not None else None,
+        }
+        for row in bid_summary_result.all()
+    }
+
+    summaries: list[FreightFinancialShipmentSummary] = []
+    for shipment_id, margin_policy in shipments:
+        bid_summary = bid_summaries.get(shipment_id, {})
+        best_bid_amount = bid_summary.get("best_bid_amount")
+        selected_bid_amount = bid_summary.get("selected_bid_amount")
+        quote_source_amount = selected_bid_amount or best_bid_amount
+        margin_amount = 0.0
+        margin_percent = 0.0
+        recommended_quote_amount = None
+        selected_quote_amount = None
+        if quote_source_amount:
+            margin_amount, margin_percent = _financial_margin_amount(
+                float(quote_source_amount),
+                dict(margin_policy or {}),
+            )
+            recommended_quote_amount = round(float(quote_source_amount) + margin_amount, 2)
+        if selected_bid_amount:
+            selected_margin, _selected_margin_percent = _financial_margin_amount(
+                float(selected_bid_amount),
+                dict(margin_policy or {}),
+            )
+            selected_quote_amount = round(float(selected_bid_amount) + selected_margin, 2)
+
+        summaries.append(
+            FreightFinancialShipmentSummary(
+                shipment_id=str(shipment_id),
+                best_bid_amount=best_bid_amount,
+                best_bid_id=None,
+                bid_count=int(bid_summary.get("bid_count") or 0),
+                priced_bid_count=int(bid_summary.get("priced_bid_count") or 0),
+                margin_amount=margin_amount,
+                margin_percent=margin_percent,
+                recommended_quote_amount=recommended_quote_amount,
+                selected_bid_amount=selected_bid_amount,
+                selected_quote_amount=selected_quote_amount,
+                currency="USD",
+            )
+        )
+
+    return FreightFinancialSummaryResponse(shipments=summaries)
+
+
 @router.post("/freight/outlook/ingest", response_model=OutlookSyncResponse)
 async def freight_outlook_ingest(
     request: OutlookIngestRequest,
@@ -3705,6 +3883,36 @@ async def freight_outlook_sync(
         auto_tms_status_updates=auto_tms_status_updates,
         manual_reviews=manual_reviews,
         results=results,
+    )
+
+
+@router.get("/freight/outlook/webhook/status", response_model=OutlookWebhookStatusResponse)
+async def freight_outlook_webhook_status() -> OutlookWebhookStatusResponse:
+    """Report whether the configured Outlook webhook subscription exists and is active."""
+    outlook = OutlookGraphClient()
+    if not outlook.webhook_is_configured():
+        return _outlook_webhook_status_response(outlook=outlook, subscriptions=[])
+    try:
+        subscriptions = await outlook.list_subscriptions()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return _outlook_webhook_status_response(outlook=outlook, subscriptions=subscriptions)
+
+
+@router.post("/freight/outlook/webhook/ensure", response_model=OutlookWebhookStatusResponse)
+async def freight_outlook_webhook_ensure() -> OutlookWebhookStatusResponse:
+    """Create or renew the configured Outlook webhook subscription."""
+    outlook = OutlookGraphClient()
+    try:
+        subscription = await outlook.ensure_inbox_webhook_subscription()
+        subscriptions = await outlook.list_subscriptions()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    action = str(subscription.get("subscriptionAction") or "ensured")
+    return _outlook_webhook_status_response(
+        outlook=outlook,
+        subscriptions=subscriptions,
+        subscription_action=action,
     )
 
 

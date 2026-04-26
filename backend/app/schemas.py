@@ -482,6 +482,24 @@ class FreightOverviewResponse(BaseModel):
     integrations: dict[str, str] = Field(default_factory=dict)
 
 
+class FreightFinancialShipmentSummary(BaseModel):
+    shipment_id: str
+    best_bid_amount: float | None = None
+    best_bid_id: str | None = None
+    bid_count: int = 0
+    priced_bid_count: int = 0
+    margin_amount: float = 0
+    margin_percent: float = 0
+    recommended_quote_amount: float | None = None
+    selected_bid_amount: float | None = None
+    selected_quote_amount: float | None = None
+    currency: str = "USD"
+
+
+class FreightFinancialSummaryResponse(BaseModel):
+    shipments: list[FreightFinancialShipmentSummary] = Field(default_factory=list)
+
+
 class OutlookSyncRequest(BaseModel):
     limit: int = Field(10, ge=1, le=100)
     auto_acknowledge_new_shipments: bool = True
@@ -492,6 +510,22 @@ class OutlookSyncRequest(BaseModel):
     customer_quote_dry_run: bool = False
     auto_book_on_confirmation: bool = True
     booking_dry_run: bool = False
+
+
+class OutlookWebhookStatusResponse(BaseModel):
+    configured: bool = False
+    status: str = "unknown"
+    missing_fields: list[str] = Field(default_factory=list)
+    expected_notification_url: str | None = None
+    expected_resource: str | None = None
+    expected_change_type: str | None = None
+    subscription_id: str | None = None
+    subscription_action: str | None = None
+    expires_at: str | None = None
+    matching_count: int = 0
+    active_matching_count: int = 0
+    total_subscriptions: int = 0
+    last_checked_at: str | None = None
 
 
 class OutlookIngestRequest(BaseModel):
