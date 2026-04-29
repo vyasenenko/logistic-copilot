@@ -9,8 +9,23 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.memory.database import Carrier, Client, EmailMessage, EmailThread, FraudDenylistEntry, Shipment, WorkflowEvent
-from app.schemas import FraudDenylistScope, OutlookIngestResult, ShipmentStage, WorkflowEventType
+from app.memory.database import (
+    Carrier,
+    Client,
+    EmailMessage,
+    EmailThread,
+    EmailTriageItem,
+    FraudDenylistEntry,
+    Shipment,
+    WorkflowEvent,
+)
+from app.schemas import (
+    EmailTriageClassification,
+    FraudDenylistScope,
+    OutlookIngestResult,
+    ShipmentStage,
+    WorkflowEventType,
+)
 from app.services.email_correlation import build_correlation_signals, generate_quote_reference
 from app.services.email_fraud import (
     assess_sender_risk,
@@ -18,6 +33,7 @@ from app.services.email_fraud import (
     fraud_assessment_from_denylist_match,
     normalize_sender_email,
 )
+from app.services.email_triage import classify_email_triage
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.outlook import OutlookMailboxMessage
 
@@ -73,6 +89,19 @@ def _looks_like_bounce_or_non_delivery(mailbox_message: OutlookMailboxMessage) -
     if any(hint in body_preview for hint in body_hints):
         return True, "bounce_body_detected"
     return False, None
+
+
+def _should_materialize_shipment_for_triage(
+    *,
+    classification: EmailTriageClassification,
+    quote_token: str | None,
+    existing_shipment_linked: bool,
+) -> bool:
+    if classification == EmailTriageClassification.FRAUD_OR_PHISHING:
+        return False
+    if quote_token or existing_shipment_linked:
+        return True
+    return classification == EmailTriageClassification.FREIGHT_QUOTE_REQUEST
 
 
 async def _find_or_create_thread(
@@ -214,6 +243,12 @@ async def _find_or_create_shipment(
     return shipment, True
 
 
+async def _latest_shipment_for_thread(session: AsyncSession, thread_id) -> Shipment | None:
+    return await session.scalar(
+        select(Shipment).where(Shipment.email_thread_id == thread_id).order_by(Shipment.created_at.desc())
+    )
+
+
 async def _find_active_fraud_denylist_entry(
     session: AsyncSession,
     *,
@@ -239,6 +274,35 @@ async def _find_active_fraud_denylist_entry(
     return result.scalars().first()
 
 
+async def _save_email_triage_item(
+    session: AsyncSession,
+    *,
+    email_message: EmailMessage,
+    thread: EmailThread,
+    triage_result,
+    shipment: Shipment | None = None,
+    fraud_payload: dict | None = None,
+) -> EmailTriageItem:
+    item = EmailTriageItem(
+        email_message_id=email_message.id,
+        thread_id=thread.id,
+        classification=triage_result.classification.value,
+        confidence=triage_result.confidence,
+        reason=triage_result.reason[:500] if triage_result.reason else None,
+        recommended_action=triage_result.recommended_action,
+        created_shipment_id=shipment.id if shipment is not None else None,
+        payload_json={
+            "signals": triage_result.signals,
+            "fraud": fraud_payload or {},
+            "sender": email_message.sender,
+            "subject": email_message.subject,
+        },
+    )
+    session.add(item)
+    await session.flush()
+    return item
+
+
 async def ingest_outlook_message(
     session: AsyncSession,
     mailbox_message: OutlookMailboxMessage,
@@ -255,12 +319,39 @@ async def ingest_outlook_message(
         )
     )
     if existing_message is not None:
-        shipment = await session.scalar(
-            select(Shipment).where(Shipment.email_thread_id == existing_message.thread_id).order_by(Shipment.created_at.desc())
-        )
+        shipment = await _latest_shipment_for_thread(session, existing_message.thread_id)
         fraud_payload = dict((existing_message.raw_payload_json or {}).get("fraud", {}) or {})
+        triage_item = await session.scalar(
+            select(EmailTriageItem)
+            .where(EmailTriageItem.email_message_id == existing_message.id)
+            .order_by(EmailTriageItem.created_at.desc())
+        )
         if shipment is None:
-            return None
+            if triage_item is None:
+                return None
+            return OutlookIngestResult(
+                thread_id=str(existing_message.thread_id),
+                email_message_id=str(existing_message.id),
+                shipment_id="",
+                created_thread=False,
+                created_message=False,
+                created_shipment=False,
+                created_client=False,
+                suppressed=True,
+                suppression_reason="shipment_creation_skipped",
+                shipment_creation_skipped=True,
+                sender_known=bool(fraud_payload.get("sender_known", False)),
+                sender_verification_required=bool(fraud_payload.get("verification_required", False)),
+                fraud_risk_level=fraud_payload.get("risk_level"),
+                fraud_risk_reasons=list(fraud_payload.get("reasons", []) or []),
+                fraud_score=fraud_payload.get("score"),
+                sender_email=fraud_payload.get("sender_email"),
+                sender_domain=fraud_payload.get("sender_domain"),
+                triage_id=str(triage_item.id),
+                triage_classification=triage_item.classification,
+                triage_reason=triage_item.reason,
+                triage_recommended_action=triage_item.recommended_action,
+            )
         return OutlookIngestResult(
             thread_id=str(existing_message.thread_id),
             email_message_id=str(existing_message.id),
@@ -280,6 +371,10 @@ async def ingest_outlook_message(
             fraud_score=fraud_payload.get("score"),
             sender_email=fraud_payload.get("sender_email"),
             sender_domain=fraud_payload.get("sender_domain"),
+            triage_id=str(triage_item.id) if triage_item else None,
+            triage_classification=triage_item.classification if triage_item else None,
+            triage_reason=triage_item.reason if triage_item else None,
+            triage_recommended_action=triage_item.recommended_action if triage_item else None,
         )
 
     quote_reference = generate_quote_reference()
@@ -361,11 +456,28 @@ async def ingest_outlook_message(
     session.add(email_message)
     await session.flush()
 
+    existing_shipment = await _latest_shipment_for_thread(session, thread.id)
+    triage_result = classify_email_triage(
+        subject=mailbox_message.subject,
+        body_preview=mailbox_message.body_preview,
+        sender_email=mailbox_message.sender_email,
+        quote_token=signals.quote_token,
+        existing_shipment_linked=existing_shipment is not None,
+        fraud_reasons=list(fraud_assessment.reasons),
+        fraud_risk_level=fraud_assessment.risk_level.value,
+    )
+
     carrier = await session.scalar(select(Carrier).where(Carrier.email == mailbox_message.sender_email))
     client = await session.scalar(select(Client).where(Client.email == mailbox_message.sender_email))
 
     created_client = False
-    if carrier is None and client is None and not thread.shipment_ingest_suppressed and denylist_entry is None:
+    if (
+        carrier is None
+        and client is None
+        and not thread.shipment_ingest_suppressed
+        and denylist_entry is None
+        and triage_result.classification == EmailTriageClassification.FREIGHT_QUOTE_REQUEST
+    ):
         # New senders are ingested for review, but are not auto-trusted as customers.
         if not fraud_assessment.verification_required and create_client_if_missing:
             client, created_client = await _find_or_create_client(
@@ -378,30 +490,34 @@ async def ingest_outlook_message(
     shipment = None
     created_shipment = False
     shipment_creation_skipped = False
-    if not thread.shipment_ingest_suppressed:
+    should_materialize_shipment = _should_materialize_shipment_for_triage(
+        classification=triage_result.classification,
+        quote_token=signals.quote_token or thread.quote_token,
+        existing_shipment_linked=existing_shipment is not None,
+    )
+    if not thread.shipment_ingest_suppressed and should_materialize_shipment:
         shipment, created_shipment = await _find_or_create_shipment(
             session,
             thread=thread,
             client=client,
             body_preview=mailbox_message.body_preview,
         )
-        if denylist_entry is not None:
-            now = datetime.now(timezone.utc)
-            suppression_reason = f"fraud_denylist:{denylist_entry.scope}:{denylist_entry.value}"
-            shipment.is_archived = True
-            shipment.archive_reason_code = "fraud"
-            shipment.archive_reason_note = suppression_reason
-            shipment.archived_reason = suppression_reason
-            shipment.archived_at = now
-            shipment.updated_at = now
-            thread.shipment_ingest_suppressed = True
-            thread.shipment_ingest_suppressed_reason = suppression_reason
-            thread.shipment_ingest_suppressed_at = now
     else:
         shipment_creation_skipped = True
-        shipment = await session.scalar(
-            select(Shipment).where(Shipment.email_thread_id == thread.id).order_by(Shipment.created_at.desc())
-        )
+        shipment = existing_shipment
+        if shipment is None:
+            thread.shipment_ingest_suppressed = True
+            thread.shipment_ingest_suppressed_reason = triage_result.classification.value
+            thread.shipment_ingest_suppressed_at = datetime.now(timezone.utc)
+
+    triage_item = await _save_email_triage_item(
+        session,
+        email_message=email_message,
+        thread=thread,
+        triage_result=triage_result,
+        shipment=shipment,
+        fraud_payload=fraud_payload,
+    )
 
     workflow_events: list[WorkflowEvent] = []
     if shipment is not None:
@@ -420,7 +536,7 @@ async def ingest_outlook_message(
         )
         session.add(workflow_event)
         workflow_events.append(workflow_event)
-        if denylist_entry is not None:
+        if denylist_entry is not None and shipment.is_archived:
             archive_payload = {
                 "reason": thread.shipment_ingest_suppressed_reason,
                 "reason_code": "fraud",
@@ -468,4 +584,8 @@ async def ingest_outlook_message(
         fraud_score=fraud_assessment.score,
         sender_email=fraud_assessment.sender_email,
         sender_domain=fraud_assessment.sender_domain,
+        triage_id=str(triage_item.id),
+        triage_classification=triage_result.classification,
+        triage_reason=triage_result.reason,
+        triage_recommended_action=triage_result.recommended_action,
     )

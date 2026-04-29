@@ -150,6 +150,24 @@ class EmailMessage(Base):
     bids = relationship("CarrierBid", back_populates="email_message")
 
 
+class EmailTriageItem(Base):
+    __tablename__ = "email_triage_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email_message_id = Column(UUID(as_uuid=True), ForeignKey("email_messages.id"), nullable=False)
+    thread_id = Column(UUID(as_uuid=True), ForeignKey("email_threads.id"), nullable=False)
+    classification = Column(String(50), nullable=False)
+    confidence = Column(Float, default=0, nullable=False)
+    reason = Column(String(500), nullable=True)
+    recommended_action = Column(String(100), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_action = Column(String(100), nullable=True)
+    created_shipment_id = Column(UUID(as_uuid=True), ForeignKey("shipments.id"), nullable=True)
+    payload_json = Column(JSON, default=dict, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class Shipment(Base):
     __tablename__ = "shipments"
 
@@ -353,6 +371,33 @@ async def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_fraud_denylist_scope_value_active "
                 "ON fraud_denylist_entries(scope, value, is_active)"
             )
+        )
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS email_triage_items (
+                    id UUID PRIMARY KEY,
+                    email_message_id UUID NOT NULL REFERENCES email_messages(id),
+                    thread_id UUID NOT NULL REFERENCES email_threads(id),
+                    classification VARCHAR(50) NOT NULL,
+                    confidence DOUBLE PRECISION DEFAULT 0 NOT NULL,
+                    reason VARCHAR(500),
+                    recommended_action VARCHAR(100),
+                    resolved_at TIMESTAMP WITH TIME ZONE,
+                    resolved_action VARCHAR(100),
+                    created_shipment_id UUID REFERENCES shipments(id),
+                    payload_json JSON DEFAULT '{}'::json NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+                )
+                """
+            )
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_email_triage_classification ON email_triage_items(classification)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_email_triage_resolved_at ON email_triage_items(resolved_at)")
         )
 
 

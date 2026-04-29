@@ -15,18 +15,20 @@ from app.services.outlook import OutlookGraphClient
 
 logger = logging.getLogger(__name__)
 
-OUTLOOK_CATEGORY_NEW_QUOTE = "LC: New Quote"
-OUTLOOK_CATEGORY_CARRIER_BID = "LC: Carrier Bid"
-OUTLOOK_CATEGORY_CONFIRMATION = "LC: Confirmation"
-OUTLOOK_CATEGORY_CLARIFICATION = "LC: Clarification"
-OUTLOOK_CATEGORY_STATUS = "LC: Status"
-OUTLOOK_CATEGORY_NEEDS_REVIEW = "LC: Needs Review"
-OUTLOOK_CATEGORY_ARCHIVED = "LC: Archived"
-OUTLOOK_CATEGORY_EXCEPTION = "LC: Exception"
-OUTLOOK_CATEGORY_OTHER = "LC: Other"
-OUTLOOK_CATEGORY_NEW_SENDER = "LC: New Sender"
-OUTLOOK_CATEGORY_VERIFY_SENDER = "LC: Verify Sender"
-OUTLOOK_CATEGORY_PROBABLE_FRAUD = "LC: Probable Fraud"
+OUTLOOK_CATEGORY_NEW_QUOTE = "🆕 New Quote"
+OUTLOOK_CATEGORY_CARRIER_BID = "🚚 Carrier Bid"
+OUTLOOK_CATEGORY_CONFIRMATION = "✅ Confirmation"
+OUTLOOK_CATEGORY_CLARIFICATION = "❓ Clarification"
+OUTLOOK_CATEGORY_STATUS = "🔍 Status"
+OUTLOOK_CATEGORY_NEEDS_REVIEW = "👀 Needs Review"
+OUTLOOK_CATEGORY_ARCHIVED = "🗃️ Archived"
+OUTLOOK_CATEGORY_EXCEPTION = "❌ Exception"
+OUTLOOK_CATEGORY_OTHER = "Other"
+OUTLOOK_CATEGORY_NEW_SENDER = "🆕 New Sender"
+OUTLOOK_CATEGORY_VERIFY_SENDER = "⚠️ Verify Sender"
+OUTLOOK_CATEGORY_PROBABLE_FRAUD = "‼️ Probable Fraud"
+OUTLOOK_CATEGORY_NOT_SHIPMENT = "🚫 Not Shipment"
+OUTLOOK_CATEGORY_TRIAGE = "🔍 Triage"
 
 OUTLOOK_CATEGORY_COLORS = {
     OUTLOOK_CATEGORY_NEW_QUOTE: "preset4",
@@ -41,6 +43,8 @@ OUTLOOK_CATEGORY_COLORS = {
     OUTLOOK_CATEGORY_NEW_SENDER: "preset3",
     OUTLOOK_CATEGORY_VERIFY_SENDER: "preset12",
     OUTLOOK_CATEGORY_PROBABLE_FRAUD: "preset0",
+    OUTLOOK_CATEGORY_NOT_SHIPMENT: "preset14",
+    OUTLOOK_CATEGORY_TRIAGE: "preset7",
 }
 
 
@@ -48,7 +52,7 @@ def quote_token_outlook_category(quote_token: str | None) -> str | None:
     token = (quote_token or "").strip().upper()
     if not token:
         return None
-    return f"LC: {token}"
+    return f"{token}"
 
 
 async def _workflow_stage_for_shipment(
@@ -109,6 +113,19 @@ def outlook_categories_for_fraud_assessment(
     elif fraud_risk_level == "high":
         categories.extend([OUTLOOK_CATEGORY_PROBABLE_FRAUD, OUTLOOK_CATEGORY_NEEDS_REVIEW])
     return list(dict.fromkeys(categories))
+
+
+def outlook_categories_for_email_triage(classification: str | None) -> list[str]:
+    """Map pre-shipment triage classifications into Outlook categories."""
+    if classification == "fraud_or_phishing":
+        return [OUTLOOK_CATEGORY_PROBABLE_FRAUD, OUTLOOK_CATEGORY_NEEDS_REVIEW]
+    if classification == "needs_operator_triage":
+        return [OUTLOOK_CATEGORY_TRIAGE, OUTLOOK_CATEGORY_NEEDS_REVIEW]
+    if classification == "noise_or_unhandled":
+        return [OUTLOOK_CATEGORY_NOT_SHIPMENT, OUTLOOK_CATEGORY_TRIAGE]
+    if classification in {"carrier_reply", "status_or_ops"}:
+        return [OUTLOOK_CATEGORY_TRIAGE]
+    return []
 
 
 async def add_email_message_categories(

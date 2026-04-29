@@ -61,7 +61,10 @@ TIME_ONLY_PATTERN = re.compile(r"\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", re.IGNOR
 QUOTE_REQUEST_HINTS = ("quote", "need to move", "need moved", "move", "load", "pickup", "delivery", "pallet", "lb", "lbs")
 BID_HINTS = ("all in", "can do", "rate", "quote back", "our quote", "best rate", "$")
 CONFIRM_HINTS = ("ok book", "please book", "book it", "go ahead and book", "approved", "confirmed", "confirm booking")
-SHORT_CONFIRM_PATTERN = re.compile(r"^\s*(?:ok|okay|yes|yep|approved|confirmed|confirm|book it)\s*[.!]?\s*$", re.IGNORECASE)
+SHORT_CONFIRM_PATTERN = re.compile(
+    r"^\s*(?:ok|okay|yes|yep|approved|confirmed|confirm|book it|ок|окей|да|подтверждаю|согласен|согласна)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
 CONFIRMABLE_SHIPMENT_STATUSES = {"quoted", "awaiting_confirmation"}
 STATUS_REQUEST_HINTS = ("eta", "status", "update", "where is", "where's", "location", "arrive", "delivery status")
 CARRIER_STATUS_HINTS = ("arrived", "loaded", "empty", "unloaded", "detained", "running late", "eta", "currently in", "gps", "location")
@@ -262,6 +265,14 @@ def _context_blob(email_context: dict) -> str:
     )
 
 
+def _first_meaningful_reply_line(text: str) -> str:
+    for line in re.split(r"\r?\n", text or ""):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
 async def classify_email_intent(email_context: dict) -> IntentResult:
     """Classify the business intent of an inbound freight email."""
     heuristics = _classify_with_heuristics(email_context)
@@ -276,7 +287,7 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
             "customer_quote_confirmation, customer_clarification, customer_status_request, carrier_status_update, exception_or_issue, noise_or_unhandled. "
             "Return high confidence only when the intent is clear. "
             "When sender_role is client and shipment_status is quoted or awaiting_confirmation, "
-            "a short affirmative body such as OK, Okay, Yes, Confirm, Approved, or Book it means customer_quote_confirmation.\n\n"
+            "a short affirmative body such as OK, Okay, Yes, Confirm, Approved, Book it, Окей, ОК, Да, or Подтверждаю means customer_quote_confirmation.\n\n"
             f"{_context_blob(email_context)}"
         )
         result = await _invoke_structured_with_fallback(
@@ -304,6 +315,8 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
             "weight_lb, equipment_type, ready_at, delivery_at, notes, missing_fields, ambiguity_reasons and confidence. "
             "Use ready_at for the pickup-ready time and delivery_at for delivery appointment/dropoff time when present. "
             "If the email gives a local civil time, return it as a concise datetime like YYYY-MM-DDTHH:MM:SS without inventing a timezone. "
+            "Do not use 00:00/night for vague pickup wording. If the customer says early morning, use approximately 07:00 local time; "
+            "if they say morning, use approximately 08:00 local time. If they provide only a date with no time or daypart, leave ready_at null and add ready_at to missing_fields. "
             "If the email clearly gives an absolute timezone-aware timestamp, you may return that precise instant. "
             "If a field is absent, leave it null and include it in missing_fields when critical. "
             "If the email suggests multiple routes, conflicting details, or attachment-only details, add ambiguity_reasons.\n\n"
@@ -314,7 +327,7 @@ async def extract_shipment_details(email_context: dict) -> ShipmentExtractionRes
             schema=ShipmentExtractionResult,
             prompt=prompt,
         )
-        return _merge_shipment_results(result, heuristics)
+        return _merge_shipment_results(result, heuristics, source_text=_shipment_source_text(email_context))
     except Exception:
         logger.exception("freight_ai.extract_shipment.failed")
         return heuristics
@@ -345,9 +358,11 @@ async def extract_shipment_field_from_thread(field: str, thread_context: dict) -
             "Return only the requested field. "
             "For field ready_at_local, find the customer-confirmed pickup-ready time. "
             "Prefer the latest clear customer-provided pickup-ready time. "
-            "Return value_local_text as a strict local datetime string in YYYY-MM-DDTHH:MM format when possible. "
+            "Return value_local_text as a strict local datetime string (YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS) with NO timezone suffix. "
+            "If the customer says early morning, use approximately 07:00 local; if they say morning, use approximately 08:00 local. "
+            "If they give only a date with no time or daypart, keep value_local_text null. "
             "If the thread is ambiguous, conflicting, or the time is not clear enough, keep value_local_text null and explain ambiguity_reasons. "
-            "Do not infer a timezone. Do not return UTC. Do not return extra fields outside the schema.\n\n"
+            "Do not append Z or offsets. Do not return extra fields outside the schema.\n\n"
             f"field: {field}\n"
             f"origin: {thread_context.get('origin', '')}\n"
             f"destination: {thread_context.get('destination', '')}\n"
@@ -449,6 +464,7 @@ async def extract_carrier_status_update(email_context: dict) -> CarrierStatusUpd
 
 def _classify_with_heuristics(email_context: dict) -> IntentResult:
     body_text = str(email_context.get("body_preview", "") or "")
+    first_reply_line = _first_meaningful_reply_line(body_text)
     text = f"{email_context.get('subject', '')}\n{body_text}".lower()
     sender_role = email_context.get("sender_role")
     shipment_status = email_context.get("shipment_status") or ""
@@ -463,7 +479,11 @@ def _classify_with_heuristics(email_context: dict) -> IntentResult:
     if (
         sender_role == "client"
         and shipment_status in CONFIRMABLE_SHIPMENT_STATUSES
-        and (SHORT_CONFIRM_PATTERN.match(body_text) or any(token in text for token in CONFIRM_HINTS))
+        and (
+            SHORT_CONFIRM_PATTERN.match(body_text)
+            or SHORT_CONFIRM_PATTERN.match(first_reply_line)
+            or any(token in text for token in CONFIRM_HINTS)
+        )
     ):
         return IntentResult(intent="customer_quote_confirmation", confidence=0.85)
     if sender_role == "client" and shipment_status in {"booked", "booking_in_progress"} and any(token in text for token in STATUS_REQUEST_HINTS):
@@ -547,9 +567,37 @@ def _extract_bid_with_heuristics(email_context: dict) -> CarrierBidExtractionRes
     )
 
 
+def _shipment_source_text(email_context: dict) -> str:
+    return " ".join(
+        str(email_context.get(key) or "")
+        for key in ("subject", "body_preview", "body", "content")
+    )
+
+
+def _adjust_vague_ready_time(
+    ready_at: datetime | None,
+    source_text: str | None,
+    ambiguity_reasons: list[str],
+) -> datetime | None:
+    if ready_at is None or not source_text:
+        return ready_at
+    if ready_at.hour != 0 or ready_at.minute != 0 or ready_at.second != 0:
+        return ready_at
+
+    normalized_text = source_text.lower()
+    if re.search(r"\bearly\s+morning\b", normalized_text):
+        return ready_at.replace(hour=7, minute=0, second=0, microsecond=0)
+    if re.search(r"\bmorning\b", normalized_text):
+        return ready_at.replace(hour=8, minute=0, second=0, microsecond=0)
+    if "ready_at_date_only_no_time" not in ambiguity_reasons:
+        ambiguity_reasons.append("ready_at_date_only_no_time")
+    return None
+
+
 def _merge_shipment_results(
     primary: ShipmentExtractionResult,
     fallback: ShipmentExtractionResult,
+    source_text: str | None = None,
 ) -> ShipmentExtractionResult:
     if primary.origin is None:
         primary.origin = fallback.origin
@@ -577,6 +625,7 @@ def _merge_shipment_results(
     primary.equipment_type = _normalize_equipment(primary.equipment_type)
     primary.weight_lb = _normalize_weight_lb(primary.weight_lb)
     primary.notes = _normalize_shipment_notes(primary.notes)
+    primary.ready_at = _adjust_vague_ready_time(primary.ready_at, source_text, primary.ambiguity_reasons)
     primary.ready_at = _normalize_schedule_candidate(
         utc_value=primary.ready_at,
         local_text=None,
@@ -809,7 +858,58 @@ def _extract_weight_lb(text: str) -> float | None:
     return _normalize_weight_lb(raw_value)
 
 
+def _lane_fingerprint(origin: str, destination: str) -> tuple[str, str]:
+    """City-first key so 'Salt Lake City' and 'Salt Lake City, UT' dedupe as one lane."""
+
+    def core(loc: str) -> str:
+        part = loc.strip().lower()
+        if not part:
+            return ""
+        return part.split(",")[0].strip()
+
+    return (core(origin), core(destination))
+
+
+def _extract_ready_at_month_flexible(text: str) -> datetime | None:
+    """Parse 'April 30, flexible after 8:00 AM' where filler sits between day and clock time."""
+    md = re.search(
+        r"\b(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+"
+        r"(?P<day>\d{1,2})(?:,?\s*(?P<year>\d{4}))?\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not md:
+        return None
+    months = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    month_key = md.group("month")[:3].lower()
+    month = months[month_key]
+    day = int(md.group("day"))
+    year = int(md.group("year") or datetime.now(timezone.utc).year)
+    tail = text[md.end() : min(len(text), md.end() + 200)]
+    tm = re.search(
+        r"(?:after|starting|from|at|by)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)\b)|\b(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
+        tail,
+        re.IGNORECASE,
+    )
+    if not tm:
+        return None
+    time_raw = (tm.group(1) or tm.group(2) or "").strip()
+    if not time_raw:
+        return None
+    hour, minute = _parse_time_token(time_raw)
+    try:
+        return datetime(year, month, day, hour, minute, 0, 0)
+    except ValueError:
+        return None
+
+
 def _extract_ready_at(text: str) -> datetime | None:
+    month_based = _extract_ready_at_month_flexible(text)
+    if month_based is not None:
+        return month_based
     match = READY_AT_PATTERN.search(text)
     if not match:
         return None
@@ -980,8 +1080,15 @@ def _shipment_ambiguity_reasons(
     destination: str | None,
 ) -> list[str]:
     reasons: list[str] = []
-    route_count = sum(1 for pattern in (ROUTE_FROM_TO_PATTERN, ROUTE_ARROW_PATTERN) for _ in pattern.finditer(text))
-    if route_count > 1:
+    route_fingerprints: set[tuple[str, str]] = set()
+    for pattern in (ROUTE_FROM_TO_PATTERN, ROUTE_ARROW_PATTERN):
+        for match in pattern.finditer(text):
+            o = _normalize_location(match.group("origin"))
+            d = _normalize_location(match.group("destination"))
+            if not o or not d or o == d:
+                continue
+            route_fingerprints.add(_lane_fingerprint(o, d))
+    if len(route_fingerprints) > 1:
         reasons.append("multiple_routes_detected")
     if any(hint in text.lower() for hint in ATTACHMENT_HINTS) and not (origin and destination):
         reasons.append("attachment_referenced_without_lane_details")

@@ -52,6 +52,12 @@ DOCUMENT_TYPE_RULES = (
 BOOKING_DOCUMENT_REQUIREMENTS = (
     ("pricing_backup", {"rate_confirmation", "quote_sheet"}),
 )
+BOOKING_DOCUMENT_REVIEW_STATUSES = {
+    ShipmentStage.AWAITING_CONFIRMATION.value,
+    ShipmentStage.BOOKING_IN_PROGRESS.value,
+    ShipmentStage.BOOKING_FAILED.value,
+    ShipmentStage.BOOKED.value,
+}
 ATTACHMENT_CACHE_KEY = "_logistic_copilot_extract"
 GENERIC_AMOUNT_PATTERN = re.compile(r"(?:\$|usd\s*)(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE)
 RATE_AMOUNT_PATTERNS = (
@@ -564,7 +570,7 @@ async def collect_shipment_attachments(
     return attachments
 
 
-def summarize_booking_documents(attachments: list[dict]) -> dict:
+def summarize_booking_documents(attachments: list[dict], *, require_booking_documents: bool = True) -> dict:
     summary: dict[str, int] = {}
     ocr_pending_count = 0
     review_required_count = 0
@@ -577,9 +583,10 @@ def summarize_booking_documents(attachments: list[dict]) -> dict:
             review_required_count += 1
 
     missing_document_types: list[str] = []
-    for requirement_name, accepted_types in BOOKING_DOCUMENT_REQUIREMENTS:
-        if not any(summary.get(document_type, 0) > 0 for document_type in accepted_types):
-            missing_document_types.append(requirement_name)
+    if require_booking_documents:
+        for requirement_name, accepted_types in BOOKING_DOCUMENT_REQUIREMENTS:
+            if not any(summary.get(document_type, 0) > 0 for document_type in accepted_types):
+                missing_document_types.append(requirement_name)
 
     pricing_docs = summary.get("rate_confirmation", 0) + summary.get("quote_sheet", 0)
     warning = None
@@ -669,8 +676,14 @@ def build_document_health(
     *,
     approved_fields: dict | None = None,
     warning_ignored: bool = False,
+    require_booking_documents: bool | None = None,
 ) -> dict:
-    booking_summary = summarize_booking_documents(attachments)
+    if require_booking_documents is None:
+        require_booking_documents = shipment.status in BOOKING_DOCUMENT_REVIEW_STATUSES
+    booking_summary = summarize_booking_documents(
+        attachments,
+        require_booking_documents=require_booking_documents,
+    )
     document_enrichment = _extract_document_enrichment(attachments)
     if approved_fields:
         document_enrichment.update(dict(approved_fields))
@@ -1267,7 +1280,7 @@ async def handoff_to_tms(
     bid, carrier = await _get_selected_bid(session, shipment, bid_id)
     client = await session.get(Client, shipment.client_id) if shipment.client_id else None
     attachments = await collect_shipment_attachments(session, shipment)
-    document_status = build_document_health(attachments, shipment)
+    document_status = build_document_health(attachments, shipment, require_booking_documents=True)
     document_context = build_document_context(attachments)
     payload = {
         "shipment_id": str(shipment.id),

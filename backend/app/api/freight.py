@@ -7,7 +7,7 @@ import re
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -17,6 +17,7 @@ from app.memory.database import (
     Client,
     EmailMessage,
     EmailThread,
+    EmailTriageItem,
     FraudDenylistEntry,
     Shipment,
     WorkflowEvent,
@@ -49,9 +50,16 @@ from app.schemas import (
     FreightFoundationResponse,
     FreightFinancialShipmentSummary,
     FreightFinancialSummaryResponse,
+    FraudDenylistEntryRecord,
+    FraudDenylistEntryRequest,
+    FraudDenylistEntryUpdateRequest,
     FraudDenylistScope,
     FraudReviewType,
     FraudRiskLevel,
+    EmailTriageAction,
+    EmailTriageActionRequest,
+    EmailTriageClassification,
+    EmailTriageRecord,
     OutlookIngestRequest,
     OutlookIngestResult,
     OutlookSyncRequest,
@@ -120,7 +128,11 @@ from app.services.freight_inbox_agent import (
     run_freight_inbox_orchestrator,
     send_customer_clarification,
 )
-from app.services.freight_ai import extract_carrier_status_update, extract_shipment_field_from_thread
+from app.services.freight_ai import (
+    extract_carrier_status_update,
+    extract_shipment_details,
+    extract_shipment_field_from_thread,
+)
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import (
     format_route_datetime_display,
@@ -136,6 +148,7 @@ from app.services.outlook_mail_actions import (
     mark_email_message_read_after_ai_success,
     move_shipment_thread_messages_to_archive,
     outlook_categories_for_ai_decision,
+    outlook_categories_for_email_triage,
     outlook_categories_for_fraud_assessment,
 )
 from app.services.freight_read import build_freight_overview, is_status_stale as _is_status_stale, list_notification_feed
@@ -336,16 +349,54 @@ def _serialize_thread_message(message: EmailMessage) -> ShipmentThreadMessageRec
 def _parse_magic_local_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
-    normalized = value.strip()
+    normalized = value.strip().strip('"').strip("'")
     if not normalized:
         return None
+    if normalized.startswith("```"):
+        normalized = re.sub(r"^```[a-zA-Z]*\s*", "", normalized)
+        normalized = re.sub(r"\s*```$", "", normalized).strip()
     try:
-        parsed = datetime.fromisoformat(normalized)
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is not None:
         return parsed.replace(tzinfo=None)
     return parsed
+
+
+async def _magic_fill_ready_fallback_from_full_extraction(
+    *,
+    shipment: Shipment,
+    client: Client,
+    customer_messages: list[EmailMessage],
+    all_messages: list[EmailMessage],
+) -> datetime | None:
+    """When single-field extraction does not yield a parseable pickup time, reuse full shipment extraction."""
+    last = customer_messages[-1]
+    body = _message_display_body(last) or (last.body_preview or "")
+    email_context = {
+        "sender_email": (last.sender or ""),
+        "sender_role": "customer",
+        "subject": last.subject or "",
+        "body_preview": body,
+        "body": body,
+        "thread_subject": (all_messages[-1].subject if all_messages else "") or "",
+        "shipment_status": shipment.status,
+        "known_client": client.email,
+        "known_carrier": "",
+    }
+    full_ext = await extract_shipment_details(email_context)
+    if full_ext.ready_at is None:
+        return None
+    origin = shipment.origin or full_ext.origin
+    destination = shipment.destination or full_ext.destination
+    _, pickup_local, _, _ = normalize_pickup_datetime_fields(
+        ready_at=full_ext.ready_at if full_ext.ready_at.tzinfo is not None else None,
+        ready_at_local=full_ext.ready_at if full_ext.ready_at.tzinfo is None else None,
+        origin=origin,
+        destination=destination,
+    )
+    return pickup_local
 
 
 def _message_touches_email(message: EmailMessage, email: str) -> bool:
@@ -578,16 +629,30 @@ async def _process_outlook_mailbox_message(
 
     if result.shipment_creation_skipped or result.suppressed:
         fraud_level = str(result.fraud_risk_level or "")
-        result.next_action = "fraud_suppressed" if fraud_level == FraudRiskLevel.HIGH.value else "suppressed"
+        classification = (
+            result.triage_classification.value
+            if hasattr(result.triage_classification, "value")
+            else result.triage_classification
+        )
+        if classification == "fraud_or_phishing":
+            result.next_action = "fraud_triage"
+        elif classification == "noise_or_unhandled":
+            result.next_action = "triage_archived"
+        elif classification == "needs_operator_triage":
+            result.next_action = "operator_triage"
+            result.manual_review_required = True
+        else:
+            result.next_action = "fraud_suppressed" if fraud_level == FraudRiskLevel.HIGH.value else "suppressed"
         categories = outlook_categories_for_fraud_assessment(
             sender_verification_required=result.sender_verification_required,
             fraud_risk_level=fraud_level or None,
         )
-        if categories and result.email_message_id and result.shipment_id:
+        categories = list(dict.fromkeys(categories + outlook_categories_for_email_triage(classification)))
+        if categories and result.email_message_id:
             await add_email_message_categories(
                 session,
                 email_message_id=result.email_message_id,
-                shipment_id=result.shipment_id,
+                shipment_id=result.shipment_id or None,
                 categories=categories,
                 reason=f"suppressed:{result.next_action}",
             )
@@ -750,6 +815,27 @@ def _serialize_carrier(carrier: Carrier) -> CarrierRecord:
     )
 
 
+def _serialize_fraud_denylist_entry(entry: FraudDenylistEntry) -> FraudDenylistEntryRecord:
+    return FraudDenylistEntryRecord(
+        id=str(entry.id),
+        scope=FraudDenylistScope(entry.scope),
+        value=entry.value,
+        reason=entry.reason,
+        source_shipment_id=str(entry.source_shipment_id) if entry.source_shipment_id else None,
+        is_active=entry.is_active,
+        created_at=entry.created_at,
+        updated_at=entry.updated_at,
+    )
+
+
+def _normalize_fraud_denylist_value(scope: FraudDenylistScope, value: str) -> str:
+    return (
+        extract_sender_domain(value)
+        if scope == FraudDenylistScope.SENDER_DOMAIN and "@" in value
+        else str(value or "").strip().lower().rstrip(".")
+    )
+
+
 def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> ShipmentRecord:
     ai_payload = ai_payload or {}
     ready_at, ready_at_local, ready_timezone_name, ready_offset = normalize_pickup_datetime_fields(
@@ -764,7 +850,11 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         origin=shipment.origin,
         destination=shipment.destination,
     )
-    ai_missing_fields = list(ai_payload.get("missing_fields", []) or [])
+    ai_missing_fields = _shipment_current_missing_fields(
+        shipment,
+        ready_at=ready_at,
+        ready_at_local=ready_at_local,
+    )
     ai_ambiguity_reasons = list(ai_payload.get("ambiguity_reasons", []) or [])
     manual_review_required = bool(ai_payload.get("manual_review_required", False))
     sender_verification_required = bool(ai_payload.get("sender_verification_required", False))
@@ -930,6 +1020,28 @@ def _shipment_next_step_label(
         if label:
             return label
     return None
+
+
+def _shipment_current_missing_fields(
+    shipment: Shipment,
+    *,
+    ready_at: datetime | None,
+    ready_at_local: datetime | None,
+) -> list[str]:
+    missing_fields: list[str] = []
+    if not (shipment.origin or "").strip():
+        missing_fields.append("origin")
+    if not (shipment.destination or "").strip():
+        missing_fields.append("destination")
+    if shipment.pallets is None:
+        missing_fields.append("pallets")
+    if shipment.weight_lb is None:
+        missing_fields.append("weight_lb")
+    if not (shipment.equipment_type or "").strip():
+        missing_fields.append("equipment_type")
+    if ready_at is None and ready_at_local is None:
+        missing_fields.append("ready_at")
+    return missing_fields
 
 
 def _derive_attention_projection(
@@ -1428,11 +1540,7 @@ async def _upsert_fraud_denylist_entry(
     reason: str | None,
     source_shipment_id: UUID | None,
 ) -> tuple[FraudDenylistEntry, bool]:
-    normalized_value = (
-        extract_sender_domain(value)
-        if scope == FraudDenylistScope.SENDER_DOMAIN and "@" in value
-        else str(value or "").strip().lower().rstrip(".")
-    )
+    normalized_value = _normalize_fraud_denylist_value(scope, value)
     if not normalized_value:
         raise HTTPException(status_code=400, detail="Cannot create fraud denylist entry without a sender value.")
     entry = await session.scalar(
@@ -2435,6 +2543,89 @@ async def update_carrier(
     return _serialize_carrier(carrier)
 
 
+@router.get("/freight/fraud-denylist", response_model=list[FraudDenylistEntryRecord])
+async def list_fraud_denylist_entries(
+    value: str | None = Query(default=None),
+    include_inactive: bool = Query(default=True),
+    session: AsyncSession = Depends(get_session),
+) -> list[FraudDenylistEntryRecord]:
+    """List fraud denylist entries, optionally scoped to one email/domain value."""
+    conditions = []
+    if not include_inactive:
+        conditions.append(FraudDenylistEntry.is_active.is_(True))
+    if value:
+        normalized_email = normalize_sender_email(value)
+        normalized_domain = extract_sender_domain(normalized_email or value)
+        value_conditions = []
+        if normalized_email:
+            value_conditions.append(
+                (FraudDenylistEntry.scope == FraudDenylistScope.SENDER_EMAIL.value)
+                & (FraudDenylistEntry.value == normalized_email)
+            )
+        if normalized_domain:
+            value_conditions.append(
+                (FraudDenylistEntry.scope == FraudDenylistScope.SENDER_DOMAIN.value)
+                & (FraudDenylistEntry.value == normalized_domain)
+            )
+        if value_conditions:
+            conditions.append(or_(*value_conditions))
+    query = select(FraudDenylistEntry).order_by(FraudDenylistEntry.updated_at.desc())
+    if conditions:
+        query = query.where(*conditions)
+    result = await session.execute(query)
+    return [_serialize_fraud_denylist_entry(entry) for entry in result.scalars().all()]
+
+
+@router.post("/freight/fraud-denylist", response_model=FraudDenylistEntryRecord)
+async def create_fraud_denylist_entry(
+    request: FraudDenylistEntryRequest,
+    session: AsyncSession = Depends(get_session),
+) -> FraudDenylistEntryRecord:
+    """Create or reactivate a fraud denylist entry."""
+    normalized_value = _normalize_fraud_denylist_value(request.scope, request.value)
+    if not normalized_value:
+        raise HTTPException(status_code=400, detail="Cannot create fraud denylist entry without a sender value.")
+    entry = await session.scalar(
+        select(FraudDenylistEntry).where(
+            FraudDenylistEntry.scope == request.scope.value,
+            FraudDenylistEntry.value == normalized_value,
+        )
+    )
+    if entry is None:
+        entry = FraudDenylistEntry(
+            scope=request.scope.value,
+            value=normalized_value,
+            reason=request.reason,
+            is_active=request.is_active,
+        )
+        session.add(entry)
+    else:
+        entry.reason = request.reason
+        entry.is_active = request.is_active
+        entry.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(entry)
+    return _serialize_fraud_denylist_entry(entry)
+
+
+@router.patch("/freight/fraud-denylist/{entry_id}", response_model=FraudDenylistEntryRecord)
+async def update_fraud_denylist_entry(
+    entry_id: UUID,
+    request: FraudDenylistEntryUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+) -> FraudDenylistEntryRecord:
+    """Update fraud denylist entry state."""
+    entry = await session.get(FraudDenylistEntry, entry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Fraud denylist entry not found.")
+    entry.reason = request.reason
+    entry.is_active = request.is_active
+    entry.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(entry)
+    return _serialize_fraud_denylist_entry(entry)
+
+
 @router.get("/freight/shipments", response_model=list[ShipmentRecord])
 async def list_shipments(
     month: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}$"),
@@ -2792,6 +2983,25 @@ async def magic_fill_shipment_field(
     )
 
     suggested_local = _parse_magic_local_datetime(extraction.value_local_text)
+    suggested_value_for_response = extraction.value_local_text
+    used_full_extraction_fallback = False
+    if suggested_local is None and request.field == ShipmentMagicField.READY_AT_LOCAL:
+        fb_local = await _magic_fill_ready_fallback_from_full_extraction(
+            shipment=shipment,
+            client=client,
+            customer_messages=customer_messages,
+            all_messages=all_messages,
+        )
+        if fb_local is not None:
+            suggested_local = fb_local
+            suggested_value_for_response = fb_local.replace(microsecond=0).isoformat(sep="T")
+            used_full_extraction_fallback = True
+            logger.info(
+                "magic_fill.full_extraction_fallback shipment_id=%s suggested_local=%s",
+                shipment_id,
+                suggested_value_for_response,
+            )
+
     logger.info(
         "magic_fill.normalized shipment_id=%s field=%s suggested_local=%s",
         shipment_id,
@@ -2811,6 +3021,7 @@ async def magic_fill_shipment_field(
             shipment.ready_at_timezone,
         )
 
+        response_confidence = max(extraction.confidence, 0.85) if used_full_extraction_fallback else extraction.confidence
         evt = WorkflowEvent(
             shipment_id=shipment.id,
             event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
@@ -2820,8 +3031,10 @@ async def magic_fill_shipment_field(
                 "edited_by": "magic_fill",
                 "source": "customer_thread_ai",
                 "field": request.field.value,
-                "confidence": extraction.confidence,
-                "suggested_value": extraction.value_local_text,
+                "confidence": response_confidence,
+                "suggested_value": suggested_value_for_response,
+                "single_field_value_local_text": extraction.value_local_text,
+                "full_extraction_fallback": used_full_extraction_fallback,
                 "source_messages": len(customer_messages),
                 "ambiguity_reasons": extraction.ambiguity_reasons,
             },
@@ -2831,13 +3044,18 @@ async def magic_fill_shipment_field(
         await session.refresh(shipment)
         await freight_realtime_hub.notify_workflow_event(evt)
         logger.info("magic_fill.applied shipment_id=%s field=%s", shipment_id, request.field.value)
+        applied_message = (
+            "Pickup-ready time recovered from thread (full extraction) and applied."
+            if used_full_extraction_fallback
+            else "Pickup-ready time extracted from customer thread and applied to shipment."
+        )
         return ShipmentMagicFillResponse(
             shipment_id=str(shipment.id),
             field=request.field,
             status="applied",
-            message="Pickup-ready time extracted from customer thread and applied to shipment.",
-            confidence=extraction.confidence,
-            suggested_value=extraction.value_local_text,
+            message=applied_message,
+            confidence=response_confidence,
+            suggested_value=suggested_value_for_response,
             ambiguity_reasons=extraction.ambiguity_reasons,
             source_messages=len(customer_messages),
             shipment=_serialize_shipment(shipment),
@@ -2847,7 +3065,11 @@ async def magic_fill_shipment_field(
     message = "AI could not confidently recover a pickup-ready time from the customer thread."
     if suggested_local is not None and not request.apply_value:
         status = "suggested"
-        message = "Pickup-ready time extracted from customer thread."
+        message = (
+            "Pickup-ready time suggested via full thread extraction."
+            if used_full_extraction_fallback
+            else "Pickup-ready time extracted from customer thread."
+        )
     logger.warning(
         "magic_fill.no_apply shipment_id=%s field=%s status=%s value_local_text=%s",
         shipment_id,
@@ -2861,8 +3083,8 @@ async def magic_fill_shipment_field(
         field=request.field,
         status=status,
         message=message,
-        confidence=extraction.confidence,
-        suggested_value=extraction.value_local_text,
+        confidence=max(extraction.confidence, 0.85) if used_full_extraction_fallback else extraction.confidence,
+        suggested_value=suggested_value_for_response,
         ambiguity_reasons=extraction.ambiguity_reasons,
         source_messages=len(customer_messages),
         shipment=None,
@@ -3018,6 +3240,130 @@ async def freight_review_queue(
         if (shipments_by_id.get(event.shipment_id) is not None and not shipments_by_id[event.shipment_id].is_archived)
     ]
     return sorted(items, key=_review_priority_score)
+
+
+async def _serialize_email_triage_item(session: AsyncSession, item: EmailTriageItem) -> EmailTriageRecord:
+    message = await session.get(EmailMessage, item.email_message_id)
+    shipment = None
+    if item.created_shipment_id:
+        shipment = await session.get(Shipment, item.created_shipment_id)
+    elif item.thread_id:
+        shipment = await session.scalar(
+            select(Shipment).where(Shipment.email_thread_id == item.thread_id).order_by(Shipment.created_at.desc())
+        )
+    return EmailTriageRecord(
+        id=str(item.id),
+        email_message_id=str(item.email_message_id),
+        thread_id=str(item.thread_id),
+        shipment_id=str(shipment.id) if shipment else None,
+        classification=item.classification,
+        confidence=float(item.confidence or 0),
+        reason=item.reason,
+        recommended_action=item.recommended_action,
+        resolved_at=item.resolved_at,
+        resolved_action=item.resolved_action,
+        created_shipment_id=str(item.created_shipment_id) if item.created_shipment_id else None,
+        sender=message.sender if message else None,
+        subject=message.subject if message else None,
+        body_preview=message.body_preview if message else None,
+        received_at=message.received_at if message else None,
+        payload=dict(item.payload_json or {}),
+        created_at=item.created_at,
+    )
+
+
+@router.get("/freight/email-triage", response_model=list[EmailTriageRecord])
+async def freight_email_triage_queue(
+    include_resolved: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> list[EmailTriageRecord]:
+    """Return pre-shipment email triage items for operator review."""
+    query = select(EmailTriageItem).order_by(EmailTriageItem.created_at.desc()).limit(limit)
+    if not include_resolved:
+        query = query.where(EmailTriageItem.resolved_at.is_(None))
+    result = await session.execute(query)
+    return [await _serialize_email_triage_item(session, item) for item in result.scalars().all()]
+
+
+@router.post("/freight/email-triage/{triage_id}/action", response_model=EmailTriageRecord)
+async def freight_email_triage_action(
+    triage_id: UUID,
+    request: EmailTriageActionRequest,
+    session: AsyncSession = Depends(get_session),
+) -> EmailTriageRecord:
+    """Resolve a triage item by creating/linking a shipment or marking it as non-shipment/fraud."""
+    item = await session.get(EmailTriageItem, triage_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Email triage item not found.")
+    message = await session.get(EmailMessage, item.email_message_id)
+    thread = await session.get(EmailThread, item.thread_id)
+    if message is None or thread is None:
+        raise HTTPException(status_code=404, detail="Triage source email not found.")
+
+    now = datetime.now(timezone.utc)
+    shipment: Shipment | None = None
+    if request.action == EmailTriageAction.CREATE_SHIPMENT:
+        shipment = await session.scalar(
+            select(Shipment).where(Shipment.email_thread_id == thread.id).order_by(Shipment.created_at.desc())
+        )
+        if shipment is None:
+            thread.quote_token = thread.quote_token or generate_quote_reference().subject_token
+            shipment = Shipment(
+                email_thread_id=thread.id,
+                status=ShipmentStage.RECEIVED.value,
+                quote_token=thread.quote_token,
+                margin_policy_json={
+                    "percent": settings.profit_margin_percent_default,
+                    "floor_amount": settings.profit_margin_floor_default,
+                },
+                notes=None,
+            )
+            session.add(shipment)
+            await session.flush()
+        item.created_shipment_id = shipment.id
+        item.resolved_action = request.action.value
+    elif request.action == EmailTriageAction.LINK_TO_EXISTING_SHIPMENT:
+        if not request.shipment_id:
+            raise HTTPException(status_code=400, detail="shipment_id is required to link triage email.")
+        shipment = await session.get(Shipment, UUID(str(request.shipment_id)))
+        if shipment is None:
+            raise HTTPException(status_code=404, detail="Shipment not found.")
+        shipment.email_thread_id = shipment.email_thread_id or thread.id
+        item.created_shipment_id = shipment.id
+        item.resolved_action = request.action.value
+    elif request.action == EmailTriageAction.MARK_NOT_SHIPMENT:
+        thread.shipment_ingest_suppressed = True
+        thread.shipment_ingest_suppressed_reason = request.reason or "operator_marked_not_shipment"
+        thread.shipment_ingest_suppressed_at = now
+        item.resolved_action = request.action.value
+    elif request.action in {EmailTriageAction.MARK_FRAUD_EMAIL, EmailTriageAction.MARK_FRAUD_DOMAIN}:
+        sender_email = normalize_sender_email(message.sender)
+        sender_value = sender_email if request.action == EmailTriageAction.MARK_FRAUD_EMAIL else extract_sender_domain(sender_email)
+        scope = (
+            FraudDenylistScope.SENDER_EMAIL
+            if request.action == EmailTriageAction.MARK_FRAUD_EMAIL
+            else FraudDenylistScope.SENDER_DOMAIN
+        )
+        await _upsert_fraud_denylist_entry(
+            session,
+            scope=scope,
+            value=sender_value,
+            reason=request.reason or "operator_triage_fraud",
+            source_shipment_id=None,
+        )
+        thread.shipment_ingest_suppressed = True
+        thread.shipment_ingest_suppressed_reason = f"fraud_triage:{scope.value}:{sender_value}"
+        thread.shipment_ingest_suppressed_at = now
+        item.classification = EmailTriageClassification.FRAUD_OR_PHISHING.value
+        item.resolved_action = request.action.value
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported triage action.")
+
+    item.resolved_at = item.resolved_at or now
+    item.updated_at = now
+    await session.commit()
+    return await _serialize_email_triage_item(session, item)
 
 
 @router.get("/freight/status-queue", response_model=list[StatusQueueItem])

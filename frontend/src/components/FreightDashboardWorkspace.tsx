@@ -25,7 +25,6 @@ import {
   LucideIcon,
   Mail,
   MapPin,
-  MoreHorizontal,
   Package2,
   PencilLine,
   RadioTower,
@@ -43,7 +42,7 @@ import {
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const OUTLOOK_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 
-type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers" | "archive";
+type DashboardTab = "shipments" | "triage" | "status_ops" | "clients" | "carriers" | "archive";
 type WorkspaceSection = "overview" | "bids" | "timeline" | "status" | "docs";
 type DrawerMode = "overview" | "edit";
 type DrawerMobileTab = "details" | "thread";
@@ -54,6 +53,8 @@ type SenderIdentityRole = "customer" | "carrier";
 type SenderTrustScope = FraudBlockScope;
 type EditFocusTarget = "client_id" | "equipment_type" | "origin" | "destination" | "pallets" | "weight_lb" | "ready_at" | "delivery_at" | "notes";
 type StatusQueueAction = "preview" | "approve_and_send" | "approve_and_push" | "rebuild_draft" | "retry_push" | "dismiss";
+type EmailTriageAction = "create_shipment" | "mark_not_shipment" | "mark_fraud_email" | "mark_fraud_domain" | "link_to_existing_shipment";
+type PartyDrawerState = { kind: "client" | "carrier"; id: string } | null;
 type OperatorAction =
   | "resume_workflow"
   | "approve_and_continue"
@@ -104,6 +105,8 @@ interface ClientRecord {
   is_active: boolean;
   default_margin_percent: number;
   default_margin_floor: number;
+  created_at: string;
+  updated_at: string;
 }
 
 interface CarrierRecord {
@@ -114,6 +117,20 @@ interface CarrierRecord {
   is_active: boolean;
   regions: string[];
   equipment: string[];
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+interface FraudDenylistEntryRecord {
+  id: string;
+  scope: FraudBlockScope;
+  value: string;
+  reason: string | null;
+  source_shipment_id: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 interface ShipmentRecord {
@@ -268,6 +285,26 @@ interface StatusQueueItem {
   draft_body: string | null;
   structured_payload: Record<string, unknown>;
   last_failure: string | null;
+}
+
+interface EmailTriageItem {
+  id: string;
+  email_message_id: string;
+  thread_id: string;
+  shipment_id: string | null;
+  classification: string;
+  confidence: number;
+  reason: string | null;
+  recommended_action: string | null;
+  resolved_at: string | null;
+  resolved_action: string | null;
+  created_shipment_id: string | null;
+  sender: string | null;
+  subject: string | null;
+  body_preview: string | null;
+  received_at: string | null;
+  payload: Record<string, unknown>;
+  created_at: string;
 }
 
 interface OutlookIngestResult {
@@ -624,6 +661,24 @@ function formatDate(value: string | null) {
   }).format(new Date(value));
 }
 
+function localDateKey(value: string | null | undefined) {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return new Intl.DateTimeFormat("en-CA").format(parsed);
+}
+
+function emailDomain(value: string | null | undefined) {
+  const normalized = (value || "").trim().toLowerCase();
+  return normalized.includes("@") ? normalized.split("@").pop() || "" : normalized;
+}
+
+function shipmentActivityTimestamp(shipment: ShipmentRecord) {
+  const createdAt = new Date(shipment.created_at).getTime();
+  const updatedAt = new Date(shipment.updated_at).getTime();
+  return Math.max(Number.isNaN(createdAt) ? 0 : createdAt, Number.isNaN(updatedAt) ? 0 : updatedAt);
+}
+
 function webhookStatusLabel(status: string | null | undefined) {
   if (status === "active") return "Active";
   if (status === "expiring_soon") return "Renew soon";
@@ -640,12 +695,18 @@ function webhookStatusClasses(status: string | null | undefined) {
   return "border-white/10 bg-white/5 text-slate-300";
 }
 
-function formatShipmentSchedule(displayValue: string | null, localValue: string | null) {
+function formatShipmentSchedule(
+  displayValue: string | null,
+  localValue: string | null,
+  utcIsoFallback: string | null = null,
+) {
   const rawValue = displayValue
     ? displayValue.replace(/\s*\([^)]+\)\s*$/, "").trim()
     : localValue
       ? localValue.replace("T", " ").trim()
-      : "";
+      : utcIsoFallback
+        ? utcIsoFallback.trim()
+        : "";
   if (!rawValue) return "Not scheduled";
   const normalizedForParse = rawValue.includes("T") ? rawValue : rawValue.replace(" ", "T");
   const parsed = new Date(normalizedForParse);
@@ -717,6 +778,19 @@ function formatConfidence(value: number | null) {
   return `${Math.round(value * 100)}%`;
 }
 
+function triageClassificationLabel(value: string | null | undefined) {
+  if (!value) return "Unknown";
+  return value.replaceAll("_", " ");
+}
+
+function triageClassificationClasses(value: string | null | undefined) {
+  if (value === "fraud_or_phishing") return "border-rose-300/24 bg-rose-300/12 text-rose-50";
+  if (value === "needs_operator_triage") return "border-amber-300/24 bg-amber-300/12 text-amber-50";
+  if (value === "freight_quote_request") return "border-emerald-300/24 bg-emerald-300/12 text-emerald-50";
+  if (value === "carrier_reply" || value === "status_or_ops") return "border-cyan-300/24 bg-cyan-300/12 text-cyan-50";
+  return "border-white/10 bg-white/5 text-slate-300";
+}
+
 function formatCurrency(value: number | null | undefined, options?: { compact?: boolean }) {
   if (value === null || value === undefined || Number.isNaN(value)) return "--";
   return new Intl.NumberFormat("en-US", {
@@ -752,8 +826,8 @@ function buildShipmentEditor(shipment: ShipmentRecord | null): ShipmentEditorSta
     pallets: shipment?.pallets?.toString() || "",
     weight_lb: shipment?.weight_lb?.toString() || "",
     equipment_type: shipment?.equipment_type || "",
-    ready_at: toDateTimeLocal(shipment?.ready_at_local || null),
-    delivery_at: toDateTimeLocal(shipment?.delivery_at_local || null),
+    ready_at: toDateTimeLocal(shipment?.ready_at_local || shipment?.ready_at || null),
+    delivery_at: toDateTimeLocal(shipment?.delivery_at_local || shipment?.delivery_at || null),
     notes: shipment?.notes || "",
   };
 }
@@ -796,8 +870,7 @@ function shipmentBlockingBadge(shipment: ShipmentRecord) {
   if (shipment.attention_state === "docs_warning") return "Docs warning";
   if (shipment.attention_state === "status_review") return "Status review";
   if (shipment.attention_state === "stale") return "Status stale";
-  if (shipment.status === "waiting_bids") return "Waiting bids";
-  return "Ready";
+  return null;
 }
 
 function shipmentFraudIndicators(shipment: ShipmentRecord) {
@@ -1159,6 +1232,7 @@ export function FreightDashboardWorkspace() {
   const [archiveMonth, setArchiveMonth] = useState(currentMonthValue());
   const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
   const [statusQueue, setStatusQueue] = useState<StatusQueueItem[]>([]);
+  const [emailTriageQueue, setEmailTriageQueue] = useState<EmailTriageItem[]>([]);
   const [events, setEvents] = useState<WorkflowEventRecord[]>([]);
   const [bids, setBids] = useState<BidRecord[]>([]);
   const [documents, setDocuments] = useState<ShipmentDocumentRecord[]>([]);
@@ -1180,6 +1254,14 @@ export function FreightDashboardWorkspace() {
   const [notificationTotal, setNotificationTotal] = useState(0);
   const [selectedShipmentId, setSelectedShipmentId] = useState<string | null>(null);
   const [selectedStatusTaskId, setSelectedStatusTaskId] = useState<string | null>(null);
+  const [selectedTriageItemId, setSelectedTriageItemId] = useState<string | null>(null);
+  const [triageLinkShipmentId, setTriageLinkShipmentId] = useState("");
+  const [partyDrawer, setPartyDrawer] = useState<PartyDrawerState>(null);
+  const [clientEditor, setClientEditor] = useState({ name: "", email: "", is_active: true, default_margin_percent: "15", default_margin_floor: "0" });
+  const [carrierEditor, setCarrierEditor] = useState({ name: "", email: "", is_active: true, rating: "0", regions: "", equipment: "" });
+  const [partyDenylistEntries, setPartyDenylistEntries] = useState<FraudDenylistEntryRecord[]>([]);
+  const [partyDenylistReason, setPartyDenylistReason] = useState("");
+  const [partyDenylistExpanded, setPartyDenylistExpanded] = useState(false);
   const [statusQueueScope, setStatusQueueScope] = useState<"active" | "resolved">("active");
   const [shipmentEditor, setShipmentEditor] = useState<ShipmentEditorState>(buildShipmentEditor(null));
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
@@ -1319,6 +1401,20 @@ export function FreightDashboardWorkspace() {
     () => filteredStatusQueue.find((task) => task.task_id === selectedStatusTaskId) || null,
     [filteredStatusQueue, selectedStatusTaskId],
   );
+  const selectedTriageItem = useMemo(
+    () => emailTriageQueue.find((item) => item.id === selectedTriageItemId) || emailTriageQueue[0] || null,
+    [emailTriageQueue, selectedTriageItemId],
+  );
+  const selectedPartyClient = useMemo(
+    () => (partyDrawer?.kind === "client" ? clients.find((client) => client.id === partyDrawer.id) || null : null),
+    [clients, partyDrawer],
+  );
+  const selectedPartyCarrier = useMemo(
+    () => (partyDrawer?.kind === "carrier" ? carriers.find((carrier) => carrier.id === partyDrawer.id) || null : null),
+    [carriers, partyDrawer],
+  );
+  const selectedPartyEmail = selectedPartyClient?.email || selectedPartyCarrier?.email || "";
+  const selectedPartyDomain = emailDomain(selectedPartyEmail);
   const shipmentStatusTasks = useMemo(
     () => statusQueue.filter((task) => task.shipment_id === selectedShipmentId && task.queue_scope === "active"),
     [selectedShipmentId, statusQueue],
@@ -1326,6 +1422,34 @@ export function FreightDashboardWorkspace() {
   const actionModel = useMemo(
     () => (selectedShipment ? deriveShipmentActionModel(selectedShipment, shipmentEditor, shipmentStatusTasks, bids.length) : null),
     [selectedShipment, shipmentEditor, shipmentStatusTasks, bids.length],
+  );
+  const contextMenuShipment = useMemo(
+    () =>
+      contextMenu
+        ? shipments.find((shipment) => shipment.id === contextMenu.shipmentId) ||
+          archivedShipments.find((shipment) => shipment.id === contextMenu.shipmentId) ||
+          null
+        : null,
+    [archivedShipments, contextMenu, shipments],
+  );
+  const contextMenuStatusTasks = useMemo(
+    () =>
+      contextMenuShipment
+        ? statusQueue.filter((task) => task.shipment_id === contextMenuShipment.id && task.queue_scope === "active")
+        : [],
+    [contextMenuShipment, statusQueue],
+  );
+  const contextMenuActionModel = useMemo(
+    () =>
+      contextMenuShipment
+        ? deriveShipmentActionModel(
+            contextMenuShipment,
+            contextMenuShipment.id === selectedShipmentId ? shipmentEditor : buildShipmentEditor(contextMenuShipment),
+            contextMenuStatusTasks,
+            bids.length,
+          )
+        : null,
+    [bids.length, contextMenuShipment, contextMenuStatusTasks, selectedShipmentId, shipmentEditor],
   );
   const shipmentFormDirty = useMemo(() => {
     if (!selectedShipment) return false;
@@ -1337,15 +1461,14 @@ export function FreightDashboardWorkspace() {
     return bids.find((bid) => bid.id === evaluation.selected_bid_id) || null;
   }, [bids, evaluation]);
   const boardShipments = useMemo(() => {
-    const today = new Intl.DateTimeFormat("en-CA").format(new Date());
+    const today = localDateKey(new Date().toISOString());
     const query = shipmentSearch.trim().toLowerCase();
-    return shipments.filter((shipment) => {
+    const filtered = shipments.filter((shipment) => {
       if (activeBoardFilter === "attention" && !shipmentNeedsAttention(shipment)) {
         return false;
       }
       if (activeBoardFilter === "today") {
-        if (!shipment.ready_at_local) return shipmentNeedsAttention(shipment);
-        if (shipment.ready_at_local.slice(0, 10) !== today) {
+        if (localDateKey(shipment.created_at) !== today && localDateKey(shipment.updated_at) !== today) {
           return false;
         }
       }
@@ -1364,6 +1487,10 @@ export function FreightDashboardWorkspace() {
         .toLowerCase();
       return searchHaystack.includes(query);
     });
+    if (activeBoardFilter !== "today") {
+      return filtered;
+    }
+    return [...filtered].sort((first, second) => shipmentActivityTimestamp(second) - shipmentActivityTimestamp(first));
   }, [shipments, activeBoardFilter, shipmentSearch]);
   const groupedShipmentsByStatus = useMemo(() => {
     const groups: Record<string, ShipmentRecord[]> = {
@@ -1590,12 +1717,13 @@ export function FreightDashboardWorkspace() {
     setOverview(overviewData);
   }
 
-  async function refreshFinancialSummary(month = selectedBoardMonth, options?: { silent?: boolean }) {
+  async function refreshFinancialSummary(month: string | null = activeBoardFilter === "today" ? null : selectedBoardMonth, options?: { silent?: boolean }) {
     if (!options?.silent) {
       setFinancialSummaryLoading(true);
     }
     try {
-      const financialData = await fetchJson<FinancialSummaryResponse>(`/api/freight/financial-summary?month=${encodeURIComponent(month)}`);
+      const query = month ? `?month=${encodeURIComponent(month)}` : "";
+      const financialData = await fetchJson<FinancialSummaryResponse>(`/api/freight/financial-summary${query}`);
       setFinancialSummary(financialData);
     } finally {
       if (!options?.silent) {
@@ -1615,8 +1743,25 @@ export function FreightDashboardWorkspace() {
     setSelectedStatusTaskId((current) => current && statusQueueData.some((item) => item.task_id === current) ? current : statusQueueData[0]?.task_id || null);
   }
 
-  async function refreshShipmentList(month = selectedBoardMonth) {
-    const shipmentData = await fetchJson<ShipmentRecord[]>(`/api/freight/shipments?month=${encodeURIComponent(month)}`);
+  async function refreshEmailTriageQueue() {
+    const triageData = await fetchJson<EmailTriageItem[]>("/api/freight/email-triage");
+    setEmailTriageQueue(triageData);
+    setSelectedTriageItemId((current) => current && triageData.some((item) => item.id === current) ? current : triageData[0]?.id || null);
+  }
+
+  async function refreshPartyDenylist(email: string) {
+    const normalized = email.trim().toLowerCase();
+    if (!normalized) {
+      setPartyDenylistEntries([]);
+      return;
+    }
+    const entries = await fetchJson<FraudDenylistEntryRecord[]>(`/api/freight/fraud-denylist?value=${encodeURIComponent(normalized)}`);
+    setPartyDenylistEntries(entries);
+  }
+
+  async function refreshShipmentList(month: string | null = activeBoardFilter === "today" ? null : selectedBoardMonth) {
+    const query = month ? `?month=${encodeURIComponent(month)}` : "";
+    const shipmentData = await fetchJson<ShipmentRecord[]>(`/api/freight/shipments${query}`);
     setShipments(shipmentData);
     setSelectedShipmentId((current) => {
       if (currentQuoteParam() && current) return current;
@@ -1667,13 +1812,16 @@ export function FreightDashboardWorkspace() {
     }
     setError(null);
     try {
-      const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData] = await Promise.all([
+      const boardMonthFilter = activeBoardFilter === "today" ? null : selectedBoardMonth;
+      const shipmentQuery = boardMonthFilter ? `?month=${encodeURIComponent(boardMonthFilter)}` : "";
+      const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData, triageData] = await Promise.all([
         fetchJson<OverviewResponse>("/api/freight/overview"),
         fetchJson<ClientRecord[]>("/api/freight/clients"),
         fetchJson<CarrierRecord[]>("/api/freight/carriers"),
-        fetchJson<ShipmentRecord[]>(`/api/freight/shipments?month=${encodeURIComponent(selectedBoardMonth)}`),
+        fetchJson<ShipmentRecord[]>(`/api/freight/shipments${shipmentQuery}`),
         fetchJson<ReviewQueueItem[]>("/api/freight/reviews"),
         fetchJson<StatusQueueItem[]>("/api/freight/status-queue?include_resolved=true"),
+        fetchJson<EmailTriageItem[]>("/api/freight/email-triage"),
       ]);
 
       startTransition(() => {
@@ -1683,16 +1831,18 @@ export function FreightDashboardWorkspace() {
         setShipments(shipmentData);
         setReviewQueue(reviewData);
         setStatusQueue(statusQueueData);
+        setEmailTriageQueue(triageData);
         setSelectedShipmentId((current) => {
           if (currentQuoteParam() && current) return current;
           return current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null;
         });
         setSelectedStatusTaskId((current) => current && statusQueueData.some((item) => item.task_id === current) ? current : statusQueueData[0]?.task_id || null);
+        setSelectedTriageItemId((current) => current && triageData.some((item) => item.id === current) ? current : triageData[0]?.id || null);
         if (!bidForm.carrier_id && carrierData[0]) {
           setBidForm((current) => ({ ...current, carrier_id: carrierData[0].id }));
         }
       });
-      void refreshFinancialSummary(selectedBoardMonth).catch(() => undefined);
+      void refreshFinancialSummary(boardMonthFilter).catch(() => undefined);
       void loadWebhookStatus({ silent: true, allowCache: true }).catch(() => undefined);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Failed to load dashboard.");
@@ -1801,6 +1951,42 @@ export function FreightDashboardWorkspace() {
     return true;
   }
 
+  function openClientDrawer(client: ClientRecord) {
+    setClientEditor({
+      name: client.name,
+      email: client.email,
+      is_active: client.is_active,
+      default_margin_percent: String(client.default_margin_percent),
+      default_margin_floor: String(client.default_margin_floor),
+    });
+    setPartyDenylistReason("");
+    setPartyDenylistExpanded(false);
+    setPartyDrawer({ kind: "client", id: client.id });
+    void refreshPartyDenylist(client.email).catch(() => undefined);
+  }
+
+  function openCarrierDrawer(carrier: CarrierRecord) {
+    setCarrierEditor({
+      name: carrier.name,
+      email: carrier.email,
+      is_active: carrier.is_active,
+      rating: String(carrier.rating),
+      regions: carrier.regions.join(", "),
+      equipment: carrier.equipment.join(", "),
+    });
+    setPartyDenylistReason("");
+    setPartyDenylistExpanded(false);
+    setPartyDrawer({ kind: "carrier", id: carrier.id });
+    void refreshPartyDenylist(carrier.email).catch(() => undefined);
+  }
+
+  function closePartyDrawer() {
+    setPartyDrawer(null);
+    setPartyDenylistEntries([]);
+    setPartyDenylistReason("");
+    setPartyDenylistExpanded(false);
+  }
+
   function openNotification(item: NotificationItem) {
     markNotificationRead(item.id);
     if (!item.shipment_id) {
@@ -1852,14 +2038,15 @@ export function FreightDashboardWorkspace() {
     }
     overviewRefreshTimerRef.current = setTimeout(() => {
       setBackgroundRefreshing(true);
-      void Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue(), refreshShipmentList()])
+      const boardMonthFilter = activeBoardFilter === "today" ? null : selectedBoardMonth;
+      void Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue(), refreshShipmentList(boardMonthFilter)])
         .catch((loadError) => {
           setError(loadError instanceof Error ? loadError.message : "Failed to refresh dashboard.");
         })
         .finally(() => {
           setBackgroundRefreshing(false);
         });
-      void refreshFinancialSummary(undefined, { silent: true }).catch(() => undefined);
+      void refreshFinancialSummary(boardMonthFilter, { silent: true }).catch(() => undefined);
     }, 180);
   }
 
@@ -1914,11 +2101,12 @@ export function FreightDashboardWorkspace() {
     if (initialLoading || tab !== "shipments") {
       return;
     }
-    void refreshShipmentList(selectedBoardMonth).catch((loadError) => {
+    const boardMonthFilter = activeBoardFilter === "today" ? null : selectedBoardMonth;
+    void refreshShipmentList(boardMonthFilter).catch((loadError) => {
       setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipments for selected month.");
     });
-    void refreshFinancialSummary(selectedBoardMonth).catch(() => undefined);
-  }, [selectedBoardMonth]);
+    void refreshFinancialSummary(boardMonthFilter).catch(() => undefined);
+  }, [activeBoardFilter, selectedBoardMonth, initialLoading, tab]);
 
   useEffect(() => {
     if (initialLoading || tab !== "archive") {
@@ -2269,6 +2457,40 @@ export function FreightDashboardWorkspace() {
     }
   }
 
+  async function handleEmailTriageAction(action: EmailTriageAction, itemId = selectedTriageItem?.id) {
+    if (!itemId) return;
+    setSubmitting(`triage-${action}`);
+    setError(null);
+    try {
+      const response = await fetchJson<EmailTriageItem>(`/api/freight/email-triage/${itemId}/action`, {
+        method: "POST",
+        body: JSON.stringify({
+          action,
+          shipment_id: action === "link_to_existing_shipment" ? triageLinkShipmentId || null : null,
+          reason: `operator_${action}`,
+        }),
+      });
+      const createdShipmentId = response.created_shipment_id || response.shipment_id;
+      setNotice(`Email triage resolved as ${triageClassificationLabel(response.resolved_action || action)}.`);
+      await Promise.all([
+        refreshEmailTriageQueue(),
+        refreshOverview(),
+        refreshShipmentList(),
+        refreshReviewQueue(),
+      ]);
+      if (createdShipmentId) {
+        setSelectedShipmentId(createdShipmentId);
+        setTab("shipments");
+        await refreshSelectedShipmentContext(createdShipmentId);
+      }
+      setTriageLinkShipmentId("");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to resolve triage item.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
   async function persistShipmentEdits() {
     if (!selectedShipment) return false;
     setSubmitting("save_shipment");
@@ -2343,27 +2565,27 @@ export function FreightDashboardWorkspace() {
     }
   }
 
-  async function runStatefulPrimaryAction() {
-    if (!selectedShipment || !actionModel?.operatorAction) return;
-    if (actionModel.requiresSave || shipmentFormDirty) {
+  async function runStatefulPrimaryAction(shipmentId = selectedShipment?.id, model = actionModel) {
+    if (!shipmentId || !selectedShipment || !model?.operatorAction) return;
+    if (model.requiresSave || shipmentFormDirty) {
       const saved = await persistShipmentEdits();
       if (!saved) return;
     }
-    await handleOperatorAction(actionModel.operatorAction, selectedShipment.id);
+    await handleOperatorAction(model.operatorAction, shipmentId);
   }
 
-  async function handleContextAction(action: ShipmentContextAction) {
+  async function handleContextAction(action: ShipmentContextAction, shipmentId = selectedShipment?.id) {
     setContextMenu(null);
     if (action.key === "edit") {
       enterEditMode();
       return;
     }
-    if (!selectedShipment || !action.operatorAction) return;
+    if (!shipmentId || !selectedShipment || !action.operatorAction) return;
     if (action.requiresSave || shipmentFormDirty) {
       const saved = await persistShipmentEdits();
       if (!saved) return;
     }
-    await handleOperatorAction(action.operatorAction, selectedShipment.id);
+    await handleOperatorAction(action.operatorAction, shipmentId);
   }
 
   async function handleCreateShipment(event: FormEvent<HTMLFormElement>) {
@@ -2417,6 +2639,7 @@ export function FreightDashboardWorkspace() {
       setClients((current) => [createdClient, ...current]);
       setNotice("Client added.");
       setClientForm({ name: "", email: "", default_margin_percent: "15", default_margin_floor: "0" });
+      openClientDrawer(createdClient);
       await refreshOverview();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to create client.");
@@ -2444,9 +2667,107 @@ export function FreightDashboardWorkspace() {
       setCarriers((current) => [createdCarrier, ...current]);
       setNotice("Carrier added.");
       setCarrierForm({ name: "", email: "", rating: "0", regions: "midwest,northeast", equipment: "dry van" });
+      openCarrierDrawer(createdCarrier);
       await refreshOverview();
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Failed to create carrier.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleSaveClientDetails() {
+    if (!selectedPartyClient) return;
+    setSubmitting("save_client");
+    setError(null);
+    try {
+      const updatedClient = await fetchJson<ClientRecord>(`/api/freight/clients/${selectedPartyClient.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: clientEditor.name,
+          email: clientEditor.email,
+          is_active: clientEditor.is_active,
+          default_margin_percent: Number(clientEditor.default_margin_percent || 0),
+          default_margin_floor: Number(clientEditor.default_margin_floor || 0),
+        }),
+      });
+      setClients((current) => current.map((client) => (client.id === updatedClient.id ? updatedClient : client)));
+      setNotice("Customer details saved.");
+      await refreshPartyDenylist(updatedClient.email);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to save customer.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleSaveCarrierDetails() {
+    if (!selectedPartyCarrier) return;
+    setSubmitting("save_carrier");
+    setError(null);
+    try {
+      const updatedCarrier = await fetchJson<CarrierRecord>(`/api/freight/carriers/${selectedPartyCarrier.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: carrierEditor.name,
+          email: carrierEditor.email,
+          rating: Number(carrierEditor.rating || 0),
+          is_active: carrierEditor.is_active,
+          regions: carrierEditor.regions.split(",").map((item) => item.trim()).filter(Boolean),
+          equipment: carrierEditor.equipment.split(",").map((item) => item.trim()).filter(Boolean),
+          metadata: selectedPartyCarrier.metadata || {},
+        }),
+      });
+      setCarriers((current) => current.map((carrier) => (carrier.id === updatedCarrier.id ? updatedCarrier : carrier)));
+      setNotice("Carrier details saved.");
+      await refreshPartyDenylist(updatedCarrier.email);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to save carrier.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleCreatePartyDenylistEntry(scope: FraudBlockScope) {
+    const value = scope === "sender_domain" ? selectedPartyDomain : selectedPartyEmail.trim().toLowerCase();
+    if (!value) return;
+    setSubmitting("party_denylist");
+    setError(null);
+    try {
+      await fetchJson<FraudDenylistEntryRecord>("/api/freight/fraud-denylist", {
+        method: "POST",
+        body: JSON.stringify({
+          scope,
+          value,
+          reason: partyDenylistReason.trim() || `${partyDrawer?.kind === "carrier" ? "Carrier" : "Customer"} blocked by operator`,
+          is_active: true,
+        }),
+      });
+      setPartyDenylistReason("");
+      await refreshPartyDenylist(selectedPartyEmail);
+      setNotice("Fraud denylist updated.");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to update fraud denylist.");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleTogglePartyDenylistEntry(entry: FraudDenylistEntryRecord) {
+    setSubmitting("party_denylist");
+    setError(null);
+    try {
+      await fetchJson<FraudDenylistEntryRecord>(`/api/freight/fraud-denylist/${entry.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          reason: entry.reason,
+          is_active: !entry.is_active,
+        }),
+      });
+      await refreshPartyDenylist(selectedPartyEmail);
+      setNotice(entry.is_active ? "Fraud denylist entry disabled." : "Fraud denylist entry enabled.");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Failed to update fraud denylist entry.");
     } finally {
       setSubmitting(null);
     }
@@ -2769,7 +3090,8 @@ export function FreightDashboardWorkspace() {
     actionModel?.contextActions.filter(
       (action) => action.operatorAction !== actionModel.operatorAction && action.key !== "archive_shipment",
     ) || [];
-  const quickActions = actionModel?.contextActions.filter((action) => action.operatorAction !== actionModel.operatorAction) || [];
+  const contextMenuQuickActions =
+    contextMenuActionModel?.contextActions.filter((action) => action.operatorAction !== contextMenuActionModel.operatorAction) || [];
   const boardColumns = [
     { key: "parsing", label: "Parsing", accent: "from-teal-300/18 to-teal-500/0" },
     { key: "waiting_bids", label: "Waiting Bids", accent: "from-orange-300/18 to-orange-500/0" },
@@ -3043,7 +3365,7 @@ export function FreightDashboardWorkspace() {
             <div className="space-y-3">
               <div className="flex flex-wrap items-center gap-2">
                 <ShipmentStatusPill status={selectedShipment.status} />
-                {shipmentNeedsAttention(selectedShipment) && (
+                {shipmentBlockingBadge(selectedShipment) && (
                   <span className="rounded-full border border-amber-300/20 bg-amber-300/10 px-3 py-1 text-xs text-amber-100">
                     {shipmentBlockingBadge(selectedShipment)}
                   </span>
@@ -3064,7 +3386,11 @@ export function FreightDashboardWorkspace() {
                 {editableMetricCard("Equipment", selectedShipment.equipment_type || "--", () => enterEditMode("equipment_type"))}
                 {editableMetricCard(
                   "Ready",
-                  formatShipmentSchedule(selectedShipment.ready_at_display, selectedShipment.ready_at_local),
+                  formatShipmentSchedule(
+                    selectedShipment.ready_at_display,
+                    selectedShipment.ready_at_local,
+                    selectedShipment.ready_at,
+                  ),
                   () => enterEditMode("ready_at"),
                   {
                     label: "Auto-fill from thread",
@@ -3075,7 +3401,15 @@ export function FreightDashboardWorkspace() {
                   },
                 )}
                 {shipmentShowsDeliveryTime(selectedShipment) &&
-                  editableMetricCard("Delivery", formatShipmentSchedule(selectedShipment.delivery_at_display, selectedShipment.delivery_at_local), () => enterEditMode("delivery_at"))}
+                  editableMetricCard(
+                    "Delivery",
+                    formatShipmentSchedule(
+                      selectedShipment.delivery_at_display,
+                      selectedShipment.delivery_at_local,
+                      selectedShipment.delivery_at,
+                    ),
+                    () => enterEditMode("delivery_at"),
+                  )}
               </div>
             </div>
             <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
@@ -3927,9 +4261,12 @@ export function FreightDashboardWorkspace() {
         {notice && <div className="glass-panel-strong border-cyan-400/20 px-5 py-4 text-sm text-cyan-100">{notice}</div>}
 
         <section className="glass-panel p-4">
-          <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+          <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
             {[
+              { key: "triage", label: "Email triage", icon: Mail },
               { key: "shipments", label: "Shipments", icon: Package2 },
+              // Status Ops is hidden until the workflow purpose is clearer.
+              // { key: "status_ops", label: "Status ops", icon: RadioTower },
               { key: "clients", label: "Customers", icon: Users },
               { key: "carriers", label: "Carriers", icon: Truck },
               { key: "archive", label: "Archive", icon: Archive },
@@ -4152,11 +4489,13 @@ export function FreightDashboardWorkspace() {
                         {items.map((shipment) => {
                           const isSelected = shipment.id === selectedShipmentId;
                           const fraudIndicators = shipmentFraudIndicators(shipment);
+                          const blockingBadge = shipmentBlockingBadge(shipment);
                           return (
                             <div
                               key={shipment.id}
                               onContextMenu={(event: ReactMouseEvent<HTMLDivElement>) => {
                                 event.preventDefault();
+                                event.stopPropagation();
                                 if (!selectShipment(shipment.id)) return;
                                 setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
                               }}
@@ -4166,16 +4505,6 @@ export function FreightDashboardWorkspace() {
                                   : "border-white/10 bg-white/[0.05] hover:-translate-y-0.5 hover:border-white/20 hover:bg-white/[0.08]"
                               }`}
                             >
-                              <button
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  if (!selectShipment(shipment.id)) return;
-                                  setContextMenu({ shipmentId: shipment.id, x: event.clientX, y: event.clientY });
-                                }}
-                                className="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-full text-[var(--text-muted)] opacity-100 transition hover:bg-white/10 hover:text-white xl:opacity-0 xl:group-hover:opacity-100"
-                              >
-                                <MoreHorizontal size={14} />
-                              </button>
                               <div className="flex items-start">
                                 <button
                                   onClick={() => {
@@ -4183,38 +4512,45 @@ export function FreightDashboardWorkspace() {
                                   }}
                                   className="w-full text-left"
                                 >
-                                  <div className="flex items-center justify-between gap-2 pr-7">
-                                    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                                      <ShipmentStatusPill status={shipment.status} />
-                                      <span className={`inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-full px-2 text-[9px] font-medium uppercase tracking-[0.1em] ${
-                                        shipmentNeedsAttention(shipment) ? "bg-amber-300/10 text-amber-100" : "bg-emerald-300/10 text-emerald-100"
-                                      }`}>
-                                        {shipmentBlockingBadge(shipment)}
+                                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                                    {fraudIndicators.length > 0 && (
+                                      <div className="flex items-center gap-1">
+                                        {fraudIndicators.map((indicator) => {
+                                          const Icon = indicator.icon;
+                                          return (
+                                            <span
+                                              key={indicator.key}
+                                              title={indicator.title}
+                                              className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${indicator.className}`}
+                                            >
+                                              <Icon size={11} />
+                                            </span>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
+                                    <ShipmentStatusPill status={shipment.status} />
+                                    {blockingBadge && (
+                                      <span className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-full bg-amber-300/10 px-2 text-[9px] font-medium uppercase tracking-[0.1em] text-amber-100">
+                                        {blockingBadge}
                                       </span>
-                                      {fraudIndicators.length > 0 && (
-                                        <div className="flex items-center gap-1">
-                                          {fraudIndicators.map((indicator) => {
-                                            const Icon = indicator.icon;
-                                            return (
-                                              <span
-                                                key={indicator.key}
-                                                title={indicator.title}
-                                                className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${indicator.className}`}
-                                              >
-                                                <Icon size={11} />
-                                              </span>
-                                            );
-                                          })}
-                                        </div>
-                                      )}
-                                    </div>
-                                    <span className="shrink-0 rounded-full bg-cyan-300/10 px-2 py-0.5 text-[10px] text-cyan-100">
+                                    )}
+                                    <span
+                                      title="AI confidence"
+                                      className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-full border border-cyan-200/14 bg-cyan-300/10 px-2 text-[9px] font-medium uppercase tracking-[0.1em] text-cyan-100"
+                                    >
                                       {formatConfidence(shipment.ai_confidence)}
                                     </span>
                                   </div>
                                   <p className="mt-1.5 line-clamp-2 text-[13px] font-medium leading-4.5 text-white">{formatRoute(shipment)}</p>
                                   <div className="mt-1.5 grid grid-cols-[minmax(0,1.25fr)_minmax(0,0.95fr)] gap-x-2 gap-y-1 text-[10px] leading-4 text-[var(--text-muted)]">
-                                    <p className="min-w-0 whitespace-normal">{formatShipmentSchedule(shipment.ready_at_display, shipment.ready_at_local || null) || "TBD"}</p>
+                                    <p className="min-w-0 whitespace-normal">
+                                      {formatShipmentSchedule(
+                                        shipment.ready_at_display,
+                                        shipment.ready_at_local || null,
+                                        shipment.ready_at,
+                                      ) || "TBD"}
+                                    </p>
                                     <p className="min-w-0 text-right whitespace-normal">Weight: {shipment.weight_lb ?? "--"} lb</p>
                                     <p className="min-w-0 whitespace-normal">Token: {shipment.quote_token || "--"}</p>
                                     <p className="min-w-0 text-right whitespace-normal">Pallets: {shipment.pallets ?? "--"}</p>
@@ -4236,12 +4572,12 @@ export function FreightDashboardWorkspace() {
                 <div className="flex min-h-[72vh] w-[310px] flex-col rounded-[28px] border border-white/10 bg-slate-950/25">
                   <div className="sticky top-0 z-10 rounded-t-[28px] border-b border-white/10 bg-gradient-to-b from-cyan-300/12 to-slate-900/0 px-4 py-4 backdrop-blur">
                     <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-medium text-white">Financial Snapshot</p>
-                        <p className="mt-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">visible board value</p>
-                      </div>
-                      <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-cyan-300/10 text-cyan-100">
-                        {financialSummaryLoading ? <Loader2 className="animate-spin" size={16} /> : <CircleDollarSign size={17} />}
+                      <p className="text-sm font-medium text-white">Financial Snapshot</p>
+                      <span
+                        title="Visible board value"
+                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-cyan-300/10 text-cyan-100"
+                      >
+                        {financialSummaryLoading ? <Loader2 className="animate-spin" size={14} /> : <CircleDollarSign size={15} />}
                       </span>
                     </div>
                   </div>
@@ -4346,6 +4682,126 @@ export function FreightDashboardWorkspace() {
           </section>
         )}
 
+        {!initialLoading && tab === "triage" && (
+          <section className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
+            <div className="glass-panel p-4">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Email triage</p>
+                  <p className="mt-1 text-lg font-medium text-white">Emails that did not become shipments</p>
+                  <p className="mt-1 text-sm text-slate-300">Fraud, noise, and uncertain freight stay here until an operator resolves them.</p>
+                </div>
+                <button
+                  onClick={() => void refreshEmailTriageQueue()}
+                  disabled={submitting !== null}
+                  className="inline-flex items-center gap-2 rounded-[14px] border border-cyan-200/12 bg-cyan-200/8 px-3 py-2 text-xs font-medium text-cyan-50 transition hover:bg-cyan-200/14 disabled:opacity-50"
+                >
+                  <RefreshCcw size={14} /> Refresh
+                </button>
+              </div>
+              <div className="space-y-2">
+                {emailTriageQueue.length === 0 ? (
+                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                    No active triage emails right now.
+                  </div>
+                ) : null}
+                {emailTriageQueue.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => setSelectedTriageItemId(item.id)}
+                    className={`w-full rounded-2xl border p-4 text-left transition ${item.id === selectedTriageItem?.id ? "border-cyan-300/40 bg-cyan-300/10" : "border-white/10 bg-white/5 hover:bg-white/10"}`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium text-white">{item.subject || "No subject"}</p>
+                        <p className="mt-1 truncate text-xs text-[var(--text-muted)]">{item.sender || "Unknown sender"}</p>
+                      </div>
+                      <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] ${triageClassificationClasses(item.classification)}`}>
+                        {formatConfidence(item.confidence)}
+                      </span>
+                    </div>
+                    <p className="mt-2 line-clamp-2 text-sm text-slate-300">{item.reason || item.body_preview || "No triage reason."}</p>
+                    <p className="mt-2 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                      {triageClassificationLabel(item.classification)}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="glass-panel p-5">
+              {!selectedTriageItem ? (
+                <div className="text-sm text-[var(--text-muted)]">Choose a triage email to review it.</div>
+              ) : (
+                <div className="space-y-5">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Selected email</p>
+                      <h2 className="mt-1 text-2xl font-semibold text-white">{selectedTriageItem.subject || "No subject"}</h2>
+                      <p className="mt-2 text-sm text-slate-300">{selectedTriageItem.sender || "Unknown sender"} · {formatAge(selectedTriageItem.received_at || selectedTriageItem.created_at)}</p>
+                    </div>
+                    <span className={`rounded-full border px-3 py-1.5 text-xs capitalize ${triageClassificationClasses(selectedTriageItem.classification)}`}>
+                      {triageClassificationLabel(selectedTriageItem.classification)}
+                    </span>
+                  </div>
+
+                  <div className="rounded-[22px] border border-white/10 bg-white/[0.04] p-4">
+                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Why it stopped</p>
+                    <p className="mt-2 text-sm leading-6 text-slate-200">{selectedTriageItem.reason || "Classifier did not find enough safe shipment signal."}</p>
+                    <div className="mt-3 grid gap-2 md:grid-cols-2">
+                      <div className="rounded-[14px] bg-slate-950/28 p-3">
+                        <p className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Recommended</p>
+                        <p className="mt-1 text-sm text-white">{triageClassificationLabel(selectedTriageItem.recommended_action)}</p>
+                      </div>
+                      <div className="rounded-[14px] bg-slate-950/28 p-3">
+                        <p className="text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Confidence</p>
+                        <p className="mt-1 text-sm text-white">{formatConfidence(selectedTriageItem.confidence)}</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-[22px] border border-white/10 bg-slate-950/22 p-4">
+                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Email preview</p>
+                    <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-300">{selectedTriageItem.body_preview || "No preview available."}</p>
+                  </div>
+
+                  <div className="rounded-[22px] border border-cyan-200/12 bg-cyan-200/[0.04] p-4">
+                    <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/70">Operator actions</p>
+                    <div className="mt-3 grid gap-2 md:grid-cols-2">
+                      <button onClick={() => void handleEmailTriageAction("create_shipment")} disabled={submitting !== null} className="action-button bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">
+                        Create shipment
+                      </button>
+                      <button onClick={() => void handleEmailTriageAction("mark_not_shipment")} disabled={submitting !== null} className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">
+                        Not a shipment
+                      </button>
+                      <button onClick={() => void handleEmailTriageAction("mark_fraud_email")} disabled={submitting !== null} className="action-button bg-rose-300/15 text-rose-100 hover:bg-rose-300/20 disabled:opacity-50">
+                        Block email
+                      </button>
+                      <button onClick={() => void handleEmailTriageAction("mark_fraud_domain")} disabled={submitting !== null} className="action-button bg-rose-300/10 text-rose-100 hover:bg-rose-300/18 disabled:opacity-50">
+                        Block domain
+                      </button>
+                    </div>
+                    <div className="mt-3 flex flex-col gap-2 md:flex-row">
+                      <select className="field-input" value={triageLinkShipmentId} onChange={(event) => setTriageLinkShipmentId(event.target.value)}>
+                        <option value="">Link to existing shipment...</option>
+                        {shipments.slice(0, 80).map((shipment) => (
+                          <option key={shipment.id} value={shipment.id}>
+                            {shipment.quote_token || shipment.id.slice(0, 8)} · {formatRoute(shipment)}
+                          </option>
+                        ))}
+                      </select>
+                      <button onClick={() => void handleEmailTriageAction("link_to_existing_shipment")} disabled={submitting !== null || !triageLinkShipmentId} className="action-button shrink-0 bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">
+                        Link
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
         {!initialLoading && tab === "status_ops" && (
           <section className="grid gap-4 xl:grid-cols-[380px,minmax(0,1fr)]">
             <div className="glass-panel p-4">
@@ -4446,7 +4902,7 @@ export function FreightDashboardWorkspace() {
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <p className="text-[10px] uppercase tracking-[0.18em] text-cyan-200/52">{notificationBadgeLabel(item.kind)}</p>
-                        <p className="mt-1 text-sm font-medium text-white">{item.title}</p>
+                        <p className="mt-1 min-w-0 break-words text-sm font-medium text-white [overflow-wrap:anywhere]">{item.title}</p>
                       </div>
                       <button
                         onClick={() => hideNotificationToast(item.id)}
@@ -4456,7 +4912,7 @@ export function FreightDashboardWorkspace() {
                         <X size={14} />
                       </button>
                     </div>
-                    <p className="mt-2 text-sm leading-6 text-slate-300">{item.detail}</p>
+                    <p className="mt-2 min-w-0 break-words text-sm leading-6 text-slate-300 [overflow-wrap:anywhere]">{item.detail}</p>
                     <div className="mt-3 flex items-center justify-between gap-3">
                       <span className="text-[11px] text-slate-400">{formatAge(item.created_at)}</span>
                       <button
@@ -4480,7 +4936,7 @@ export function FreightDashboardWorkspace() {
           onClick={() => setNotificationCenterOpen(false)}
         />
         <aside
-          className={`fixed right-6 top-6 z-[89] flex h-[min(82vh,760px)] w-[min(390px,calc(100vw-2rem))] flex-col overflow-hidden rounded-[28px] border border-cyan-200/14 bg-[linear-gradient(180deg,rgba(12,20,31,0.97),rgba(9,15,25,0.96))] shadow-[0_28px_120px_rgba(2,8,23,0.56)] backdrop-blur transition-all duration-300 ${
+          className={`fixed right-6 top-6 z-[89] flex h-[min(82vh,760px)] w-[min(390px,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-[28px] border border-cyan-200/14 bg-[linear-gradient(180deg,rgba(12,20,31,0.97),rgba(9,15,25,0.96))] shadow-[0_28px_120px_rgba(2,8,23,0.56)] backdrop-blur transition-all duration-300 ${
             notificationCenterOpen ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-4 opacity-0"
           }`}
         >
@@ -4529,7 +4985,7 @@ export function FreightDashboardWorkspace() {
                   <button
                     key={item.id}
                     onClick={() => openNotification(item)}
-                    className={`w-full rounded-[22px] border px-4 py-4 text-left transition ${
+                    className={`min-w-0 w-full rounded-[22px] border px-4 py-4 text-left transition ${
                       item.unread
                         ? "border-cyan-200/16 bg-cyan-200/[0.06] hover:bg-cyan-200/[0.09]"
                         : "border-white/10 bg-white/[0.035] hover:bg-white/[0.055]"
@@ -4546,11 +5002,11 @@ export function FreightDashboardWorkspace() {
                               <span className="text-[10px] uppercase tracking-[0.18em] text-cyan-200/52">{notificationBadgeLabel(item.kind)}</span>
                               {item.unread && <span className="inline-flex h-2 w-2 rounded-full bg-cyan-200" />}
                             </div>
-                            <p className="mt-1 text-sm font-medium text-white">{item.title}</p>
+                            <p className="mt-1 min-w-0 break-words text-sm font-medium text-white [overflow-wrap:anywhere]">{item.title}</p>
                           </div>
                           <span className="shrink-0 text-[11px] text-slate-400">{formatAge(item.created_at)}</span>
                         </div>
-                        <p className="mt-2 text-sm leading-6 text-slate-300">{item.detail}</p>
+                        <p className="mt-2 min-w-0 break-words text-sm leading-6 text-slate-300 [overflow-wrap:anywhere]">{item.detail}</p>
                         {(item.quote_token || item.shipment_id) && (
                           <div className="mt-3 flex flex-wrap gap-2">
                             {item.quote_token && (
@@ -4874,15 +5330,23 @@ export function FreightDashboardWorkspace() {
             </form>
             <div className="glass-panel p-5 space-y-3">
               {clients.map((client) => (
-                <div key={client.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                <button
+                  key={client.id}
+                  type="button"
+                  onClick={() => openClientDrawer(client)}
+                  className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-cyan-200/20 hover:bg-white/8"
+                >
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-white">{client.name}</p>
                       <p className="text-sm text-[var(--text-muted)]">{client.email}</p>
                     </div>
-                    <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">{client.default_margin_percent}%</span>
+                    <div className="flex flex-wrap justify-end gap-2">
+                      {!client.is_active && <span className="rounded-full bg-amber-300/12 px-3 py-1 text-xs text-amber-100">Inactive</span>}
+                      <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">{client.default_margin_percent}%</span>
+                    </div>
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </section>
@@ -4901,44 +5365,200 @@ export function FreightDashboardWorkspace() {
             </form>
             <div className="glass-panel p-5 space-y-3">
               {carriers.map((carrier) => (
-                <div key={carrier.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                <button
+                  key={carrier.id}
+                  type="button"
+                  onClick={() => openCarrierDrawer(carrier)}
+                  className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-cyan-200/20 hover:bg-white/8"
+                >
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-white">{carrier.name}</p>
                       <p className="text-sm text-[var(--text-muted)]">{carrier.email}</p>
                     </div>
-                    <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">Rating {carrier.rating}</span>
+                    <div className="flex flex-wrap justify-end gap-2">
+                      {!carrier.is_active && <span className="rounded-full bg-amber-300/12 px-3 py-1 text-xs text-amber-100">Inactive</span>}
+                      <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">Rating {carrier.rating}</span>
+                    </div>
                   </div>
-                </div>
+                </button>
               ))}
             </div>
           </section>
         )}
 
-        {contextMenu && selectedShipment && actionModel && (
+        {partyDrawer && (selectedPartyClient || selectedPartyCarrier) && (
+          <>
+            <div
+              className="fixed inset-0 z-40 !mt-0 bg-slate-950/45 backdrop-blur-sm"
+              onClick={closePartyDrawer}
+            />
+            <aside className="fixed inset-y-0 top-0 right-0 z-[70] !mt-0 h-[100dvh] w-full max-w-[620px] overflow-y-auto border-l border-white/10 bg-[linear-gradient(180deg,rgba(13,21,32,0.98),rgba(9,16,26,0.97))] p-5 shadow-[0_24px_90px_rgba(0,0,0,0.5)]">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">
+                    {partyDrawer.kind === "client" ? "Customer details" : "Carrier details"}
+                  </p>
+                  <h2 className="mt-1 text-2xl font-semibold text-white">
+                    {selectedPartyClient?.name || selectedPartyCarrier?.name}
+                  </h2>
+                  <p className="mt-1 text-sm text-slate-400">{selectedPartyEmail}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closePartyDrawer}
+                  className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-300 transition hover:bg-white/10 hover:text-white"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="mt-5 space-y-4">
+                {partyDrawer.kind === "client" && selectedPartyClient ? (
+                  <div className="rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.055),rgba(255,255,255,0.025))] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Edit customer</p>
+                    <div className="mt-4 space-y-3">
+                      <input className="field-input" value={clientEditor.name} onChange={(event) => setClientEditor((current) => ({ ...current, name: event.target.value }))} placeholder="Customer name" />
+                      <input className="field-input" value={clientEditor.email} onChange={(event) => setClientEditor((current) => ({ ...current, email: event.target.value }))} placeholder="Customer email" />
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <input className="field-input" value={clientEditor.default_margin_percent} onChange={(event) => setClientEditor((current) => ({ ...current, default_margin_percent: event.target.value }))} placeholder="Margin %" />
+                        <input className="field-input" value={clientEditor.default_margin_floor} onChange={(event) => setClientEditor((current) => ({ ...current, default_margin_floor: event.target.value }))} placeholder="Margin floor" />
+                      </div>
+                      <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/28 px-3 py-2 text-sm text-slate-200">
+                        <input type="checkbox" checked={clientEditor.is_active} onChange={(event) => setClientEditor((current) => ({ ...current, is_active: event.target.checked }))} />
+                        Active customer
+                      </label>
+                      <button type="button" onClick={() => void handleSaveClientDetails()} disabled={submitting !== null} className="action-button bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110 disabled:opacity-50">
+                        Save customer
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {partyDrawer.kind === "carrier" && selectedPartyCarrier ? (
+                  <div className="rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.055),rgba(255,255,255,0.025))] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Edit carrier</p>
+                    <div className="mt-4 space-y-3">
+                      <input className="field-input" value={carrierEditor.name} onChange={(event) => setCarrierEditor((current) => ({ ...current, name: event.target.value }))} placeholder="Carrier name" />
+                      <input className="field-input" value={carrierEditor.email} onChange={(event) => setCarrierEditor((current) => ({ ...current, email: event.target.value }))} placeholder="Carrier email" />
+                      <input className="field-input" value={carrierEditor.rating} onChange={(event) => setCarrierEditor((current) => ({ ...current, rating: event.target.value }))} placeholder="Rating" />
+                      <input className="field-input" value={carrierEditor.regions} onChange={(event) => setCarrierEditor((current) => ({ ...current, regions: event.target.value }))} placeholder="Regions, comma-separated" />
+                      <input className="field-input" value={carrierEditor.equipment} onChange={(event) => setCarrierEditor((current) => ({ ...current, equipment: event.target.value }))} placeholder="Equipment, comma-separated" />
+                      <label className="flex items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/28 px-3 py-2 text-sm text-slate-200">
+                        <input type="checkbox" checked={carrierEditor.is_active} onChange={(event) => setCarrierEditor((current) => ({ ...current, is_active: event.target.checked }))} />
+                        Active carrier
+                      </label>
+                      <button type="button" onClick={() => void handleSaveCarrierDetails()} disabled={submitting !== null} className="action-button bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110 disabled:opacity-50">
+                        Save carrier
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="overflow-hidden rounded-[28px] border border-rose-300/18 bg-[linear-gradient(180deg,rgba(244,63,94,0.08),rgba(15,23,42,0.24))] shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+                  <button
+                    type="button"
+                    onClick={() => setPartyDenylistExpanded((expanded) => !expanded)}
+                    className="flex w-full items-center justify-between gap-4 p-4 text-left transition hover:bg-rose-300/[0.04]"
+                  >
+                    <span className="min-w-0">
+                      <span className="block text-xs uppercase tracking-[0.18em] text-rose-100/70">Fraud denylist</span>
+                      <span className="mt-1 block text-sm text-slate-300">
+                        {partyDenylistEntries.filter((entry) => entry.is_active).length} active blocks for this {partyDrawer.kind === "client" ? "customer" : "carrier"}.
+                      </span>
+                    </span>
+                    <span className="inline-flex shrink-0 items-center gap-2 rounded-full border border-rose-200/14 bg-rose-300/10 px-3 py-1.5 text-xs text-rose-50">
+                      {partyDenylistExpanded ? "Hide" : "Manage"}
+                      <ChevronDown size={14} className={`transition ${partyDenylistExpanded ? "rotate-180" : ""}`} />
+                    </span>
+                  </button>
+
+                  {partyDenylistExpanded && (
+                    <div className="border-t border-rose-200/10 p-4">
+                      <p className="text-sm leading-6 text-slate-300">
+                        Manage sender email and domain blocks connected to this {partyDrawer.kind === "client" ? "customer" : "carrier"}.
+                      </p>
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        <div className="min-w-0 rounded-2xl border border-white/10 bg-slate-950/36 p-3 text-sm text-slate-200">
+                          <span className="block text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Email</span>
+                          <span className="mt-1 block break-all text-white">{selectedPartyEmail || "--"}</span>
+                        </div>
+                        <div className="min-w-0 rounded-2xl border border-white/10 bg-slate-950/36 p-3 text-sm text-slate-200">
+                          <span className="block text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Domain</span>
+                          <span className="mt-1 block break-all text-white">{selectedPartyDomain || "--"}</span>
+                        </div>
+                      </div>
+                      <textarea
+                        className="field-input mt-3 min-h-[88px]"
+                        value={partyDenylistReason}
+                        onChange={(event) => setPartyDenylistReason(event.target.value)}
+                        placeholder="Reason for denylist change..."
+                      />
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        <button type="button" onClick={() => void handleCreatePartyDenylistEntry("sender_email")} disabled={submitting !== null || !selectedPartyEmail} className="action-button bg-rose-300/16 text-rose-50 hover:bg-rose-300/24 disabled:opacity-50">
+                          Block email
+                        </button>
+                        <button type="button" onClick={() => void handleCreatePartyDenylistEntry("sender_domain")} disabled={submitting !== null || !selectedPartyDomain} className="action-button bg-rose-300/12 text-rose-50 hover:bg-rose-300/20 disabled:opacity-50">
+                          Block domain
+                        </button>
+                      </div>
+                      <div className="mt-4 space-y-2">
+                        {partyDenylistEntries.length === 0 && (
+                          <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.04] p-4 text-sm text-[var(--text-muted)]">
+                            No denylist entries for this email or domain.
+                          </div>
+                        )}
+                        {partyDenylistEntries.map((entry) => (
+                          <div key={entry.id} className="rounded-2xl border border-white/10 bg-slate-950/36 p-3">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="break-all text-sm font-medium text-white">{entry.value}</p>
+                                <p className="mt-1 text-xs uppercase tracking-[0.14em] text-[var(--text-muted)]">{entry.scope.replaceAll("_", " ")}</p>
+                              </div>
+                              <span className={`shrink-0 rounded-full px-2.5 py-1 text-xs ${entry.is_active ? "bg-rose-300/16 text-rose-100" : "bg-white/10 text-slate-300"}`}>
+                                {entry.is_active ? "Active" : "Inactive"}
+                              </span>
+                            </div>
+                            {entry.reason && <p className="mt-2 break-words text-sm text-slate-300">{entry.reason}</p>}
+                            <button type="button" onClick={() => void handleTogglePartyDenylistEntry(entry)} disabled={submitting !== null} className="mt-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-slate-200 transition hover:bg-white/10 disabled:opacity-50">
+                              {entry.is_active ? "Disable" : "Enable"}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </aside>
+          </>
+        )}
+
+        {contextMenu && contextMenuShipment && contextMenuActionModel && (
           <div
             className="fixed z-50 min-w-[240px] rounded-2xl border border-white/10 bg-slate-950/95 p-2 shadow-2xl backdrop-blur"
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.stopPropagation()}
           >
             <button onClick={() => { selectShipment(contextMenu.shipmentId, { openDrawer: true }); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
               <Package2 size={16} /> Open shipment
             </button>
-            {actionModel.label && actionModel.operatorAction && (
+            {contextMenuActionModel.label && contextMenuActionModel.operatorAction && (
               <button
-                onClick={() => void runStatefulPrimaryAction()}
+                onClick={() => void runStatefulPrimaryAction(contextMenu.shipmentId, contextMenuActionModel)}
                 className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-cyan-100 transition hover:bg-cyan-300/10"
               >
-                <CheckCircle2 size={16} /> {actionModel.label}
+                <CheckCircle2 size={16} /> {contextMenuActionModel.label}
               </button>
             )}
             <button onClick={() => { enterEditMode(); setContextMenu(null); }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-white transition hover:bg-white/10">
               <PencilLine size={16} /> Edit details
             </button>
-            {quickActions.map((action) => (
+            {contextMenuQuickActions.map((action) => (
               <button
                 key={action.key}
-                onClick={() => void handleContextAction(action)}
+                onClick={() => void handleContextAction(action, contextMenu.shipmentId)}
                 className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm transition ${
                   action.tone === "warning" ? "text-amber-100 hover:bg-amber-300/10" : "text-white hover:bg-white/10"
                 }`}

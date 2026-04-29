@@ -111,6 +111,26 @@ def test_document_health_merges_enrichment_and_counts_reviews():
     assert health["review_required"] is False
 
 
+def test_document_health_does_not_require_pricing_backup_before_booking_flow():
+    shipment = Shipment(status="quoted")
+    health = build_document_health([], shipment)
+
+    assert health["missing_document_types"] == []
+    assert health["booking_review_warning"] is None
+    assert health["booking_review_required"] is False
+    assert health["review_required"] is False
+
+
+def test_document_health_requires_pricing_backup_for_booking_flow():
+    shipment = Shipment(status="awaiting_confirmation")
+    health = build_document_health([], shipment)
+
+    assert health["missing_document_types"] == ["pricing_backup"]
+    assert health["booking_review_warning"] == "No rate confirmation or quote sheet found in the email thread."
+    assert health["booking_review_required"] is True
+    assert health["review_required"] is True
+
+
 def test_document_health_detects_conflict_against_ready_date():
     shipment = Shipment(
         status="awaiting_confirmation",

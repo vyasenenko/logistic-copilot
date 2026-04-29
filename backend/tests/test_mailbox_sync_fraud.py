@@ -3,7 +3,8 @@ from uuid import uuid4
 
 import pytest
 
-from app.memory.database import EmailMessage, FraudDenylistEntry, Shipment, WorkflowEvent
+from app.memory.database import EmailMessage, EmailTriageItem, FraudDenylistEntry, Shipment, WorkflowEvent
+from app.schemas import EmailTriageClassification
 from app.services import mailbox_sync
 from app.services.outlook import OutlookMailboxMessage
 
@@ -53,14 +54,55 @@ class FakeSession:
         self.committed = True
 
 
+def test_q_token_reply_reaches_ai_even_when_triage_intent_is_unclear():
+    should_materialize = mailbox_sync._should_materialize_shipment_for_triage(
+        classification=EmailTriageClassification.NEEDS_OPERATOR_TRIAGE,
+        quote_token="Q-12345678",
+        existing_shipment_linked=False,
+    )
+
+    assert should_materialize is True
+
+
+def test_existing_shipment_reply_reaches_ai_even_without_q_token():
+    should_materialize = mailbox_sync._should_materialize_shipment_for_triage(
+        classification=EmailTriageClassification.NEEDS_OPERATOR_TRIAGE,
+        quote_token=None,
+        existing_shipment_linked=True,
+    )
+
+    assert should_materialize is True
+
+
+def test_correlated_carrier_reply_reaches_ai_flow():
+    should_materialize = mailbox_sync._should_materialize_shipment_for_triage(
+        classification=EmailTriageClassification.CARRIER_REPLY,
+        quote_token="Q-12345678",
+        existing_shipment_linked=True,
+    )
+
+    assert should_materialize is True
+
+
+def test_fraud_triage_still_blocks_q_token_materialization():
+    should_materialize = mailbox_sync._should_materialize_shipment_for_triage(
+        classification=EmailTriageClassification.FRAUD_OR_PHISHING,
+        quote_token="Q-12345678",
+        existing_shipment_linked=True,
+    )
+
+    assert should_materialize is False
+
+
 @pytest.mark.asyncio
 async def test_ingest_outlook_message_flags_unknown_sender_and_skips_client_creation(monkeypatch):
     session = FakeSession(
         scalar_results=[
             None,  # existing EmailMessage
+            None,  # existing shipment
             None,  # carrier by exact email
             None,  # client by exact email
-            None,  # existing shipment
+            None,  # existing shipment during materialization
         ],
         execute_results=[
             [],  # fraud denylist entries
@@ -73,7 +115,7 @@ async def test_ingest_outlook_message_flags_unknown_sender_and_skips_client_crea
         conversation_id=None,
         internet_message_id="<msg-1@example.com>",
         subject="Quote request",
-        body_preview="Need a quote from Porto to Madrid",
+        body_preview="Need a quote pickup Chicago, IL delivery New York, NY dry van 5 pallets 12000 lb",
         sender_email="quotes@c0mpany.com",
         sender_name="Company Logistics",
         recipients=["ops@example.com"],
@@ -96,7 +138,9 @@ async def test_ingest_outlook_message_flags_unknown_sender_and_skips_client_crea
     email_messages = [item for item in session.added if isinstance(item, EmailMessage)]
     workflow_events = [item for item in session.added if isinstance(item, WorkflowEvent)]
     shipments = [item for item in session.added if isinstance(item, Shipment)]
+    triage_items = [item for item in session.added if isinstance(item, EmailTriageItem)]
     assert shipments and shipments[0].client_id is None
+    assert triage_items and triage_items[0].classification == "freight_quote_request"
     assert email_messages
     assert email_messages[0].raw_payload_json["fraud"]["risk_level"] == "high"
     assert workflow_events
@@ -116,9 +160,9 @@ async def test_ingest_outlook_message_archives_denylisted_sender(monkeypatch):
     session = FakeSession(
         scalar_results=[
             None,  # existing EmailMessage
+            None,  # existing shipment
             None,  # carrier by exact email
             None,  # client by exact email
-            None,  # existing shipment
         ],
         execute_results=[
             [denylist_entry],  # fraud denylist entries
@@ -147,18 +191,14 @@ async def test_ingest_outlook_message_archives_denylisted_sender(monkeypatch):
 
     assert result.created_client is False
     assert result.suppressed is True
-    assert result.suppression_reason == "fraud_denylist:sender_email:bad@fraud.test"
+    assert result.suppression_reason == "fraud_or_phishing"
     assert result.fraud_risk_level == "high"
     assert result.fraud_risk_reasons == ["denylisted_sender_email"]
     shipments = [item for item in session.added if isinstance(item, Shipment)]
-    assert shipments
-    assert shipments[0].is_archived is True
-    assert shipments[0].archive_reason_code == "fraud"
-    assert shipments[0].client_id is None
+    assert shipments == []
+    triage_items = [item for item in session.added if isinstance(item, EmailTriageItem)]
+    assert triage_items and triage_items[0].classification == "fraud_or_phishing"
+    assert result.shipment_creation_skipped is True
+    assert result.shipment_id == ""
     workflow_events = [item for item in session.added if isinstance(item, WorkflowEvent)]
-    assert workflow_events
-    email_received = next(event for event in workflow_events if event.event_type == "email_received")
-    assert email_received.payload_json["suppressed"] is True
-    assert email_received.payload_json["fraud"]["denylist_entry_id"] == str(denylist_entry.id)
-    assert any(event.event_type == "shipment_archived" for event in workflow_events)
-    assert any(event.event_type == "shipment_source_suppressed" for event in workflow_events)
+    assert workflow_events == []

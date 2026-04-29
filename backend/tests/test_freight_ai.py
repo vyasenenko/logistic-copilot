@@ -10,6 +10,7 @@ from app.services.freight_ai import (
     _extract_status_request_with_heuristics,
     _extract_bid_with_heuristics,
     _extract_shipment_with_heuristics,
+    _extract_ready_at,
     _merge_shipment_results,
 )
 from app.services.freight_inbox_agent import _sender_role_for_inbox_context
@@ -72,6 +73,45 @@ def test_merge_shipment_results_keeps_naive_ready_at_wall_time_with_origin_timez
     assert "ready_at_timezone_unresolved" not in merged.ambiguity_reasons
 
 
+def test_merge_shipment_results_converts_early_morning_midnight_to_seven_am():
+    primary = ShipmentExtractionResult(
+        origin="Houston, TX",
+        destination="Austin, TX",
+        ready_at="2026-04-26T00:00:00",
+        missing_fields=[],
+        ambiguity_reasons=[],
+        confidence=0.95,
+    )
+    fallback = ShipmentExtractionResult(confidence=0.5)
+
+    merged = _merge_shipment_results(
+        primary,
+        fallback,
+        source_text="Pickup April 26, early morning if possible.",
+    )
+
+    assert merged.ready_at is not None
+    assert merged.ready_at.hour == 12
+    assert merged.ready_at.minute == 0
+
+
+def test_merge_shipment_results_drops_date_only_midnight_without_daypart():
+    primary = ShipmentExtractionResult(
+        origin="Houston, TX",
+        destination="Austin, TX",
+        ready_at="2026-04-26T00:00:00",
+        missing_fields=[],
+        ambiguity_reasons=[],
+        confidence=0.95,
+    )
+    fallback = ShipmentExtractionResult(confidence=0.5)
+
+    merged = _merge_shipment_results(primary, fallback, source_text="Pickup April 26.")
+
+    assert merged.ready_at is None
+    assert "ready_at_date_only_no_time" in merged.ambiguity_reasons
+
+
 def test_merge_shipment_results_flags_unresolved_timezone_for_naive_ready_at():
     primary = ShipmentExtractionResult(
         origin="Unknown Origin",
@@ -126,6 +166,24 @@ def test_classify_short_ok_as_customer_quote_confirmation():
     assert result.confidence >= 0.85
 
 
+def test_classify_cyrillic_ok_with_outlook_quote_as_customer_quote_confirmation():
+    result = _classify_with_heuristics(
+        {
+            "subject": "Re: Quote Fresno, CA to Los Angeles, CA [Q-DC836F74]",
+            "body_preview": (
+                "Окей\r\n\r\n"
+                "Get Outlook for iOS\r\n"
+                "________________________________\r\n"
+                "From: Ops <ops@example.com>"
+            ),
+            "sender_role": "client",
+            "shipment_status": "awaiting_confirmation",
+        }
+    )
+    assert result.intent == "customer_quote_confirmation"
+    assert result.confidence >= 0.85
+
+
 def test_classify_short_ok_does_not_confirm_before_quote_is_sent():
     result = _classify_with_heuristics(
         {
@@ -160,6 +218,26 @@ def test_extract_shipment_marks_multiple_routes_as_ambiguous():
         }
     )
     assert "multiple_routes_detected" in result.ambiguity_reasons
+
+
+def test_same_lane_in_subject_and_body_is_not_multiple_routes():
+    """Subject + body often repeat one lane; must not downgrade LLM merge with a false flag."""
+    result = _extract_shipment_with_heuristics(
+        {
+            "subject": "Need pricing Salt Lake City to Boise",
+            "body_preview": "Need a quote for 4 pallets from Salt Lake City, UT to Boise, ID.\nPickup April 30.",
+        }
+    )
+    assert "multiple_routes_detected" not in result.ambiguity_reasons
+
+
+def test_extract_ready_at_month_day_flexible_after_clock():
+    parsed = _extract_ready_at("Pickup April 30, flexible after 8:00 AM.")
+    assert parsed is not None
+    assert parsed.month == 4
+    assert parsed.day == 30
+    assert parsed.hour == 8
+    assert parsed.minute == 0
 
 
 def test_extract_bid_marks_multiple_amounts_as_ambiguous():
@@ -290,3 +368,25 @@ async def test_structured_output_falls_back_to_json_prompt_when_response_format_
     assert result.pallets == 10
     assert result.weight_lb == 2000
     assert result.confidence == 0.91
+
+
+def test_shipment_extraction_result_accepts_null_notes_from_llm():
+    """LLMs follow 'use null for unknown' and emit notes: null; must not fail validation."""
+    model = ShipmentExtractionResult.model_validate(
+        {
+            "intent": "new_quote_request",
+            "origin": "Salt Lake City, UT",
+            "destination": "Boise, ID",
+            "pallets": 4,
+            "weight_lb": 7200,
+            "equipment_type": "Dry Van",
+            "ready_at": "2026-04-30T08:00:00",
+            "delivery_at": None,
+            "notes": None,
+            "missing_fields": ["delivery_at"],
+            "ambiguity_reasons": [],
+            "confidence": 0.95,
+        }
+    )
+    assert model.notes is None
+    assert model.ready_at is not None

@@ -163,3 +163,46 @@ def test_shipment_board_sort_key_prioritizes_attention_and_freshness():
         fresh_record.id,
         older_record.id,
     ]
+
+
+def test_serialize_shipment_uses_current_missing_fields_not_stale_ai_payload():
+    shipment = Shipment(
+        id=uuid4(),
+        status=ShipmentStage.RECEIVED.value,
+        origin="Chicago, IL",
+        destination="Atlanta, GA",
+        pallets=4,
+        weight_lb=7500,
+        equipment_type="Dry Van",
+        ready_at_local=datetime(2026, 4, 28, 9, 0),
+        created_at=datetime(2026, 4, 10, 9, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 20, 9, 0, tzinfo=timezone.utc),
+    )
+
+    record = freight._serialize_shipment(
+        shipment,
+        {
+            "missing_fields": ["origin", "destination", "ready_at"],
+            "manual_review_required": False,
+        },
+    )
+
+    assert record.ai_missing_fields == []
+    assert record.attention_state == "none"
+    assert record.has_active_review is False
+
+
+def test_serialize_shipment_reports_actual_missing_fields():
+    shipment = Shipment(
+        id=uuid4(),
+        status=ShipmentStage.RECEIVED.value,
+        origin="Chicago, IL",
+        destination="Atlanta, GA",
+        created_at=datetime(2026, 4, 10, 9, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 4, 20, 9, 0, tzinfo=timezone.utc),
+    )
+
+    record = freight._serialize_shipment(shipment, {"missing_fields": []})
+
+    assert record.ai_missing_fields == ["pallets", "weight_lb", "equipment_type", "ready_at"]
+    assert record.attention_state == "missing_details"

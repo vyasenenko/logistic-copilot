@@ -73,6 +73,23 @@ class SenderTrustScope(str, Enum):
     SENDER_DOMAIN = "sender_domain"
 
 
+class EmailTriageClassification(str, Enum):
+    FREIGHT_QUOTE_REQUEST = "freight_quote_request"
+    CARRIER_REPLY = "carrier_reply"
+    STATUS_OR_OPS = "status_or_ops"
+    FRAUD_OR_PHISHING = "fraud_or_phishing"
+    NOISE_OR_UNHANDLED = "noise_or_unhandled"
+    NEEDS_OPERATOR_TRIAGE = "needs_operator_triage"
+
+
+class EmailTriageAction(str, Enum):
+    CREATE_SHIPMENT = "create_shipment"
+    MARK_NOT_SHIPMENT = "mark_not_shipment"
+    MARK_FRAUD_EMAIL = "mark_fraud_email"
+    MARK_FRAUD_DOMAIN = "mark_fraud_domain"
+    LINK_TO_EXISTING_SHIPMENT = "link_to_existing_shipment"
+
+
 class WorkflowEventType(str, Enum):
     EMAIL_RECEIVED = "email_received"
     EMAIL_MARKED_READ = "email_marked_read"
@@ -202,6 +219,29 @@ class CarrierRecord(BaseModel):
     metadata: dict = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+
+
+class FraudDenylistEntryRecord(BaseModel):
+    id: str
+    scope: FraudDenylistScope
+    value: str
+    reason: str | None = None
+    source_shipment_id: str | None = None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class FraudDenylistEntryRequest(BaseModel):
+    scope: FraudDenylistScope
+    value: str = Field(..., min_length=1, max_length=320)
+    reason: str | None = Field(None, max_length=500)
+    is_active: bool = True
+
+
+class FraudDenylistEntryUpdateRequest(BaseModel):
+    reason: str | None = Field(None, max_length=500)
+    is_active: bool
 
 
 class ShipmentUpsertRequest(BaseModel):
@@ -659,6 +699,10 @@ class OutlookIngestResult(BaseModel):
     fraud_score: float | None = None
     sender_email: str | None = None
     sender_domain: str | None = None
+    triage_id: str | None = None
+    triage_classification: EmailTriageClassification | None = None
+    triage_reason: str | None = None
+    triage_recommended_action: str | None = None
     event_type: WorkflowEventType = WorkflowEventType.EMAIL_RECEIVED
 
 
@@ -686,10 +730,44 @@ class OutlookWebhookResponse(BaseModel):
     results: list[OutlookIngestResult] = Field(default_factory=list)
 
 
+class EmailTriageResult(BaseModel):
+    classification: EmailTriageClassification
+    confidence: float = Field(0, ge=0, le=1)
+    reason: str = ""
+    recommended_action: str = ""
+    signals: dict = Field(default_factory=dict)
+
+
+class EmailTriageRecord(BaseModel):
+    id: str
+    email_message_id: str
+    thread_id: str
+    shipment_id: str | None = None
+    classification: EmailTriageClassification
+    confidence: float = 0
+    reason: str | None = None
+    recommended_action: str | None = None
+    resolved_at: datetime | None = None
+    resolved_action: str | None = None
+    created_shipment_id: str | None = None
+    sender: str | None = None
+    subject: str | None = None
+    body_preview: str | None = None
+    received_at: datetime | None = None
+    payload: dict = Field(default_factory=dict)
+    created_at: datetime
+
+
+class EmailTriageActionRequest(BaseModel):
+    action: EmailTriageAction
+    shipment_id: str | None = None
+    reason: str | None = None
+
+
 class IntentResult(BaseModel):
     intent: str
     confidence: float = Field(0, ge=0, le=1)
-    notes: str = ""
+    notes: str | None = None
 
 
 class ShipmentExtractionResult(BaseModel):
@@ -701,7 +779,7 @@ class ShipmentExtractionResult(BaseModel):
     equipment_type: str | None = None
     ready_at: datetime | None = None
     delivery_at: datetime | None = None
-    notes: str = ""
+    notes: str | None = None
     missing_fields: list[str] = Field(default_factory=list)
     ambiguity_reasons: list[str] = Field(default_factory=list)
     confidence: float = Field(0, ge=0, le=1)
@@ -711,7 +789,7 @@ class ShipmentFieldExtractionResult(BaseModel):
     field: str
     value_local_text: str | None = None
     confidence: float = Field(0, ge=0, le=1)
-    notes: str = ""
+    notes: str | None = None
     ambiguity_reasons: list[str] = Field(default_factory=list)
 
 
@@ -720,7 +798,7 @@ class CarrierBidExtractionResult(BaseModel):
     amount: float | None = Field(None, ge=0)
     currency: str = "USD"
     eta_text: str | None = None
-    notes: str = ""
+    notes: str | None = None
     ambiguity_reasons: list[str] = Field(default_factory=list)
     confidence: float = Field(0, ge=0, le=1)
 
@@ -729,7 +807,7 @@ class StatusRequestExtractionResult(BaseModel):
     intent: str = "customer_status_request"
     request_type: str = "general_status"
     requested_fields: list[str] = Field(default_factory=list)
-    notes: str = ""
+    notes: str | None = None
     confidence: float = Field(0, ge=0, le=1)
 
 
@@ -738,7 +816,7 @@ class CarrierStatusUpdateExtractionResult(BaseModel):
     status_text: str | None = None
     eta_text: str | None = None
     location_text: str | None = None
-    notes: str = ""
+    notes: str | None = None
     ambiguity_reasons: list[str] = Field(default_factory=list)
     confidence: float = Field(0, ge=0, le=1)
 
