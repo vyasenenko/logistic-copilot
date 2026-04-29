@@ -425,11 +425,7 @@ async def run_freight_inbox_orchestrator(
                 confidence=intent_result.confidence,
                 next_action="booking_ready_for_review",
             )
-        if shipment.status == ShipmentStage.BOOKED.value or await _has_event(
-            session,
-            shipment.id,
-            WorkflowEventType.TMS_HANDOFF_SENT.value,
-        ):
+        if shipment.status == ShipmentStage.BOOKED.value or await _has_real_tms_handoff(session, shipment.id):
             return WorkflowDecisionResult(
                 email_message_id=str(email_message.id),
                 shipment_id=str(shipment.id),
@@ -478,7 +474,7 @@ async def evaluate_expired_quote_windows(
     now = datetime.now(timezone.utc)
     result = await session.execute(
         select(Shipment)
-        .where(Shipment.status == ShipmentStage.WAITING_BIDS.value)
+        .where(Shipment.status.in_([ShipmentStage.WAITING_BIDS.value, ShipmentStage.QUOTED.value]))
         .order_by(Shipment.updated_at.asc())
     )
     decisions: list[WorkflowDecisionResult] = []
@@ -495,7 +491,7 @@ async def evaluate_expired_quote_windows(
             continue
         if outreach_event.created_at + timedelta(minutes=settings.quote_wait_minutes_default) > now:
             continue
-        if await _has_event(session, shipment.id, WorkflowEventType.CLIENT_QUOTE_SENT.value):
+        if await _has_real_customer_quote_sent(session, shipment.id):
             continue
         priced_bids = await session.scalar(
             select(CarrierBid).where(
@@ -620,7 +616,7 @@ async def continue_phase1_workflow(
             CarrierBid.amount.is_not(None),
         )
     )
-    quote_sent = await _has_event(session, shipment.id, WorkflowEventType.CLIENT_QUOTE_SENT.value)
+    quote_sent = await _has_real_customer_quote_sent(session, shipment.id)
     if priced_bid is not None and not quote_sent:
         await evaluate_shipment_bids(session, shipment.id)
         evaluation_triggered = True
@@ -1259,7 +1255,7 @@ async def _handle_carrier_bid_reply(
         outreach_event is not None
         and outreach_event.created_at + timedelta(minutes=settings.quote_wait_minutes_default)
         <= datetime.now(timezone.utc)
-        and not await _has_event(session, shipment.id, WorkflowEventType.CLIENT_QUOTE_SENT.value)
+        and not await _has_real_customer_quote_sent(session, shipment.id)
     ):
         evaluation = await evaluate_shipment_bids(session, shipment.id)
         evaluation_triggered = True
@@ -1624,6 +1620,42 @@ async def _has_event(session: AsyncSession, shipment_id: UUID, event_type: str) 
         )
     )
     return event is not None
+
+
+async def _has_real_customer_quote_sent(session: AsyncSession, shipment_id: UUID) -> bool:
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment_id,
+            WorkflowEvent.event_type == WorkflowEventType.CLIENT_QUOTE_SENT.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    for event in result.scalars().all():
+        if not dict(event.payload_json or {}).get("dry_run"):
+            return True
+    return False
+
+
+async def _has_real_tms_handoff(session: AsyncSession, shipment_id: UUID) -> bool:
+    result = await session.execute(
+        select(WorkflowEvent)
+        .where(
+            WorkflowEvent.shipment_id == shipment_id,
+            WorkflowEvent.event_type == WorkflowEventType.TMS_HANDOFF_SENT.value,
+        )
+        .order_by(WorkflowEvent.created_at.desc())
+    )
+    for event in result.scalars().all():
+        payload = dict(event.payload_json or {})
+        if not payload.get("dry_run") and payload.get("status") in {
+            "submitted",
+            "already_submitted",
+            "not_configured",
+            "manual_pending",
+        }:
+            return True
+    return False
 
 
 async def _log_event(

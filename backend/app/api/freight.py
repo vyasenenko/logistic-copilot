@@ -1331,6 +1331,7 @@ def _is_phase1_ai_event(event: WorkflowEvent, payload: dict) -> bool:
         WorkflowEventType.EVALUATION_COMPLETED.value,
         WorkflowEventType.CLIENT_QUOTE_SENT.value,
         WorkflowEventType.CUSTOMER_CONFIRMED.value,
+        WorkflowEventType.CARRIER_AWARD_SENT.value,
     }:
         return True
     if event.event_type != WorkflowEventType.MANUAL_REVIEW_REQUIRED.value:
@@ -1581,9 +1582,14 @@ async def _latest_booking_payloads(
             continue
         payload = dict(event.payload_json or {})
         if event.event_type == WorkflowEventType.TMS_HANDOFF_SENT.value:
+            handoff_status = payload.get("status")
             payloads[event.shipment_id] = {
-                "booking_state": "booked" if payload.get("status") in {"submitted", "already_submitted"} else "booking_preview",
-                "tms_handoff_status": payload.get("status"),
+                "booking_state": (
+                    "booked"
+                    if handoff_status in {"submitted", "already_submitted", "not_configured", "manual_pending"}
+                    else "booking_preview"
+                ),
+                "tms_handoff_status": handoff_status,
                 "booking_error": None,
                 "attachment_count": payload.get("attachment_count", 0),
                 "document_summary": dict(payload.get("document_summary", {}) or {}),

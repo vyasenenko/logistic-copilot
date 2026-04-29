@@ -11,6 +11,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 _webhook_renewal_task: asyncio.Task | None = None
+_quote_window_task: asyncio.Task | None = None
 
 
 async def _ensure_outlook_webhook_subscription(reason: str) -> None:
@@ -63,6 +64,25 @@ async def _outlook_webhook_subscription_renewal_loop() -> None:
         await _ensure_outlook_webhook_subscription("scheduled")
 
 
+async def _quote_window_evaluation_loop() -> None:
+    """Periodically close expired bid windows and send customer quotes."""
+    from app.memory.database import async_session
+    from app.services.freight_inbox_agent import evaluate_expired_quote_windows
+
+    interval_seconds = max(1, settings.quote_window_check_interval_seconds)
+    while True:
+        try:
+            async with async_session() as session:
+                decisions = await evaluate_expired_quote_windows(session)
+            if decisions:
+                logger.info("Quote window scheduler processed %d shipment(s).", len(decisions))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Quote window scheduler failed.")
+        await asyncio.sleep(interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
@@ -78,11 +98,15 @@ async def lifespan(app: FastAPI):
     await init_vector_store()
     logger.info("Startup step 2/3 complete.")
 
-    logger.info("Startup step 3/3: scheduling Outlook webhook renewal task.")
-    global _webhook_renewal_task
+    logger.info("Startup step 3/3: scheduling Outlook webhook renewal and quote window tasks.")
+    global _webhook_renewal_task, _quote_window_task
     _webhook_renewal_task = asyncio.create_task(
         _outlook_webhook_subscription_renewal_loop(),
         name="outlook-webhook-renewal",
+    )
+    _quote_window_task = asyncio.create_task(
+        _quote_window_evaluation_loop(),
+        name="quote-window-evaluation",
     )
     logger.info("Startup sequence complete.")
     yield
@@ -91,6 +115,10 @@ async def lifespan(app: FastAPI):
         _webhook_renewal_task.cancel()
         with suppress(asyncio.CancelledError):
             await _webhook_renewal_task
+    if _quote_window_task and not _quote_window_task.done():
+        _quote_window_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _quote_window_task
 
 
 app = FastAPI(

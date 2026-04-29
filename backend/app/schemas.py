@@ -103,6 +103,7 @@ class WorkflowEventType(str, Enum):
     CUSTOMER_DETAILS_REQUESTED = "customer_details_requested"
     CARRIER_OUTREACH_SENT = "carrier_outreach_sent"
     CARRIER_FOLLOWUP_SENT = "carrier_followup_sent"
+    CARRIER_AWARD_SENT = "carrier_award_sent"
     BID_RECEIVED = "bid_received"
     BID_PARSE_FAILED = "bid_parse_failed"
     EVALUATION_COMPLETED = "evaluation_completed"

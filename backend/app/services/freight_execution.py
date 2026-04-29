@@ -1326,39 +1326,47 @@ async def handoff_to_tms(
         raise RuntimeError("Booking blocked until document review is resolved.")
 
     if not dry_run:
-        shipment.status = ShipmentStage.BOOKING_IN_PROGRESS.value
-        shipment.updated_at = datetime.now(timezone.utc)
-        await session.commit()
-        await freight_realtime_hub.publish_shipment_updated(
-            shipment_id=str(shipment.id),
-            fields=["status"],
-        )
-        try:
-            response_payload = await connector.request(
-                "POST",
-                "/loads",
-                json=payload,
-                idempotency_key=shipment.quote_token or str(shipment.id),
-            )
-            status = "submitted"
+        if not connector.is_configured():
+            response_payload = {
+                "source": "local_manual_booking",
+                "missing_fields": connector.missing_settings(),
+            }
+            status = "not_configured"
             shipment.status = ShipmentStage.BOOKED.value
-        except RuntimeError as exc:
-            shipment.status = ShipmentStage.BOOKING_FAILED.value
+        else:
+            shipment.status = ShipmentStage.BOOKING_IN_PROGRESS.value
             shipment.updated_at = datetime.now(timezone.utc)
-            handoff_exc_evt = WorkflowEvent(
-                shipment_id=shipment.id,
-                event_type=WorkflowEventType.EXCEPTION_RAISED.value,
-                stage=shipment.status,
-                payload_json={
-                    "reason": "tms_handoff_failed",
-                    "message": str(exc),
-                    "payload": payload,
-                },
-            )
-            session.add(handoff_exc_evt)
             await session.commit()
-            await freight_realtime_hub.notify_workflow_event(handoff_exc_evt)
-            raise
+            await freight_realtime_hub.publish_shipment_updated(
+                shipment_id=str(shipment.id),
+                fields=["status"],
+            )
+            try:
+                response_payload = await connector.request(
+                    "POST",
+                    "/loads",
+                    json=payload,
+                    idempotency_key=shipment.quote_token or str(shipment.id),
+                )
+                status = "submitted"
+                shipment.status = ShipmentStage.BOOKED.value
+            except RuntimeError as exc:
+                shipment.status = ShipmentStage.BOOKING_FAILED.value
+                shipment.updated_at = datetime.now(timezone.utc)
+                handoff_exc_evt = WorkflowEvent(
+                    shipment_id=shipment.id,
+                    event_type=WorkflowEventType.EXCEPTION_RAISED.value,
+                    stage=shipment.status,
+                    payload_json={
+                        "reason": "tms_handoff_failed",
+                        "message": str(exc),
+                        "payload": payload,
+                    },
+                )
+                session.add(handoff_exc_evt)
+                await session.commit()
+                await freight_realtime_hub.notify_workflow_event(handoff_exc_evt)
+                raise
     else:
         shipment.status = ShipmentStage.AWAITING_CONFIRMATION.value
 
@@ -1505,7 +1513,6 @@ async def send_booking_confirmation(
         subject=subject,
         body=body,
         dry_run=dry_run,
-        **delivery_payload,
     )
 
     if shipment.email_thread_id:
@@ -1854,6 +1861,14 @@ async def confirm_booking_and_handoff(
     custom_message: str | None = None,
 ) -> tuple[TmsHandoffResponse, BookingConfirmationResponse]:
     """Execute the booking flow after customer confirmation."""
+    from app.services.freight_outreach import send_carrier_award_confirmation
+
+    await send_carrier_award_confirmation(
+        session,
+        shipment_id=shipment_id,
+        bid_id=bid_id,
+        dry_run=dry_run,
+    )
     handoff = await handoff_to_tms(
         session,
         shipment_id=shipment_id,
