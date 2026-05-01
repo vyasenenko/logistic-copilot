@@ -1,4 +1,6 @@
 # Set image tags per release: issist/logistic-copilot-backend:TAG and issist/logistic-copilot-frontend:TAG
+# Private Hub images: create secret in ai-agent, e.g. kubectl create secret docker-registry dockerhub-issist ...
+# then reference it below (or change name to match your secret).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,6 +16,8 @@ spec:
       labels:
         app: backend
     spec:
+      imagePullSecrets:
+        - name: dockerhub-issist
       containers:
         - name: backend
           image: issist/logistic-copilot-backend:latest
@@ -72,6 +76,8 @@ spec:
       labels:
         app: frontend
     spec:
+      imagePullSecrets:
+        - name: dockerhub-issist
       containers:
         - name: frontend
           image: issist/logistic-copilot-frontend:latest
