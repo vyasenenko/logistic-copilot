@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { DashboardLogo } from "@/components/DashboardLogo";
 
 export const metadata: Metadata = {
   title: "LogistiCopilot | Freight Control Tower",
@@ -13,6 +14,9 @@ export default function Home() {
         <div className="pointer-events-none absolute -right-12 bottom-8 h-44 w-44 rounded-full bg-amber-300/20 blur-3xl" />
 
         <div className="relative z-10 text-center">
+          <div className="mb-6 flex justify-center sm:mb-8" aria-hidden>
+            <DashboardLogo className="h-16 w-16 object-contain sm:h-24 sm:w-24" />
+          </div>
           <div className="mb-5 inline-flex items-center rounded-full border border-cyan-200/30 bg-slate-900/40 px-4 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-cyan-200">
             Freight AI Experience
           </div>

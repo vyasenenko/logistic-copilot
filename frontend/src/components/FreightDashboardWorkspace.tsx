@@ -4177,9 +4177,11 @@ export function FreightDashboardWorkspace() {
           <div className="relative grid gap-4 lg:grid-cols-[minmax(0,1fr),minmax(560px,1.02fr)] lg:items-center xl:grid-cols-[minmax(0,1fr),minmax(680px,1.12fr)]">
             <div className="min-w-0 space-y-3">
               <div className="flex flex-wrap items-center gap-3">
-                <div className="inline-flex h-9 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[11px] uppercase tracking-[0.24em] text-cyan-100">
-                  <DashboardLogo className="h-4 w-4 shrink-0 text-cyan-100" />
-                  Logistic Copilot
+                <div className="inline-flex items-center gap-2.5">
+                  <DashboardLogo className="h-6 w-6 shrink-0 sm:h-7 sm:w-7" />
+                  <span className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-100">
+                    Logistic Copilot
+                  </span>
                 </div>
                 <span className="hidden text-[11px] uppercase tracking-[0.24em] text-cyan-200/40 md:inline">
                   Live operations board
