@@ -34,6 +34,10 @@ pnpm-debug.log*
 .env.local
 .env.*.local
 
+# Kubernetes (local/generated; do not commit secrets)
+.k8s-dotenv.mk
+k8s/secrets.yaml
+
 # IDE / editors
 .vscode/
 .idea/
