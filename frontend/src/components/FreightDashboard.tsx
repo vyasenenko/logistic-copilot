@@ -9,8 +9,6 @@ import {
   AlertTriangle,
   ArrowRight,
   Building2,
-  ChevronDown,
-  CheckCircle2,
   CircleDollarSign,
   ClipboardCheck,
   Clock3,
@@ -29,8 +27,7 @@ import {
   Truck,
   Users,
 } from "lucide-react";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { PUBLIC_API_URL as API_URL } from "@/constants/publicApi";
 
 type DashboardTab = "shipments" | "status_ops" | "clients" | "carriers";
 
@@ -82,6 +79,18 @@ interface CarrierRecord {
   metadata: Record<string, string>;
   created_at: string;
   updated_at: string;
+}
+
+interface ClientListPage {
+  items: ClientRecord[];
+  has_more: boolean;
+  next_offset: number;
+}
+
+interface CarrierListPage {
+  items: CarrierRecord[];
+  has_more: boolean;
+  next_offset: number;
 }
 
 interface ShipmentRecord {
@@ -462,15 +471,26 @@ const EMPTY_OVERVIEW: OverviewResponse = {
 };
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const authToken =
+    typeof window !== "undefined"
+      ? window.localStorage.getItem("logistic_copilot_auth_token")
+      : null;
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       ...(init?.headers || {}),
     },
   });
 
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem("logistic_copilot_auth_token");
+        window.location.assign("/");
+      }
+    }
     const message = await response.text();
     throw new Error(message || `Request failed: ${response.status}`);
   }
@@ -480,6 +500,51 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+const FREIGHT_PARTY_PAGE_LIMIT = 100;
+const FREIGHT_PARTY_MAX_ROWS = 5000;
+
+async function collectFreightDashboardClients(): Promise<ClientRecord[]> {
+  const merged: ClientRecord[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  while (merged.length < FREIGHT_PARTY_MAX_ROWS) {
+    const params = new URLSearchParams();
+    params.set("limit", String(FREIGHT_PARTY_PAGE_LIMIT));
+    params.set("offset", String(offset));
+    const page = await fetchJson<ClientListPage>(`/api/freight/clients?${params.toString()}`);
+    for (const row of page.items) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        merged.push(row);
+      }
+    }
+    if (!page.has_more) break;
+    offset = page.next_offset;
+  }
+  return merged;
+}
+
+async function collectFreightDashboardCarriers(): Promise<CarrierRecord[]> {
+  const merged: CarrierRecord[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  while (merged.length < FREIGHT_PARTY_MAX_ROWS) {
+    const params = new URLSearchParams();
+    params.set("limit", String(FREIGHT_PARTY_PAGE_LIMIT));
+    params.set("offset", String(offset));
+    const page = await fetchJson<CarrierListPage>(`/api/freight/carriers?${params.toString()}`);
+    for (const row of page.items) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        merged.push(row);
+      }
+    }
+    if (!page.has_more) break;
+    offset = page.next_offset;
+  }
+  return merged;
 }
 
 function formatDate(value: string | null) {
@@ -901,8 +966,7 @@ function LegacyFreightDashboard() {
   const [notice, setNotice] = useState<string | null>(null);
   const [lastSyncSummary, setLastSyncSummary] = useState<OutlookSyncResponse | null>(null);
   const [webhookStatus, setWebhookStatus] = useState<OutlookWebhookStatusResponse | null>(null);
-  const [syncLimit, setSyncLimit] = useState(10);
-  const [syncMenuOpen, setSyncMenuOpen] = useState(false);
+  const syncLimit = 10;
 
   const [clientForm, setClientForm] = useState({
     name: "",
@@ -986,14 +1050,14 @@ function LegacyFreightDashboard() {
     setLoading(true);
     setError(null);
     try {
-      const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData, webhookData] = await Promise.all([
+      const [overviewData, shipmentData, reviewData, statusQueueData, webhookData, clientData, carrierData] = await Promise.all([
         fetchJson<OverviewResponse>("/api/freight/overview"),
-        fetchJson<ClientRecord[]>("/api/freight/clients"),
-        fetchJson<CarrierRecord[]>("/api/freight/carriers"),
         fetchJson<ShipmentRecord[]>("/api/freight/shipments"),
         fetchJson<ReviewQueueItem[]>("/api/freight/reviews"),
         fetchJson<StatusQueueItem[]>("/api/freight/status-queue?include_resolved=true"),
-        fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/status").catch(() => null),
+        fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/auto-sync/status").catch(() => null),
+        collectFreightDashboardClients(),
+        collectFreightDashboardCarriers(),
       ]);
 
       startTransition(() => {
@@ -1326,20 +1390,9 @@ function LegacyFreightDashboard() {
     }
   }
 
-  async function loadWebhookStatus() {
-    try {
-      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/status");
-      setWebhookStatus(response);
-      setNotice(`Outlook webhook check: ${webhookStatusLabel(response.status)}.`);
-    } catch {
-      setWebhookStatus(null);
-    }
-  }
-
   async function handleOutlookSync(limit = syncLimit) {
     setSubmitting("sync");
     setError(null);
-    setSyncMenuOpen(false);
     try {
       const response = await fetchJson<OutlookSyncResponse>("/api/freight/outlook/sync", {
         method: "POST",
@@ -1361,26 +1414,6 @@ function LegacyFreightDashboard() {
     } catch (submitError) {
       setError(
         submitError instanceof Error ? submitError.message : "Failed to sync Outlook inbox.",
-      );
-    } finally {
-      setSubmitting(null);
-    }
-  }
-
-  async function handleEnsureWebhook() {
-    setSubmitting("webhook");
-    setError(null);
-    setSyncMenuOpen(false);
-    try {
-      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/ensure", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      setWebhookStatus(response);
-      setNotice(`Outlook webhook ${response.subscription_action || "checked"}: ${webhookStatusLabel(response.status)}.`);
-    } catch (submitError) {
-      setError(
-        submitError instanceof Error ? submitError.message : "Failed to install Outlook webhook.",
       );
     } finally {
       setSubmitting(null);
@@ -1717,7 +1750,7 @@ function LegacyFreightDashboard() {
 
             <div className="mt-6 grid gap-3 sm:grid-cols-3">
               <div className={`rounded-[24px] border p-4 text-sm ${webhookStatusClasses(webhookStatus?.status)}`}>
-                <div className="flex items-center justify-between"><span>Outlook webhook</span><ShieldCheck size={16} /></div>
+                <div className="flex items-center justify-between"><span>Outlook auto-sync</span><ShieldCheck size={16} /></div>
                 <p className="mt-2 text-white">{webhookStatusLabel(webhookStatus?.status)}</p>
                 {webhookStatus?.expires_at && <p className="mt-1 text-xs opacity-80">Expires {formatDate(webhookStatus.expires_at)}</p>}
               </div>
@@ -1748,69 +1781,15 @@ function LegacyFreightDashboard() {
                         <h2 className="mt-1 text-2xl font-semibold text-white">Shipment lanes</h2>
                       </div>
                       <div className="flex items-center gap-3">
-                        <div className="relative">
-                          <button
-                            onClick={() => setSyncMenuOpen((open) => !open)}
-                            disabled={submitting === "sync" || submitting === "webhook"}
-                            className="action-button gap-2 bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50"
-                          >
-                            {submitting === "sync" ? <Loader2 className="animate-spin" size={16} /> : <SlidersHorizontal size={16} />}
-                            Outlook
-                            <ChevronDown size={16} />
-                          </button>
-                          {syncMenuOpen && (
-                            <div className="absolute right-0 z-30 mt-3 w-[min(320px,calc(100vw-2rem))] rounded-[24px] border border-white/10 bg-slate-950/95 p-4 text-sm shadow-2xl backdrop-blur-xl">
-                              <div className="flex items-center justify-between gap-3">
-                                <div>
-                                  <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Inbox sync</p>
-                                  <p className="mt-1 font-medium text-white">Pull recent messages</p>
-                                </div>
-                                <span className="rounded-full bg-cyan-300/10 px-3 py-1 text-xs text-cyan-100">{syncLimit} msg</span>
-                              </div>
-                              <div className="mt-4 grid grid-cols-4 gap-2">
-                                {[5, 10, 25, 50].map((limit) => (
-                                  <button
-                                    key={limit}
-                                    onClick={() => setSyncLimit(limit)}
-                                    className={`rounded-2xl px-3 py-2 text-sm transition ${syncLimit === limit ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"}`}
-                                  >
-                                    {limit}
-                                  </button>
-                                ))}
-                              </div>
-                              <button
-                                onClick={() => void handleOutlookSync(syncLimit)}
-                                className="mt-3 flex w-full items-center justify-center gap-2 rounded-2xl bg-cyan-300/15 px-4 py-3 font-medium text-cyan-100 transition hover:bg-cyan-300/20"
-                              >
-                                <RefreshCcw size={16} /> Sync inbox
-                              </button>
-
-                              <div className={`mt-4 rounded-2xl border p-3 ${webhookStatusClasses(webhookStatus?.status)}`}>
-                                <div className="flex items-center justify-between gap-3">
-                                  <span className="flex items-center gap-2 font-medium"><ShieldCheck size={16} /> Webhook</span>
-                                  <span className="text-xs">{webhookStatusLabel(webhookStatus?.status)}</span>
-                                </div>
-                                <p className="mt-2 break-all text-xs opacity-80">{webhookStatus?.expected_notification_url || "Webhook URL is not configured"}</p>
-                                {webhookStatus?.expires_at && <p className="mt-2 text-xs opacity-80">Expires {formatDate(webhookStatus.expires_at)}</p>}
-                              </div>
-                              <div className="mt-3 grid grid-cols-2 gap-2">
-                                <button
-                                  onClick={() => void loadWebhookStatus()}
-                                  className="flex items-center justify-center gap-2 rounded-2xl bg-white/5 px-3 py-2 text-[var(--text-muted)] transition hover:bg-white/10 hover:text-white"
-                                >
-                                  <RadioTower size={16} /> Check
-                                </button>
-                                <button
-                                  onClick={() => void handleEnsureWebhook()}
-                                  disabled={submitting === "webhook"}
-                                  className="flex items-center justify-center gap-2 rounded-2xl bg-white px-3 py-2 font-medium text-slate-950 transition hover:bg-cyan-50 disabled:opacity-60"
-                                >
-                                  {submitting === "webhook" ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />} Ensure
-                                </button>
-                              </div>
-                            </div>
-                          )}
-                        </div>
+                        <button
+                          onClick={() => void handleOutlookSync(syncLimit)}
+                          disabled={submitting === "sync"}
+                          className="action-button gap-2 bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50"
+                          title="Reads recent messages from the current user's work mailbox only."
+                        >
+                          {submitting === "sync" ? <Loader2 className="animate-spin" size={16} /> : <SlidersHorizontal size={16} />}
+                          Sync my inbox
+                        </button>
                         <button onClick={() => void refreshAll()} className="action-button bg-white/10 text-sm text-white hover:bg-white/15">Refresh</button>
                       </div>
                     </div>
@@ -2500,7 +2479,7 @@ function LegacyFreightDashboard() {
             <div className="glass-panel p-5">
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Connected systems</p>
               <div className="mt-4 space-y-3 text-sm text-[var(--text-muted)]">
-                <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><Mail size={16} /> Outlook webhook</span><span className="text-white">{webhookStatusLabel(webhookStatus?.status)}</span></div>
+                <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><Mail size={16} /> Outlook auto-sync</span><span className="text-white">{webhookStatusLabel(webhookStatus?.status)}</span></div>
                 <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><CircleDollarSign size={16} /> Margin defaults</span><span className="text-white">{overview.integrations.quote_wait_minutes_default || "20"} min window</span></div>
                 <div className="flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><span className="flex items-center gap-3"><ClipboardCheck size={16} /> TMS connector</span><span className="text-white">Preview-ready</span></div>
               </div>

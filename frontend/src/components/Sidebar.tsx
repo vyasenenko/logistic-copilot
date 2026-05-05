@@ -2,8 +2,15 @@
 
 import { useEffect, useState } from "react";
 import { MessageSquare, Plus } from "lucide-react";
+import { PUBLIC_API_URL as API_URL } from "@/constants/publicApi";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+function authHeaders(): HeadersInit {
+  const authToken =
+    typeof window !== "undefined"
+      ? window.localStorage.getItem("logistic_copilot_auth_token")
+      : null;
+  return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
 
 interface Conversation {
   id: string;
@@ -26,7 +33,7 @@ export function Sidebar({
   const [conversations, setConversations] = useState<Conversation[]>([]);
 
   useEffect(() => {
-    fetch(`${API_URL}/api/conversations`)
+    fetch(`${API_URL}/api/conversations`, { headers: authHeaders() })
       .then((r) => r.json())
       .then(setConversations)
       .catch(() => {});

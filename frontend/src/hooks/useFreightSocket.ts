@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { DEFAULT_PUBLIC_API_URL, PUBLIC_API_URL } from "@/constants/publicApi";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_URL = PUBLIC_API_URL;
+const AUTH_TOKEN_KEY = "logistic_copilot_auth_token";
 
 /** Matches API WorkflowEventRecord shape. */
 export interface FreightWorkflowEventRecord {
@@ -14,17 +16,24 @@ export interface FreightWorkflowEventRecord {
   created_at: string;
 }
 
+function buildEventsWsUrl(httpOrigin: string, token?: string | null): string {
+  const u = new URL(httpOrigin.replace(/\/$/, ""));
+  u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+  u.pathname = "/ws/events";
+  u.search = "";
+  if (token) {
+    u.searchParams.set("token", token);
+  }
+  u.hash = "";
+  return u.toString();
+}
+
 /** Build ws:// or wss:// URL for /ws/events from NEXT_PUBLIC_API_URL. */
-export function freightWebSocketUrl(): string {
+export function freightWebSocketUrl(token?: string | null): string {
   try {
-    const u = new URL(API_URL.replace(/\/$/, ""));
-    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    u.pathname = "/ws/events";
-    u.search = "";
-    u.hash = "";
-    return u.toString();
+    return buildEventsWsUrl(API_URL, token);
   } catch {
-    return "ws://localhost:8000/ws/events";
+    return buildEventsWsUrl(DEFAULT_PUBLIC_API_URL, token);
   }
 }
 
@@ -73,8 +82,13 @@ export function useFreightSocket(handlers: FreightRealtimeHandlers): void {
         return;
       }
       clearReconnect();
+      const token = window.localStorage.getItem(AUTH_TOKEN_KEY);
+      if (!token) {
+        scheduleReconnect();
+        return;
+      }
       try {
-        socket = new WebSocket(freightWebSocketUrl());
+        socket = new WebSocket(freightWebSocketUrl(token));
       } catch {
         scheduleReconnect();
         return;

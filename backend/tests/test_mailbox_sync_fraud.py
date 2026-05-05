@@ -54,24 +54,24 @@ class FakeSession:
         self.committed = True
 
 
-def test_q_token_reply_reaches_ai_even_when_triage_intent_is_unclear():
+def test_q_token_does_not_materialize_unclear_email_without_existing_shipment():
     should_materialize = mailbox_sync._should_materialize_shipment_for_triage(
         classification=EmailTriageClassification.NEEDS_OPERATOR_TRIAGE,
         quote_token="Q-12345678",
         existing_shipment_linked=False,
     )
 
-    assert should_materialize is True
+    assert should_materialize is False
 
 
-def test_existing_shipment_reply_reaches_ai_even_without_q_token():
+def test_unclear_existing_shipment_reply_stays_in_triage():
     should_materialize = mailbox_sync._should_materialize_shipment_for_triage(
         classification=EmailTriageClassification.NEEDS_OPERATOR_TRIAGE,
         quote_token=None,
         existing_shipment_linked=True,
     )
 
-    assert should_materialize is True
+    assert should_materialize is False
 
 
 def test_correlated_carrier_reply_reaches_ai_flow():
@@ -92,6 +92,19 @@ def test_fraud_triage_still_blocks_q_token_materialization():
     )
 
     assert should_materialize is False
+
+
+def test_status_or_ops_only_links_when_existing_shipment_is_present():
+    assert mailbox_sync._should_materialize_shipment_for_triage(
+        classification=EmailTriageClassification.STATUS_OR_OPS,
+        quote_token="Q-12345678",
+        existing_shipment_linked=False,
+    ) is False
+    assert mailbox_sync._should_materialize_shipment_for_triage(
+        classification=EmailTriageClassification.STATUS_OR_OPS,
+        quote_token="Q-12345678",
+        existing_shipment_linked=True,
+    ) is True
 
 
 @pytest.mark.asyncio
@@ -202,3 +215,53 @@ async def test_ingest_outlook_message_archives_denylisted_sender(monkeypatch):
     assert result.shipment_id == ""
     workflow_events = [item for item in session.added if isinstance(item, WorkflowEvent)]
     assert workflow_events == []
+
+
+@pytest.mark.asyncio
+async def test_chrome_webstore_verification_email_does_not_create_shipment(monkeypatch):
+    session = FakeSession(
+        scalar_results=[
+            None,  # existing EmailMessage
+            None,  # existing thread by generated/subject token lookup
+            None,  # existing shipment
+            None,  # carrier by exact email
+            None,  # client by exact email
+        ],
+        execute_results=[
+            [],  # fraud denylist entries
+            [],  # known client emails
+            [],  # known carrier emails
+        ],
+    )
+    message = OutlookMailboxMessage(
+        provider_message_id="chrome-webstore-verify-1",
+        conversation_id=None,
+        internet_message_id="<chrome-webstore-verify-1@example.com>",
+        subject="Підтвердьте свою контактну електронну адресу",
+        body_preview=(
+            "Шановний розробнику! Підтвердьте свою контактну електронну адресу "
+            "в обліковому записі видавця у Веб-магазині Chrome."
+        ),
+        sender_email="chromewebstore-noreply@google.com",
+        sender_name="Chrome Web Store",
+        recipients=["vyasenenko@logisticopilot.com"],
+        received_at=datetime.now(timezone.utc),
+        raw_payload={},
+    )
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mailbox_sync.freight_realtime_hub, "notify_workflow_event", _noop)
+    monkeypatch.setattr(mailbox_sync.freight_realtime_hub, "notify_workflow_events", _noop)
+
+    result = await mailbox_sync.ingest_outlook_message(session, message)
+
+    assert result.shipment_id == ""
+    assert result.created_shipment is False
+    assert result.shipment_creation_skipped is True
+    assert result.triage_classification == "noise_or_unhandled"
+    shipments = [item for item in session.added if isinstance(item, Shipment)]
+    assert shipments == []
+    triage_items = [item for item in session.added if isinstance(item, EmailTriageItem)]
+    assert triage_items and triage_items[0].classification == "noise_or_unhandled"

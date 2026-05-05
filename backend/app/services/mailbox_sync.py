@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
+from uuid import UUID
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +34,7 @@ from app.services.email_fraud import (
     fraud_assessment_from_denylist_match,
     normalize_sender_email,
 )
-from app.services.email_triage import classify_email_triage
+from app.services.freight_ai import classify_email_triage_with_ai
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.outlook import OutlookMailboxMessage
 
@@ -97,16 +98,18 @@ def _should_materialize_shipment_for_triage(
     quote_token: str | None,
     existing_shipment_linked: bool,
 ) -> bool:
-    if classification == EmailTriageClassification.FRAUD_OR_PHISHING:
-        return False
-    if quote_token or existing_shipment_linked:
+    if classification == EmailTriageClassification.FREIGHT_QUOTE_REQUEST:
         return True
-    return classification == EmailTriageClassification.FREIGHT_QUOTE_REQUEST
+    if classification in {EmailTriageClassification.CARRIER_REPLY, EmailTriageClassification.STATUS_OR_OPS}:
+        return existing_shipment_linked
+    return False
 
 
 async def _find_or_create_thread(
     session: AsyncSession,
     *,
+    organization_id: UUID,
+    mailbox: str,
     mailbox_message: OutlookMailboxMessage,
     quote_token: str | None,
 ) -> tuple[EmailThread, bool]:
@@ -128,6 +131,7 @@ async def _find_or_create_thread(
     if reply_like and mailbox_message.conversation_id:
         thread = await session.scalar(
             select(EmailThread).where(
+                EmailThread.organization_id == organization_id,
                 EmailThread.provider_thread_id == mailbox_message.conversation_id
             )
         )
@@ -141,20 +145,28 @@ async def _find_or_create_thread(
         thread = await session.scalar(
             select(EmailThread)
             .join(EmailMessage, EmailMessage.thread_id == EmailThread.id)
-            .where(EmailMessage.internet_message_id.in_(reply_message_ids))
+            .where(
+                EmailThread.organization_id == organization_id,
+                EmailMessage.organization_id == organization_id,
+                EmailMessage.internet_message_id.in_(reply_message_ids),
+            )
             .order_by(EmailMessage.received_at.desc())
         )
 
     if thread is None and subject_quote_token:
         thread = await session.scalar(
-            select(EmailThread).where(EmailThread.quote_token == subject_quote_token)
+            select(EmailThread).where(
+                EmailThread.organization_id == organization_id,
+                EmailThread.quote_token == subject_quote_token,
+            )
         )
 
     created = False
     if thread is None:
         thread = EmailThread(
+            organization_id=organization_id,
             provider="outlook",
-            mailbox=settings.microsoft_mailbox or "unknown",
+            mailbox=mailbox,
             provider_thread_id=mailbox_message.conversation_id if reply_like else None,
             quote_token=quote_token,
             subject=mailbox_message.subject,
@@ -178,6 +190,7 @@ async def _find_or_create_thread(
 async def _find_or_create_client(
     session: AsyncSession,
     *,
+    organization_id: UUID,
     sender_email: str,
     sender_name: str | None,
     create_if_missing: bool,
@@ -185,11 +198,14 @@ async def _find_or_create_client(
     if not sender_email:
         return None, False
 
-    client = await session.scalar(select(Client).where(Client.email == sender_email))
+    client = await session.scalar(
+        select(Client).where(Client.organization_id == organization_id, Client.email == sender_email)
+    )
     if client is not None or not create_if_missing:
         return client, False
 
     client = Client(
+        organization_id=organization_id,
         name=sender_name or _display_name_from_email(sender_email),
         email=sender_email,
         default_margin_percent=settings.profit_margin_percent_default,
@@ -203,6 +219,7 @@ async def _find_or_create_client(
 async def _find_or_create_shipment(
     session: AsyncSession,
     *,
+    organization_id: UUID,
     thread: EmailThread,
     client: Client | None,
     body_preview: str,
@@ -210,7 +227,7 @@ async def _find_or_create_shipment(
     if bool(getattr(thread, "shipment_ingest_suppressed", False)):
         existing_archived = await session.scalar(
             select(Shipment)
-            .where(Shipment.email_thread_id == thread.id)
+            .where(Shipment.organization_id == organization_id, Shipment.email_thread_id == thread.id)
             .order_by(Shipment.created_at.desc())
         )
         if existing_archived is not None:
@@ -219,6 +236,7 @@ async def _find_or_create_shipment(
 
     shipment = await session.scalar(
         select(Shipment).where(
+            Shipment.organization_id == organization_id,
             or_(Shipment.email_thread_id == thread.id, Shipment.quote_token == thread.quote_token)
         )
     )
@@ -228,6 +246,7 @@ async def _find_or_create_shipment(
         return shipment, False
 
     shipment = Shipment(
+        organization_id=organization_id,
         client_id=client.id if client else None,
         email_thread_id=thread.id,
         status=ShipmentStage.RECEIVED.value,
@@ -243,15 +262,18 @@ async def _find_or_create_shipment(
     return shipment, True
 
 
-async def _latest_shipment_for_thread(session: AsyncSession, thread_id) -> Shipment | None:
+async def _latest_shipment_for_thread(session: AsyncSession, thread_id, *, organization_id: UUID) -> Shipment | None:
     return await session.scalar(
-        select(Shipment).where(Shipment.email_thread_id == thread_id).order_by(Shipment.created_at.desc())
+        select(Shipment)
+        .where(Shipment.organization_id == organization_id, Shipment.email_thread_id == thread_id)
+        .order_by(Shipment.created_at.desc())
     )
 
 
 async def _find_active_fraud_denylist_entry(
     session: AsyncSession,
     *,
+    organization_id: UUID,
     sender_email: str,
 ) -> FraudDenylistEntry | None:
     normalized_email = normalize_sender_email(sender_email)
@@ -260,7 +282,7 @@ async def _find_active_fraud_denylist_entry(
         return None
     result = await session.execute(
         select(FraudDenylistEntry)
-        .where(FraudDenylistEntry.is_active.is_(True))
+        .where(FraudDenylistEntry.organization_id == organization_id, FraudDenylistEntry.is_active.is_(True))
         .where(
             or_(
                 (FraudDenylistEntry.scope == FraudDenylistScope.SENDER_EMAIL.value)
@@ -284,6 +306,7 @@ async def _save_email_triage_item(
     fraud_payload: dict | None = None,
 ) -> EmailTriageItem:
     item = EmailTriageItem(
+        organization_id=email_message.organization_id,
         email_message_id=email_message.id,
         thread_id=thread.id,
         classification=triage_result.classification.value,
@@ -307,19 +330,31 @@ async def ingest_outlook_message(
     session: AsyncSession,
     mailbox_message: OutlookMailboxMessage,
     *,
+    organization_id: UUID,
+    mailbox: str | None = None,
     create_client_if_missing: bool = True,
 ) -> OutlookIngestResult | None:
     """Normalize an Outlook message into freight workflow tables."""
     if not mailbox_message.provider_message_id:
         raise RuntimeError("Outlook message payload must include a provider message id")
 
+    normalized_mailbox = (mailbox or "").strip().lower() or "unknown"
     existing_message = await session.scalar(
-        select(EmailMessage).where(
-            EmailMessage.provider_message_id == mailbox_message.provider_message_id
+        select(EmailMessage)
+        .join(EmailThread, EmailThread.id == EmailMessage.thread_id)
+        .where(
+            EmailMessage.organization_id == organization_id,
+            EmailMessage.provider_message_id == mailbox_message.provider_message_id,
+            EmailThread.organization_id == organization_id,
+            EmailThread.mailbox == normalized_mailbox,
         )
     )
     if existing_message is not None:
-        shipment = await _latest_shipment_for_thread(session, existing_message.thread_id)
+        shipment = await _latest_shipment_for_thread(
+            session,
+            existing_message.thread_id,
+            organization_id=organization_id,
+        )
         fraud_payload = dict((existing_message.raw_payload_json or {}).get("fraud", {}) or {})
         triage_item = await session.scalar(
             select(EmailTriageItem)
@@ -388,6 +423,8 @@ async def ingest_outlook_message(
 
     thread, created_thread = await _find_or_create_thread(
         session,
+        organization_id=organization_id,
+        mailbox=normalized_mailbox,
         mailbox_message=mailbox_message,
         quote_token=quote_token,
     )
@@ -399,6 +436,7 @@ async def ingest_outlook_message(
         thread.shipment_ingest_suppressed_at = datetime.now(timezone.utc)
 
     email_message = EmailMessage(
+        organization_id=organization_id,
         thread_id=thread.id,
         provider_message_id=mailbox_message.provider_message_id,
         internet_message_id=mailbox_message.internet_message_id,
@@ -418,6 +456,7 @@ async def ingest_outlook_message(
 
     denylist_entry = await _find_active_fraud_denylist_entry(
         session,
+        organization_id=organization_id,
         sender_email=mailbox_message.sender_email,
     )
     if denylist_entry is not None:
@@ -427,8 +466,8 @@ async def ingest_outlook_message(
             value=denylist_entry.value,
         )
     else:
-        known_sender_rows = await session.execute(select(Client.email))
-        known_carrier_rows = await session.execute(select(Carrier.email))
+        known_sender_rows = await session.execute(select(Client.email).where(Client.organization_id == organization_id))
+        known_carrier_rows = await session.execute(select(Carrier.email).where(Carrier.organization_id == organization_id))
         known_senders = {
             str(value).strip().lower()
             for value in [*known_sender_rows.scalars().all(), *known_carrier_rows.scalars().all()]
@@ -456,8 +495,8 @@ async def ingest_outlook_message(
     session.add(email_message)
     await session.flush()
 
-    existing_shipment = await _latest_shipment_for_thread(session, thread.id)
-    triage_result = classify_email_triage(
+    existing_shipment = await _latest_shipment_for_thread(session, thread.id, organization_id=organization_id)
+    triage_result = await classify_email_triage_with_ai(
         subject=mailbox_message.subject,
         body_preview=mailbox_message.body_preview,
         sender_email=mailbox_message.sender_email,
@@ -467,8 +506,12 @@ async def ingest_outlook_message(
         fraud_risk_level=fraud_assessment.risk_level.value,
     )
 
-    carrier = await session.scalar(select(Carrier).where(Carrier.email == mailbox_message.sender_email))
-    client = await session.scalar(select(Client).where(Client.email == mailbox_message.sender_email))
+    carrier = await session.scalar(
+        select(Carrier).where(Carrier.organization_id == organization_id, Carrier.email == mailbox_message.sender_email)
+    )
+    client = await session.scalar(
+        select(Client).where(Client.organization_id == organization_id, Client.email == mailbox_message.sender_email)
+    )
 
     created_client = False
     if (
@@ -482,6 +525,7 @@ async def ingest_outlook_message(
         if not fraud_assessment.verification_required and create_client_if_missing:
             client, created_client = await _find_or_create_client(
                 session,
+                organization_id=organization_id,
                 sender_email=mailbox_message.sender_email,
                 sender_name=mailbox_message.sender_name,
                 create_if_missing=create_client_if_missing,
@@ -498,6 +542,7 @@ async def ingest_outlook_message(
     if not thread.shipment_ingest_suppressed and should_materialize_shipment:
         shipment, created_shipment = await _find_or_create_shipment(
             session,
+            organization_id=organization_id,
             thread=thread,
             client=client,
             body_preview=mailbox_message.body_preview,
@@ -522,6 +567,7 @@ async def ingest_outlook_message(
     workflow_events: list[WorkflowEvent] = []
     if shipment is not None:
         workflow_event = WorkflowEvent(
+            organization_id=organization_id,
             shipment_id=shipment.id,
             event_type=WorkflowEventType.EMAIL_RECEIVED.value,
             stage=ShipmentStage.RECEIVED.value,
@@ -547,12 +593,14 @@ async def ingest_outlook_message(
                 "denylist_value": denylist_entry.value,
             }
             archive_event = WorkflowEvent(
+                organization_id=organization_id,
                 shipment_id=shipment.id,
                 event_type=WorkflowEventType.SHIPMENT_ARCHIVED.value,
                 stage=shipment.status,
                 payload_json={**archive_payload, "suppress_source_thread": True},
             )
             suppress_event = WorkflowEvent(
+                organization_id=organization_id,
                 shipment_id=shipment.id,
                 event_type=WorkflowEventType.SHIPMENT_SOURCE_SUPPRESSED.value,
                 stage=shipment.status,

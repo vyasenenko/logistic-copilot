@@ -7,6 +7,8 @@ import asyncio
 import httpx
 
 from app.config import settings
+from app.memory.database import OrganizationTmsIntegration
+from app.services.integration_crypto import decrypt_integration_secret
 
 
 class TmsConnector:
@@ -21,14 +23,25 @@ class TmsConnector:
         "tms_api_key",
     )
 
-    def __init__(self) -> None:
-        self.base_url = settings.tms_base_url.rstrip("/") if settings.tms_base_url else ""
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        tms_system: str = "generic",
+        source: str = "env_fallback",
+    ) -> None:
+        self.base_url = (base_url if base_url is not None else settings.tms_base_url).rstrip("/") if (base_url if base_url is not None else settings.tms_base_url) else ""
+        self.api_key = api_key if api_key is not None else settings.tms_api_key
+        self.tms_system = tms_system
+        self.source = source
 
     def missing_settings(self) -> list[str]:
         missing = []
-        for field_name in self.required_settings:
-            if not getattr(settings, field_name):
-                missing.append(field_name)
+        if not self.base_url:
+            missing.append("tms_base_url")
+        if not self.api_key:
+            missing.append("tms_api_key")
         return missing
 
     def is_configured(self) -> bool:
@@ -40,6 +53,8 @@ class TmsConnector:
         details = {
             "base_url": self.base_url or None,
             "timeout_seconds": settings.tms_timeout_seconds,
+            "tms_system": self.tms_system,
+            "source": self.source,
         }
 
         if missing:
@@ -72,7 +87,7 @@ class TmsConnector:
 
         url = f"{self.base_url}/{path.lstrip('/')}"
         headers = {
-            "Authorization": f"Bearer {settings.tms_api_key}",
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         if idempotency_key:
@@ -137,3 +152,19 @@ class TmsConnector:
             return {"status": "submitted", "response": response, "payload": payload}
         except RuntimeError:
             return {"status": "accepted_mock", "response": {"source": "fallback_mock"}, "payload": payload}
+
+
+async def build_tms_connector(session, organization_id) -> TmsConnector:
+    """Build the TMS connector from the organization's integration row, with env fallback for dev."""
+    integration = await session.get(OrganizationTmsIntegration, organization_id)
+    if integration and integration.status == "active":
+        api_key = None
+        if integration.api_key_encrypted:
+            api_key = decrypt_integration_secret(integration.api_key_encrypted)
+        return TmsConnector(
+            base_url=integration.base_url,
+            api_key=api_key,
+            tms_system=integration.tms_system or "generic",
+            source="organization",
+        )
+    return TmsConnector()

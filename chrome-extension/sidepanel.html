@@ -14,102 +14,36 @@
 <body>
   <div class="app">
     <header class="topbar">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true">
-          <img class="brand-mark__img" src="icons/logo.png" alt="" width="24" height="24" decoding="async" draggable="false" />
+      <button
+        type="button"
+        class="topbar-brand-btn"
+        id="openAgentStoriesBtn"
+        aria-expanded="false"
+        aria-controls="agentStories"
+        aria-label="Learn what Logistic Copilot Agent can do"
+        title="What this agent does"
+      >
+        <span class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <span class="brand-logo-ring">
+              <span class="brand-logo-ring__inner">
+                <img class="brand-mark__img" src="icons/logo.png" alt="" width="24" height="24" decoding="async" draggable="false" />
+              </span>
+            </span>
+          </span>
+          <span class="brand-text">
+            <span class="brand-name">Logistic Copilot</span>
+            <span class="brand-agent">Agent</span>
+          </span>
         </span>
-        <span class="brand-text">
-          <span class="brand-name">Logistic Copilot</span>
-          <span class="brand-agent">Agent</span>
-        </span>
-      </div>
-      <div class="topbar-actions">
-        <details class="topbar-menu" id="topbarMenu">
-          <summary class="icon-btn topbar-menu__trigger" id="topbarMenuTrigger" title="Menu" aria-label="Open menu" aria-haspopup="menu">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" class="topbar-menu__dots" aria-hidden="true">
-              <circle cx="12" cy="5" r="1.85"></circle>
-              <circle cx="12" cy="12" r="1.85"></circle>
-              <circle cx="12" cy="19" r="1.85"></circle>
-            </svg>
-          </summary>
-          <div class="topbar-menu__panel" role="menu">
-            <button type="button" class="topbar-menu__item" id="menuNewChatBtn" role="menuitem">
-              <span class="topbar-menu__item-leading" aria-hidden="true">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M12 5v14M5 12h14"></path>
-                </svg>
-              </span>
-              <span class="topbar-menu__item-text">
-                <span class="topbar-menu__item-label">New chat</span>
-                <span class="topbar-menu__item-desc">Empty thread; next message starts a new conversation</span>
-              </span>
-            </button>
-            <button type="button" class="topbar-menu__item" id="menuChatsBtn" role="menuitem">
-              <span class="topbar-menu__item-leading" aria-hidden="true">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                </svg>
-              </span>
-              <span class="topbar-menu__item-text">
-                <span class="topbar-menu__item-label">Conversations</span>
-                <span class="topbar-menu__item-desc">Open the side drawer</span>
-              </span>
-              <span class="topbar-menu__item-chevron" aria-hidden="true">›</span>
-            </button>
-            <button type="button" class="topbar-menu__item" id="menuThemeBtn" role="menuitem">
-              <span class="topbar-menu__item-leading" id="menuThemeIconWrap" aria-hidden="true"></span>
-              <span class="topbar-menu__item-text">
-                <span class="topbar-menu__item-label" id="menuThemeLabel">Appearance</span>
-                <span class="topbar-menu__item-desc" id="menuThemeDesc">Switch light / dark</span>
-              </span>
-            </button>
-            <details class="topbar-menu__settings">
-              <summary class="topbar-menu__item topbar-menu__item--summary">
-                <span class="topbar-menu__item-leading" aria-hidden="true">
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M4 7h16M4 12h10M4 17h16"></path>
-                    <circle cx="16" cy="12" r="2"></circle>
-                  </svg>
-                </span>
-                <span class="topbar-menu__item-text">
-                  <span class="topbar-menu__item-label">Endpoints</span>
-                  <span class="topbar-menu__item-desc">API + frontend links for this panel</span>
-                </span>
-                <span class="topbar-menu__item-chevron topbar-menu__item-chevron--settings" aria-hidden="true">›</span>
-              </summary>
-              <div class="topbar-menu__settings-body">
-                <label class="field-label" for="apiBaseInput">Backend URL</label>
-                <input type="url" id="apiBaseInput" class="field-input" placeholder="https://api.logisticopilot.com" list="apiBaseSuggestions" />
-                <datalist id="apiBaseSuggestions">
-                  <option value="https://api.logisticopilot.com"></option>
-                  <option value="http://localhost:8000"></option>
-                </datalist>
-                <button type="button" id="saveApiBtn" class="btn-primary">Save</button>
-                <label class="field-label" for="frontendBaseInput">Frontend URL</label>
-                <input type="url" id="frontendBaseInput" class="field-input" placeholder="https://logisticopilot.com" list="frontendBaseSuggestions" />
-                <datalist id="frontendBaseSuggestions">
-                  <option value="https://logisticopilot.com"></option>
-                  <option value="http://localhost:3000"></option>
-                </datalist>
-                <button type="button" id="saveFrontendBtn" class="btn-primary">Save link base</button>
-              </div>
-            </details>
-            <div class="topbar-menu__delete-block" role="none">
-              <button type="button" class="topbar-menu__delete-btn" id="menuClearBtn" role="menuitem">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <polyline points="3 6 5 6 21 6"></polyline>
-                  <path d="M19 6l-1 14H6L5 6"></path>
-                  <path d="M10 11v6"></path>
-                  <path d="M14 11v6"></path>
-                  <path d="M9 6V4h6v2"></path>
-                </svg>
-                <span>Delete chat</span>
-              </button>
-              <p class="topbar-menu__delete-hint">Server + panel if linked.</p>
-            </div>
-          </div>
-        </details>
-      </div>
+      </button>
+      <button type="button" class="icon-btn" id="openSettingsBtn" title="Threads & account" aria-label="Open conversations and account">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" class="topbar-settings__dots" aria-hidden="true">
+          <circle cx="12" cy="5" r="1.85"></circle>
+          <circle cx="12" cy="12" r="1.85"></circle>
+          <circle cx="12" cy="19" r="1.85"></circle>
+        </svg>
+      </button>
     </header>
 
     <main class="thread" id="messages" role="log" aria-live="polite">
@@ -151,14 +85,6 @@
           ></textarea>
         </div>
         <div class="composer-actions">
-          <!--
-          Voice button is temporarily disabled; keep markup for quick restore.
-          <button type="button" id="micBtn" class="composer-fab composer-fab--mic" title="Start voice dictation" aria-label="Start voice dictation">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" aria-hidden="true">
-              <rect x="9" y="3" width="6" height="11" rx="3"></rect><path d="M5 11a7 7 0 0 0 14 0"></path><path d="M12 18v3"></path><path d="M8 21h8"></path>
-            </svg>
-          </button>
-          -->
           <button type="button" id="sendBtn" class="composer-fab send-fab" title="Send" aria-label="Send">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
               <path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>
@@ -167,6 +93,95 @@
         </div>
       </div>
     </footer>
+
+    <div id="authGate" class="fullscreen-gate" hidden>
+      <div class="fullscreen-gate__backdrop" aria-hidden="true"></div>
+      <div class="fullscreen-gate__panel" role="region" aria-label="Sign in required">
+        <p class="fullscreen-gate__kicker">Extension</p>
+        <h1 class="fullscreen-gate__title">Sign in to continue</h1>
+        <p class="fullscreen-gate__desc">
+          Connect with your Logistic Copilot organization to use freight tools and synced conversations in this panel.
+        </p>
+        <button type="button" class="btn-primary fullscreen-gate__cta" id="authGateSignInBtn">Sign in</button>
+        <p class="fullscreen-gate__hint">
+          Tap ⋯ for conversations. Settings in the drawer covers appearance; use &ldquo;API &amp; environment&rdquo; there for dev URLs
+          (opens Chrome extension options). Sign in when you are ready.
+        </p>
+      </div>
+    </div>
+
+    <div id="settingsFullscreen" class="fullscreen-settings" hidden>
+      <div class="fullscreen-settings__scrim" id="settingsFullscreenScrim" aria-hidden="true"></div>
+      <div
+        class="fullscreen-settings__sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settingsFullscreenTitle"
+      >
+        <div class="fullscreen-settings__header">
+          <h2 class="fullscreen-settings__title" id="settingsFullscreenTitle">Settings</h2>
+          <button type="button" class="icon-btn" id="settingsFullscreenClose" title="Close" aria-label="Close settings">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M18 6L6 18M6 6l12 12"></path>
+            </svg>
+          </button>
+        </div>
+        <div class="fullscreen-settings__scroll">
+          <section class="settings-section" id="settingsSectionAppearance" aria-label="Appearance">
+            <button type="button" class="settings-theme-row" id="settingsThemeBtn">
+              <span class="settings-theme-row__icon" id="settingsThemeIconWrap" aria-hidden="true"></span>
+              <span class="settings-theme-row__text">
+                <span class="settings-theme-row__label" id="settingsThemeLabel">Appearance</span>
+                <span class="settings-theme-row__desc" id="settingsThemeDesc">Switch light / dark</span>
+              </span>
+            </button>
+          </section>
+
+          <section class="settings-section" id="settingsSectionPageContext" aria-label="Page context">
+            <h3 class="settings-section__heading">Page context</h3>
+            <p class="settings-section__lede">
+              When on, the agent may use a snapshot of the active tab as optional context — same as &ldquo;Use in chat&rdquo; on the card
+              above the thread.
+            </p>
+            <label class="settings-toggle-row">
+              <span class="settings-toggle-row__label">Use in chat</span>
+              <input type="checkbox" id="settingsUsePageContextToggle" class="settings-toggle-row__input" checked />
+            </label>
+          </section>
+
+          <section class="settings-section" id="settingsSectionKeyboard" aria-label="Keyboard">
+            <h3 class="settings-section__heading">Keyboard</h3>
+            <p class="settings-section__lede">
+              Press <kbd class="settings-kbd">Esc</kbd> to close the conversations drawer or this settings screen.
+            </p>
+          </section>
+
+          <section class="settings-section" id="settingsSectionPrivacy" aria-label="Privacy">
+            <h3 class="settings-section__heading">Privacy</h3>
+            <p class="settings-section__lede">
+              <a
+                id="settingsPrivacyLink"
+                class="settings-text-link"
+                href="https://logisticopilot.com/privacy-policy"
+                target="_blank"
+                rel="noopener noreferrer"
+                >Privacy &amp; how we use data</a>
+              — opens in a new tab on your configured dashboard host.
+            </p>
+          </section>
+
+          <section class="settings-section" id="settingsSectionAccount" aria-label="Account">
+            <h3 class="settings-section__heading">Account</h3>
+            <p class="settings-section__lede" id="settingsAccountHelp"></p>
+            <button type="button" class="btn-settings-secondary" id="settingsOpenDashboardBtn">Open dashboard</button>
+            <button type="button" class="btn-settings-secondary" id="settingsOpenExtensionOptionsBtn">API &amp; environment…</button>
+            <button type="button" class="btn-settings-signout" id="settingsLogoutBtn">Sign out</button>
+          </section>
+
+          <p class="settings-footer-version" id="settingsExtensionVersion"></p>
+        </div>
+      </div>
+    </div>
 
     <div id="chatPicker" class="chat-picker" hidden>
       <button type="button" class="chat-picker-backdrop" id="chatPickerBackdrop" aria-label="Close conversations drawer"></button>
@@ -193,7 +208,148 @@
           <div id="chatPickerList" class="chat-picker-list" role="listbox" aria-label="Conversation list"></div>
           <p id="chatPickerStatus" class="chat-picker-status" hidden></p>
         </div>
+        <footer class="chat-picker-footer">
+          <div class="chat-picker-account-wrap">
+            <div class="chat-picker-account-row" role="group" aria-label="Account">
+              <div class="chat-picker-account-copy">
+                <p class="chat-picker-account-title" id="chatPickerAccountTitle">Signed out</p>
+                <p class="chat-picker-account-meta" id="chatPickerAccountMeta"></p>
+              </div>
+              <div class="chat-picker-account-actions">
+                <button
+                  type="button"
+                  class="chat-picker-account-icon-btn"
+                  id="chatPickerSettingsBtn"
+                  title="Settings"
+                  aria-label="Open settings"
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" aria-hidden="true">
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M12 15a3 3 0 100-6 3 3 0 000 6z"
+                    />
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M19.4 15a1.65 1.65 0 00.33 1.82v0l.06.06a2 2 0 01-2.83 2.83l-.06-.06v0a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33v0l-.06.06a2 2 0 01-3-3v0l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82v0l-.06-.06a2 2 0 013-3v0l.06.06a1.65 1.65 0 001.82.33h0a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33v0l.06-.06a2 2 0 013 3v0l-.06.06a1.65 1.65 0 00-.33 1.82v0a1.65 1.65 0 001 1.51H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"
+                    />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="chat-picker-account-icon-btn chat-picker-account-icon-btn--logout"
+                  id="chatPickerLogoutBtn"
+                  title="Log out"
+                  aria-label="Log out"
+                  hidden
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                    <polyline points="16 17 21 12 16 7" />
+                    <line x1="21" y1="12" x2="9" y2="12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </footer>
       </aside>
+    </div>
+
+    <div id="agentStories" class="agent-stories" hidden>
+      <button type="button" class="agent-stories__backdrop" id="agentStoriesBackdrop" aria-label="Close stories"></button>
+      <div
+        class="agent-stories__frame"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="agentStoriesHeading"
+      >
+        <div class="agent-stories__top">
+          <p class="agent-stories__eyebrow" id="agentStoriesHeading">About this agent</p>
+          <div class="agent-stories__ticks" id="agentStoriesTicks" aria-hidden="true"></div>
+          <button type="button" class="icon-btn agent-stories__close" id="agentStoriesClose" title="Close" aria-label="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M18 6L6 18M6 6l12 12"></path>
+            </svg>
+          </button>
+        </div>
+        <div class="agent-stories__viewport" id="agentStoriesViewport">
+          <div class="agent-stories__rail" id="agentStoriesRail">
+            <article class="agent-stories__slide agent-stories__slide--accent1">
+              <p class="agent-stories__badge">Briefing</p>
+              <h2 class="agent-stories__slide-title">Your freight-aware copilot lives here.</h2>
+              <p class="agent-stories__slide-copy">
+                This panel runs the same Logistic Copilot brain your org uses on the web — geared for quoting, trucking ops, email
+                follow-ups and quick answers inside Chrome.
+              </p>
+              <span class="agent-stories__slide-foot">1 / 6</span>
+            </article>
+            <article class="agent-stories__slide agent-stories__slide--accent2">
+              <p class="agent-stories__badge">Tools</p>
+              <h2 class="agent-stories__slide-title">Turn threads into workflows.</h2>
+              <p class="agent-stories__slide-copy">
+                Ask for load boards, summaries, timelines, rerates, paperwork — inline tool badges show exactly what fired and what came
+                back, so you audit every hop.
+              </p>
+              <span class="agent-stories__slide-foot">2 / 6</span>
+            </article>
+            <article class="agent-stories__slide agent-stories__slide--accent3">
+              <p class="agent-stories__badge">Mail & replies</p>
+              <h2 class="agent-stories__slide-title">Let it read the hallway traffic.</h2>
+              <p class="agent-stories__slide-copy">
+                Tie in Outlook-ready flows to scan carrier replies, resurrect stale conversations, draft follow-ups faster than tab
+                tennis — scoped to whatever your admin enables.
+              </p>
+              <span class="agent-stories__slide-foot">3 / 6</span>
+            </article>
+            <article class="agent-stories__slide agent-stories__slide--accent4">
+              <p class="agent-stories__badge">Quotes & tokens</p>
+              <h2 class="agent-stories__slide-title">Trace deals down to shipment IDs.</h2>
+              <p class="agent-stories__slide-copy">
+                Mention a quote token and the assistant can steer you toward dashboard deep links — perfect when you forgot which tab had
+                the winning bid.
+              </p>
+              <span class="agent-stories__slide-foot">4 / 6</span>
+            </article>
+            <article class="agent-stories__slide agent-stories__slide--accent5">
+              <p class="agent-stories__badge">Live web page</p>
+              <h2 class="agent-stories__slide-title">This tab can ride along.</h2>
+              <p class="agent-stories__slide-copy">
+                Flip “Use in chat” on the snapshot card whenever you want the model grounded in HTML you’re staring at — great for TMS
+                pages, tenders, spreadsheets-in-the-browser vibes.
+              </p>
+              <span class="agent-stories__slide-foot">5 / 6</span>
+            </article>
+            <article class="agent-stories__slide agent-stories__slide--accent6">
+              <p class="agent-stories__badge">Control room</p>
+              <h2 class="agent-stories__slide-title">Pick up where you parked.</h2>
+              <p class="agent-stories__slide-copy">
+                Tap ⋯ to swap threads synced with the cloud, open Settings for appearance, keep sessions tidy — then slam the logo again
+                whenever you onboard a teammate.
+              </p>
+              <span class="agent-stories__slide-foot">6 / 6</span>
+            </article>
+          </div>
+          <div class="agent-stories__zones" aria-hidden="true">
+            <button
+              type="button"
+              tabindex="-1"
+              class="agent-stories__zone agent-stories__zone--prev"
+              id="agentStoriesPrev"
+              title="Previous"
+            ></button>
+            <button
+              type="button"
+              tabindex="-1"
+              class="agent-stories__zone agent-stories__zone--next"
+              id="agentStoriesNext"
+              title="Next"
+            ></button>
+          </div>
+        </div>
+        <p class="agent-stories__nav-hint"><span aria-hidden="true">← →</span> tap sides · swipe · Esc</p>
+      </div>
     </div>
   </div>
 

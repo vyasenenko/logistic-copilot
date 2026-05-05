@@ -37,8 +37,11 @@ from app.services.email_correlation import attach_quote_token, extract_quote_tok
 from app.services.document_ocr import extract_document_content
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import format_ready_at_wall_display, local_date_iso_in_zone
-from app.services.outlook import OutlookGraphClient
-from app.services.tms_connector import TmsConnector
+from app.services.outlook_organization import (
+    build_outlook_graph_client_for_shipment,
+    organization_outlook_mailbox,
+)
+from app.services.tms_connector import build_tms_connector
 
 
 DOCUMENT_TYPE_RULES = (
@@ -143,7 +146,7 @@ async def deliver_customer_thread_email(
     if dry_run:
         return delivery_payload
 
-    outlook = OutlookGraphClient()
+    outlook = await build_outlook_graph_client_for_shipment(session, shipment)
     if anchor is not None:
         try:
             await outlook.reply_to_message(
@@ -794,32 +797,39 @@ def _serialize_bid(bid: CarrierBid, carrier: Carrier) -> BidRecord:
     )
 
 
-async def _resolve_shipment(session: AsyncSession, request: BidIntakeRequest) -> Shipment:
+async def _resolve_shipment(session: AsyncSession, request: BidIntakeRequest, *, organization_id=None) -> Shipment:
     shipment = None
     if request.shipment_id:
         shipment = await session.get(Shipment, UUID(request.shipment_id))
     elif request.subject:
         quote_token = extract_quote_token(request.subject)
         if quote_token:
-            shipment = await session.scalar(select(Shipment).where(Shipment.quote_token == quote_token))
+            conditions = [Shipment.quote_token == quote_token]
+            if organization_id is not None:
+                conditions.append(Shipment.organization_id == organization_id)
+            shipment = await session.scalar(select(Shipment).where(*conditions))
 
-    if shipment is None:
+    if shipment is None or (organization_id is not None and shipment.organization_id != organization_id):
         raise RuntimeError("Shipment not found for bid intake")
     return shipment
 
 
-async def _resolve_carrier(session: AsyncSession, request: BidIntakeRequest) -> tuple[Carrier, bool]:
+async def _resolve_carrier(session: AsyncSession, request: BidIntakeRequest, *, organization_id) -> tuple[Carrier, bool]:
     carrier = None
     created = False
     if request.carrier_id:
         carrier = await session.get(Carrier, UUID(request.carrier_id))
     elif request.carrier_email:
         carrier = await session.scalar(
-            select(Carrier).where(Carrier.email == request.carrier_email.lower())
+            select(Carrier).where(
+                Carrier.organization_id == organization_id,
+                Carrier.email == request.carrier_email.lower(),
+            )
         )
 
     if carrier is None and request.create_carrier_if_missing and request.carrier_email:
         carrier = Carrier(
+            organization_id=organization_id,
             name=_display_name_from_email(request.carrier_email),
             email=request.carrier_email.lower(),
             rating=0,
@@ -838,18 +848,19 @@ async def _resolve_carrier(session: AsyncSession, request: BidIntakeRequest) -> 
     return carrier, created
 
 
-async def intake_bid(session: AsyncSession, request: BidIntakeRequest) -> BidIntakeResponse:
+async def intake_bid(session: AsyncSession, request: BidIntakeRequest, *, organization_id=None) -> BidIntakeResponse:
     """Create or update a carrier bid from a reply/manual intake payload."""
-    shipment = await _resolve_shipment(session, request)
-    carrier, created_carrier = await _resolve_carrier(session, request)
+    shipment = await _resolve_shipment(session, request, organization_id=organization_id)
+    carrier, created_carrier = await _resolve_carrier(session, request, organization_id=shipment.organization_id)
 
     created_email_message = False
     email_message_id = UUID(request.email_message_id) if request.email_message_id else None
     if email_message_id is None and shipment.email_thread_id:
         email_message = EmailMessage(
+            organization_id=shipment.organization_id,
             thread_id=shipment.email_thread_id,
             sender=carrier.email,
-            recipients_json=[settings.microsoft_mailbox or "unknown"],
+            recipients_json=[await organization_outlook_mailbox(session, shipment.organization_id)],
             direction="inbound",
             subject=request.subject or attach_quote_token("Carrier bid response", shipment.quote_token or "Q-UNKNOWN"),
             body_preview=request.raw_email[:1000],
@@ -873,6 +884,7 @@ async def intake_bid(session: AsyncSession, request: BidIntakeRequest) -> BidInt
     now = datetime.now(timezone.utc)
     if bid is None:
         bid = CarrierBid(
+            organization_id=shipment.organization_id,
             shipment_id=shipment.id,
             carrier_id=carrier.id,
             email_message_id=email_message_id,
@@ -897,6 +909,7 @@ async def intake_bid(session: AsyncSession, request: BidIntakeRequest) -> BidInt
     shipment.status = ShipmentStage.WAITING_BIDS.value
     shipment.updated_at = now
     bid_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.BID_RECEIVED.value,
         stage=shipment.status,
@@ -1003,8 +1016,9 @@ async def send_client_acknowledgement(
     if shipment.email_thread_id:
         session.add(
             EmailMessage(
+                organization_id=shipment.organization_id,
                 thread_id=shipment.email_thread_id,
-                sender=settings.microsoft_mailbox or "unknown",
+                sender=await organization_outlook_mailbox(session, shipment.organization_id),
                 recipients_json=[client.email],
                 direction="outbound",
                 subject=subject,
@@ -1021,6 +1035,7 @@ async def send_client_acknowledgement(
     shipment.status = ShipmentStage.CLIENT_ACKNOWLEDGED.value
     shipment.updated_at = datetime.now(timezone.utc)
     ack_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.CLIENT_ACK_SENT.value,
         stage=shipment.status,
@@ -1079,6 +1094,7 @@ async def evaluate_shipment_bids(session: AsyncSession, shipment_id: UUID) -> Sh
     margin_amount = _margin_amount(winner_bid.amount or 0, dict(shipment.margin_policy_json or {}))
     recommended_quote = round((winner_bid.amount or 0) + margin_amount, 2)
     eval_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.EVALUATION_COMPLETED.value,
         stage=shipment.status,
@@ -1197,8 +1213,9 @@ async def send_customer_quote(
     if shipment.email_thread_id and not dry_run:
         session.add(
             EmailMessage(
+                organization_id=shipment.organization_id,
                 thread_id=shipment.email_thread_id,
-                sender=settings.microsoft_mailbox or "unknown",
+                sender=await organization_outlook_mailbox(session, shipment.organization_id),
                 recipients_json=[client.email],
                 direction="outbound",
                 subject=subject,
@@ -1217,6 +1234,7 @@ async def send_customer_quote(
     )
     shipment.updated_at = datetime.now(timezone.utc)
     quote_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.CLIENT_QUOTE_SENT.value,
         stage=shipment.status,
@@ -1318,7 +1336,7 @@ async def handoff_to_tms(
         "document_context": document_context,
     }
 
-    connector = TmsConnector()
+    connector = await build_tms_connector(session, shipment.organization_id)
     response_payload: dict = {}
     status = "preview"
     policy_mode = settings.document_booking_policy_default.strip().lower()
@@ -1338,6 +1356,7 @@ async def handoff_to_tms(
             shipment.updated_at = datetime.now(timezone.utc)
             await session.commit()
             await freight_realtime_hub.publish_shipment_updated(
+                organization_id=shipment.organization_id,
                 shipment_id=str(shipment.id),
                 fields=["status"],
             )
@@ -1354,6 +1373,7 @@ async def handoff_to_tms(
                 shipment.status = ShipmentStage.BOOKING_FAILED.value
                 shipment.updated_at = datetime.now(timezone.utc)
                 handoff_exc_evt = WorkflowEvent(
+                    organization_id=shipment.organization_id,
                     shipment_id=shipment.id,
                     event_type=WorkflowEventType.EXCEPTION_RAISED.value,
                     stage=shipment.status,
@@ -1381,6 +1401,7 @@ async def handoff_to_tms(
         latest_review_payload = dict((latest_review.payload_json or {}) if latest_review else {})
         if latest_review_payload.get("reason") != "booking_documents_review_required":
             booking_review_evt = WorkflowEvent(
+                organization_id=shipment.organization_id,
                 shipment_id=shipment.id,
                 event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
                 stage=shipment.status,
@@ -1402,6 +1423,7 @@ async def handoff_to_tms(
             )
             session.add(booking_review_evt)
     handoff_sent_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.TMS_HANDOFF_SENT.value,
         stage=shipment.status,
@@ -1518,8 +1540,9 @@ async def send_booking_confirmation(
     if shipment.email_thread_id:
         session.add(
             EmailMessage(
+                organization_id=shipment.organization_id,
                 thread_id=shipment.email_thread_id,
-                sender=settings.microsoft_mailbox or "unknown",
+                sender=await organization_outlook_mailbox(session, shipment.organization_id),
                 recipients_json=[client.email],
                 direction="outbound",
                 subject=subject,
@@ -1534,7 +1557,10 @@ async def send_booking_confirmation(
         )
 
     await session.commit()
-    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+    await freight_realtime_hub.publish_shipment_updated(
+        organization_id=shipment.organization_id,
+        shipment_id=str(shipment.id),
+    )
 
     return BookingConfirmationResponse(
         shipment_id=str(shipment.id),
@@ -1556,7 +1582,7 @@ async def fetch_tms_shipment_status(
         raise RuntimeError("Shipment not found")
 
     shipment_key = shipment.quote_token or str(shipment.id)
-    connector = TmsConnector()
+    connector = await build_tms_connector(session, shipment.organization_id)
     payload = await connector.fetch_shipment_status(shipment_key)
     audit_payload = _build_status_audit_payload(
         kind="lookup",
@@ -1568,6 +1594,7 @@ async def fetch_tms_shipment_status(
         extra=payload,
     )
     lookup_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.TMS_STATUS_LOOKUP.value,
         stage=shipment.status,
@@ -1683,8 +1710,9 @@ async def send_customer_status_reply(
     if shipment.email_thread_id:
         session.add(
             EmailMessage(
+                organization_id=shipment.organization_id,
                 thread_id=shipment.email_thread_id,
-                sender=settings.microsoft_mailbox or "unknown",
+                sender=await organization_outlook_mailbox(session, shipment.organization_id),
                 recipients_json=[client.email],
                 direction="outbound",
                 subject=subject,
@@ -1703,6 +1731,7 @@ async def send_customer_status_reply(
         )
 
     reply_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.CUSTOMER_STATUS_SENT.value,
         stage=shipment.status,
@@ -1749,7 +1778,7 @@ async def push_carrier_status_to_tms(
     if shipment is None:
         raise RuntimeError("Shipment not found")
     shipment_key = shipment.quote_token or str(shipment.id)
-    connector = TmsConnector()
+    connector = await build_tms_connector(session, shipment.organization_id)
     payload = await connector.push_shipment_update(
         shipment_key,
         status_text=status_text,
@@ -1758,6 +1787,7 @@ async def push_carrier_status_to_tms(
         notes=notes,
     )
     push_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
         stage=shipment.status,
@@ -1806,6 +1836,7 @@ async def preview_or_push_carrier_status_update(
 
     if dry_run:
         preview_evt = WorkflowEvent(
+            organization_id=shipment.organization_id,
             shipment_id=shipment.id,
             event_type=WorkflowEventType.TMS_STATUS_UPDATED.value,
             stage=shipment.status,

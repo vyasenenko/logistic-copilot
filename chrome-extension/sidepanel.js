@@ -3,38 +3,68 @@ const userInput = document.getElementById('userInput');
 const composerPlaceholderGhost = document.getElementById('composerPlaceholderGhost');
 const sendBtn = document.getElementById('sendBtn');
 const micBtn = document.getElementById('micBtn');
-const apiBaseInput = document.getElementById('apiBaseInput');
-const saveApiBtn = document.getElementById('saveApiBtn');
-const frontendBaseInput = document.getElementById('frontendBaseInput');
-const saveFrontendBtn = document.getElementById('saveFrontendBtn');
-const menuClearBtn = document.getElementById('menuClearBtn');
-const menuNewChatBtn = document.getElementById('menuNewChatBtn');
-const menuChatsBtn = document.getElementById('menuChatsBtn');
-const menuThemeBtn = document.getElementById('menuThemeBtn');
-const menuThemeIconWrap = document.getElementById('menuThemeIconWrap');
-const menuThemeDesc = document.getElementById('menuThemeDesc');
-const topbarMenu = document.getElementById('topbarMenu');
-const topbarMenuTrigger = document.getElementById('topbarMenuTrigger');
-const pageContextTitleEl = document.getElementById('pageContextTitle');
-const pageContextMetaEl = document.getElementById('pageContextMeta');
-const refreshPageContextBtn = document.getElementById('refreshPageContextBtn');
-const usePageContextToggle = document.getElementById('usePageContextToggle');
+const openSettingsBtn = document.getElementById('openSettingsBtn');
+const settingsFullscreen = document.getElementById('settingsFullscreen');
+const settingsFullscreenScrim = document.getElementById('settingsFullscreenScrim');
+const settingsFullscreenClose = document.getElementById('settingsFullscreenClose');
+const settingsLogoutBtn = document.getElementById('settingsLogoutBtn');
+const settingsOpenDashboardBtn = document.getElementById('settingsOpenDashboardBtn');
+const settingsOpenExtensionOptionsBtn = document.getElementById('settingsOpenExtensionOptionsBtn');
+const settingsUsePageContextToggle = document.getElementById('settingsUsePageContextToggle');
+const settingsPrivacyLink = document.getElementById('settingsPrivacyLink');
+const settingsAccountHelp = document.getElementById('settingsAccountHelp');
+const settingsExtensionVersion = document.getElementById('settingsExtensionVersion');
+const settingsThemeBtn = document.getElementById('settingsThemeBtn');
+const settingsThemeIconWrap = document.getElementById('settingsThemeIconWrap');
+const settingsThemeDesc = document.getElementById('settingsThemeDesc');
+const authGate = document.getElementById('authGate');
+const authGateSignInBtn = document.getElementById('authGateSignInBtn');
 const chatPicker = document.getElementById('chatPicker');
 const chatPickerBackdrop = document.getElementById('chatPickerBackdrop');
 const chatPickerClose = document.getElementById('chatPickerClose');
 const newChatBtn = document.getElementById('newChatBtn');
 const chatPickerList = document.getElementById('chatPickerList');
 const chatPickerStatus = document.getElementById('chatPickerStatus');
+const chatPickerAccountTitle = document.getElementById('chatPickerAccountTitle');
+const chatPickerAccountMeta = document.getElementById('chatPickerAccountMeta');
+const chatPickerSettingsBtn = document.getElementById('chatPickerSettingsBtn');
+const chatPickerLogoutBtn = document.getElementById('chatPickerLogoutBtn');
+const openAgentStoriesBtn = document.getElementById('openAgentStoriesBtn');
+const agentStories = document.getElementById('agentStories');
+const agentStoriesBackdrop = document.getElementById('agentStoriesBackdrop');
+const agentStoriesClose = document.getElementById('agentStoriesClose');
+const agentStoriesViewport = document.getElementById('agentStoriesViewport');
+const agentStoriesRail = document.getElementById('agentStoriesRail');
+const agentStoriesTicks = document.getElementById('agentStoriesTicks');
+const agentStoriesPrev = document.getElementById('agentStoriesPrev');
+const agentStoriesNext = document.getElementById('agentStoriesNext');
 
 const STORAGE_MESSAGES = 'assistant_messages';
 const STORAGE_API_BASE = 'api_base_url';
+const STORAGE_AUTH_TOKEN = 'auth_token';
 const STORAGE_FRONTEND_BASE = 'frontend_base_url';
 const STORAGE_CONVERSATION = 'conversation_id';
 const STORAGE_THEME = 'ui_theme';
 const STORAGE_USE_PAGE_CONTEXT = 'use_page_context';
 const DEFAULT_API_BASE = 'https://api.logisticopilot.com';
 const DEFAULT_FRONTEND_BASE = 'https://logisticopilot.com';
+
+/** @type {Map<string, number>} */
+const conversationDeleteArmExpiry = new Map();
+/** @type {Map<string, ReturnType<typeof setTimeout>>} */
+const conversationDeleteArmTimers = new Map();
+/** Bumps whenever a concurrent `updateAuthMenuState()` run must be discarded (nested clearSession, fast re-login). */
+let _authMenuFetchGen = 0;
 const CHAT_PICKER_TRANSITION_MS = 260;
+
+/** Normalize stored URL for comparison (trim, strip trailing slashes). */
+function normalizeEnvUrl(url, fallback) {
+  const t = String(url || '')
+    .trim()
+    .replace(/\/+$/, '');
+  return t || fallback;
+}
+
 /** Default two lines: 14.5px * 1.45 * 2 + padding 11+10 ≈ 64px */
 const COMPOSER_TEXTAREA_MIN_PX = 64;
 /** Max height when draft grows (several lines). */
@@ -302,21 +332,46 @@ const THEME_ICON_SUN =
 const THEME_ICON_MOON =
   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
 
-function closeTopbarMenu() {
-  if (topbarMenu instanceof HTMLDetailsElement) topbarMenu.open = false;
+function closeSettingsFullscreen() {
+  if (settingsFullscreen) settingsFullscreen.setAttribute('hidden', '');
+}
+
+/** @param {{ section?: 'appearance' }} [opts] */
+function openSettingsFullscreen(opts) {
+  if (!settingsFullscreen) return;
+  loadFrontendBase((fb) => {
+    currentFrontendBase = fb;
+    const base = (fb || DEFAULT_FRONTEND_BASE).replace(/\/$/, '');
+    if (settingsPrivacyLink instanceof HTMLAnchorElement) {
+      settingsPrivacyLink.href = `${base}/privacy-policy`;
+    }
+  });
+  loadUsePageContext((enabled) => {
+    const s = settingsUsePageContextToggle;
+    if (s instanceof HTMLInputElement) s.checked = enabled;
+  });
+  settingsFullscreen.removeAttribute('hidden');
+  settingsFullscreenClose?.focus({ preventScroll: true });
+  const section = opts?.section === 'appearance' ? 'settingsSectionAppearance' : '';
+  if (section) {
+    queueMicrotask(() => {
+      document.getElementById(section)?.scrollIntoView({ block: 'start', behavior: 'instant' });
+    });
+  }
+  void syncSettingsAccountSection();
 }
 
 function updateThemeButton(theme) {
   const isLight = theme === 'light';
   const icon = isLight ? THEME_ICON_MOON : THEME_ICON_SUN;
-  if (menuThemeIconWrap) menuThemeIconWrap.innerHTML = icon;
+  if (settingsThemeIconWrap) settingsThemeIconWrap.innerHTML = icon;
   const title = isLight ? 'Switch to dark theme' : 'Switch to light theme';
-  if (menuThemeBtn) {
-    menuThemeBtn.title = title;
-    menuThemeBtn.setAttribute('aria-label', title);
+  if (settingsThemeBtn) {
+    settingsThemeBtn.title = title;
+    settingsThemeBtn.setAttribute('aria-label', title);
   }
-  if (menuThemeDesc) {
-    menuThemeDesc.textContent = isLight ? 'Light theme — tap to use dark' : 'Dark theme — tap to use light';
+  if (settingsThemeDesc) {
+    settingsThemeDesc.textContent = isLight ? 'Light theme — tap to use dark' : 'Dark theme — tap to use light';
   }
 }
 
@@ -333,14 +388,14 @@ function initTheme() {
     const t = r[STORAGE_THEME] === 'light' ? 'light' : 'dark';
     applyTheme(t, false);
   });
-  menuThemeBtn?.addEventListener('click', () => {
+  settingsThemeBtn?.addEventListener('click', () => {
     const cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
     applyTheme(cur === 'light' ? 'dark' : 'light', true);
-    closeTopbarMenu();
   });
 }
 
 initTheme();
+initSettingsFooterVersion();
 
 function getTime() {
   return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -366,6 +421,124 @@ function loadFrontendBase(callback) {
 function saveFrontendBase(url, callback) {
   const trimmed = (url || '').trim().replace(/\/$/, '') || DEFAULT_FRONTEND_BASE;
   chrome.storage.local.set({ [STORAGE_FRONTEND_BASE]: trimmed }, () => callback(trimmed));
+}
+
+/** How long delete stays “armed” after first tap before resetting. */
+const DELETE_CONFIRM_MS = 5000;
+
+function disarmConversationDelete(id) {
+  const tid = conversationDeleteArmTimers.get(id);
+  if (tid != null) clearTimeout(tid);
+  conversationDeleteArmTimers.delete(id);
+  conversationDeleteArmExpiry.delete(id);
+}
+
+function clearConversationDeleteArms() {
+  for (const tid of conversationDeleteArmTimers.values()) {
+    if (tid != null) clearTimeout(tid);
+  }
+  conversationDeleteArmTimers.clear();
+  conversationDeleteArmExpiry.clear();
+}
+
+/** @param {Element} delWrap .chat-picker-delete-wrap */
+function setDeleteArmCountdownRunning(delWrap, running) {
+  const cd = delWrap.querySelector('.chat-picker-delete-countdown');
+  const delBtn = delWrap.querySelector('.chat-picker-row-delete-icon');
+  if (!cd || !(delBtn instanceof HTMLButtonElement)) return;
+  if (running) {
+    delBtn.classList.add('chat-picker-row-delete-icon--armed');
+    cd.style.setProperty('--delete-arm-duration', `${DELETE_CONFIRM_MS}ms`);
+    cd.classList.remove('chat-picker-delete-countdown--running');
+    void cd.offsetWidth;
+    cd.classList.add('chat-picker-delete-countdown--running');
+  } else {
+    cd.classList.remove('chat-picker-delete-countdown--running');
+    delBtn.classList.remove('chat-picker-row-delete-icon--armed');
+    cd.style.animation = 'none';
+    void cd.offsetWidth;
+    cd.style.animation = '';
+  }
+}
+
+let agentStoriesTickRaf = 0;
+
+function getAgentStoriesSlideCount() {
+  return agentStoriesRail?.querySelectorAll('.agent-stories__slide').length ?? 0;
+}
+
+function rebuildAgentStoriesTicks() {
+  if (!agentStoriesTicks || !agentStoriesRail) return;
+  const n = getAgentStoriesSlideCount();
+  agentStoriesTicks.innerHTML = '';
+  for (let i = 0; i < n; i += 1) {
+    const t = document.createElement('span');
+    t.className = 'agent-stories__tick';
+    agentStoriesTicks.appendChild(t);
+  }
+}
+
+function getAgentStoriesIndex() {
+  if (!agentStoriesViewport) return 0;
+  const w = agentStoriesViewport.clientWidth;
+  const max = Math.max(0, getAgentStoriesSlideCount() - 1);
+  if (w <= 0) return 0;
+  const raw = Math.round(agentStoriesViewport.scrollLeft / w);
+  return Math.min(max, Math.max(0, raw));
+}
+
+function syncAgentStoriesTicks() {
+  if (!agentStoriesTicks) return;
+  const ticks = agentStoriesTicks.querySelectorAll('.agent-stories__tick');
+  const idx = getAgentStoriesIndex();
+  ticks.forEach((el, i) => {
+    el.classList.toggle('agent-stories__tick--done', i < idx);
+    el.classList.toggle('agent-stories__tick--active', i === idx);
+  });
+}
+
+function scheduleAgentStoriesTicksSync() {
+  if (!agentStoriesViewport || !agentStoriesTicks) return;
+  if (agentStoriesTickRaf) cancelAnimationFrame(agentStoriesTickRaf);
+  agentStoriesTickRaf = requestAnimationFrame(() => {
+    agentStoriesTickRaf = 0;
+    syncAgentStoriesTicks();
+  });
+}
+
+/** @param {number} delta +1 next, -1 previous (wraps) */
+function stepAgentStories(delta) {
+  const n = getAgentStoriesSlideCount();
+  if (n <= 0 || !agentStoriesViewport) return;
+  const w = agentStoriesViewport.clientWidth;
+  if (w <= 0) return;
+  let idx = getAgentStoriesIndex();
+  idx = ((idx + delta) % n + n) % n;
+  agentStoriesViewport.scrollTo({ left: idx * w, behavior: 'smooth' });
+  scheduleAgentStoriesTicksSync();
+}
+
+function openAgentStories() {
+  if (!agentStories) return;
+  rebuildAgentStoriesTicks();
+  agentStories.removeAttribute('hidden');
+  agentStories.setAttribute('aria-hidden', 'false');
+  if (openAgentStoriesBtn) openAgentStoriesBtn.setAttribute('aria-expanded', 'true');
+  if (agentStoriesViewport) {
+    agentStoriesViewport.scrollLeft = 0;
+    queueMicrotask(() => scheduleAgentStoriesTicksSync());
+  }
+  queueMicrotask(() => agentStoriesClose?.focus({ preventScroll: true }));
+}
+
+function closeAgentStories() {
+  if (!agentStories) return;
+  agentStories.setAttribute('hidden', '');
+  agentStories.setAttribute('aria-hidden', 'true');
+  if (openAgentStoriesBtn) {
+    openAgentStoriesBtn.setAttribute('aria-expanded', 'false');
+    openAgentStoriesBtn.focus({ preventScroll: true });
+  }
 }
 
 function loadConversationId(callback) {
@@ -434,6 +607,55 @@ function clearThreadTurns() {
   messagesEl.querySelectorAll('article.turn').forEach((el) => el.remove());
 }
 
+const PAGE_CONTEXT_CARD_HTML = `
+<section class="page-context-card" id="pageContextCard" aria-live="polite">
+  <div class="page-context-copy">
+    <p class="page-context-kicker">Current page</p>
+    <p class="page-context-title" id="pageContextTitle">Connecting current tab…</p>
+    <p class="page-context-meta" id="pageContextMeta">Page context will stay available as optional agent context.</p>
+  </div>
+  <div class="page-context-actions">
+    <label class="page-context-toggle">
+      <input type="checkbox" id="usePageContextToggle" checked />
+      <span>Use in chat</span>
+    </label>
+    <button type="button" class="page-context-refresh" id="refreshPageContextBtn">Refresh</button>
+  </div>
+</section>`;
+
+/** Recreate Current page card when older builds cleared #messages entirely. */
+function ensurePageContextCard() {
+  if (document.getElementById('pageContextCard')) return;
+  messagesEl.insertAdjacentHTML('afterbegin', PAGE_CONTEXT_CARD_HTML.trim());
+  chrome.storage.local.get([STORAGE_USE_PAGE_CONTEXT], (result) => {
+    const enabled = result[STORAGE_USE_PAGE_CONTEXT] !== false;
+    const el = document.getElementById('usePageContextToggle');
+    if (el instanceof HTMLInputElement) el.checked = enabled;
+    const st = settingsUsePageContextToggle;
+    if (st instanceof HTMLInputElement) st.checked = enabled;
+  });
+}
+
+/** Same starter copy as initial sidepanel markup after clearing thread turns. */
+function appendWelcomeStarterTurn() {
+  const article = document.createElement('article');
+  article.className = 'turn turn--assistant';
+  const flow = document.createElement('div');
+  flow.className = 'assistant-flow';
+  const md = document.createElement('div');
+  md.className = 'markdown-body welcome';
+  md.innerHTML =
+    '<p>Connected to <strong>LogistiCopilot</strong>. Tool calls appear <strong>inline</strong> where the model invoked them.</p>';
+  flow.appendChild(md);
+  article.appendChild(flow);
+  const meta = document.createElement('time');
+  meta.className = 'turn-meta';
+  meta.textContent = getTime();
+  article.appendChild(meta);
+  messagesEl.appendChild(article);
+  scrollToBottom();
+}
+
 /** @param {string | undefined} iso */
 function parseMessageTime(iso) {
   if (!iso || typeof iso !== 'string') return getTime();
@@ -455,8 +677,13 @@ function formatListDate(iso) {
 
 /** @param {string} apiBase @param {AbortSignal} signal */
 async function fetchConversationsList(apiBase, signal) {
-  const res = await fetch(`${apiBase}/api/conversations`, { signal });
+  const tokenSnap = await loadAuthTokenValue();
+  const res = await fetch(`${apiBase}/api/conversations`, {
+    signal,
+    headers: await buildAuthHeaders(),
+  });
   if (!res.ok) {
+    await clearAuthOnUnauthorized(res, tokenSnap);
     const t = await res.text().catch(() => '');
     throw new Error(t || `HTTP ${res.status}`);
   }
@@ -466,8 +693,10 @@ async function fetchConversationsList(apiBase, signal) {
 /** @param {string} apiBase @param {string} conversationId @param {AbortSignal} signal */
 async function fetchConversationMessages(apiBase, conversationId, signal) {
   const url = `${apiBase}/api/conversations/${encodeURIComponent(conversationId)}/messages`;
-  const res = await fetch(url, { signal });
+  const tokenSnap = await loadAuthTokenValue();
+  const res = await fetch(url, { signal, headers: await buildAuthHeaders() });
   if (!res.ok) {
+    await clearAuthOnUnauthorized(res, tokenSnap);
     const t = await res.text().catch(() => '');
     throw new Error(t || `HTTP ${res.status}`);
   }
@@ -477,13 +706,13 @@ async function fetchConversationMessages(apiBase, conversationId, signal) {
 /** @param {string} apiBase @param {string} conversationId */
 async function deleteConversationOnServer(apiBase, conversationId) {
   const url = `${apiBase}/api/conversations/${encodeURIComponent(conversationId)}`;
-  const res = await fetch(url, { method: 'DELETE' });
+  const tokenSnap = await loadAuthTokenValue();
+  const res = await fetch(url, { method: 'DELETE', headers: await buildAuthHeaders() });
   if (res.status === 204) return;
+  await clearAuthOnUnauthorized(res, tokenSnap);
   const t = await res.text().catch(() => '');
   throw new Error(t || `HTTP ${res.status}`);
 }
-
-const ROW_MORE_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.75"/><circle cx="12" cy="12" r="1.75"/><circle cx="12" cy="19" r="1.75"/></svg>`;
 
 /** @param {Array<{ role: string, content?: string, created_at?: string }>} rows */
 function buildHistoryFromServerMessages(rows) {
@@ -507,6 +736,74 @@ function escapeHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+/** @param {string} body */
+function extractApiDetailString(body) {
+  const t = String(body || '').trim();
+  if (!t) return '';
+  try {
+    const j = JSON.parse(t);
+    const d = j?.detail;
+    if (typeof d === 'string') return d.trim();
+    if (Array.isArray(d) && d.length) {
+      const first = d[0];
+      if (first && typeof first.msg === 'string') return String(first.msg).trim();
+    }
+  } catch {
+    /* not JSON */
+  }
+  return '';
+}
+
+/**
+ * Turn raw fetch/API error text into a short drawer-friendly line (no JSON blobs).
+ * @param {unknown} err
+ * @param {'list' | 'open' | 'delete'} kind
+ */
+function friendlyDrawerApiError(err, kind) {
+  const raw = (err instanceof Error ? err.message : String(err)).trim();
+  const lower = raw.toLowerCase();
+  const detail = extractApiDetailString(raw) || raw;
+  const blob = `${lower} ${detail.toLowerCase()}`;
+  const authish =
+    /\b401\b/.test(raw) ||
+    /authentication required|not authenticated|invalid token|missing token|credentials/i.test(blob);
+  if (authish) {
+    if (kind === 'delete') return 'Sign in to delete conversations.';
+    if (kind === 'open') return 'Sign in to open this conversation.';
+    return 'Sign in to load your conversations.';
+  }
+  if (/failed to fetch|networkerror|load failed|net::err/i.test(blob)) {
+    if (kind === 'delete') return 'Could not delete — check your connection and try again.';
+    if (kind === 'open') return 'Could not open this chat — check your connection and try again.';
+    return 'Could not load conversations — check your connection and try again.';
+  }
+  if (/^http\s+[45]\d\d\b/i.test(raw) || /\b403\b/.test(raw)) {
+    if (kind === 'delete') return 'You do not have permission to delete this conversation.';
+    if (kind === 'open') return 'You do not have permission to open this conversation.';
+    return 'Could not load conversations — access was denied.';
+  }
+  const shortDetail =
+    detail && !detail.startsWith('{')
+      ? detail.length > 140
+        ? `${detail.slice(0, 137)}…`
+        : detail
+      : '';
+  if (shortDetail) {
+    if (kind === 'list') return `Could not load conversations: ${shortDetail}`;
+    if (kind === 'open') return `Could not open chat: ${shortDetail}`;
+    return `Could not delete: ${shortDetail}`;
+  }
+  if (raw.startsWith('{')) {
+    if (kind === 'list') return 'Could not load conversations. Try again in a moment.';
+    if (kind === 'open') return 'Could not open this chat. Try again in a moment.';
+    return 'Could not delete. Try again in a moment.';
+  }
+  const tail = raw.length > 120 ? `${raw.slice(0, 117)}…` : raw;
+  if (kind === 'list') return `Could not load conversations. ${tail}`;
+  if (kind === 'open') return `Could not open chat. ${tail}`;
+  return `Could not delete. ${tail}`;
 }
 
 function pageContextSummary(snapshot) {
@@ -538,8 +835,10 @@ function pageContextSummary(snapshot) {
 function renderPageContext(snapshot) {
   currentPageContext = snapshot || null;
   const summary = pageContextSummary(snapshot);
-  if (pageContextTitleEl) pageContextTitleEl.textContent = summary.title;
-  if (pageContextMetaEl) pageContextMetaEl.textContent = summary.meta;
+  const titleEl = document.getElementById('pageContextTitle');
+  const metaEl = document.getElementById('pageContextMeta');
+  if (titleEl) titleEl.textContent = summary.title;
+  if (metaEl) metaEl.textContent = summary.meta;
 }
 
 function shouldAttachPageHint(text) {
@@ -661,7 +960,9 @@ function formatToolLabel(toolName) {
 async function loadToolLabelsFromBackend() {
   try {
     const apiBase = await loadApiBaseValue();
-    const response = await fetch(`${apiBase}/api/tools/metadata`);
+    const response = await fetch(`${apiBase}/api/tools/metadata`, {
+      headers: await buildAuthHeaders(),
+    });
     if (!response.ok) return;
     const payload = await response.json().catch(() => null);
     const labels = payload?.tool_labels;
@@ -982,16 +1283,18 @@ function showTyping() {
 
 async function streamChat(apiBase, conversationId, userText, onToken, onEvent, signal) {
   const url = `${apiBase}/api/chat`;
+  const pageCtxToggle = document.getElementById('usePageContextToggle');
   const browserContextPayload =
-    usePageContextToggle?.checked && currentPageContext
+    pageCtxToggle?.checked && currentPageContext
       ? {
           page_snapshot: currentPageContext,
           attach_hint: shouldAttachPageHint(userText),
         }
       : undefined;
+  const tokenSnap = await loadAuthTokenValue();
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await buildAuthHeaders({ 'Content-Type': 'application/json' }),
     signal,
     body: JSON.stringify({
       content: userText,
@@ -1004,6 +1307,7 @@ async function streamChat(apiBase, conversationId, userText, onToken, onEvent, s
   if (hdrConv) onEvent({ event: '_conversation_id', data: hdrConv });
 
   if (!res.ok) {
+    await clearAuthOnUnauthorized(res, tokenSnap);
     const t = await res.text().catch(() => '');
     throw new Error(`HTTP ${res.status}: ${t || res.statusText}`);
   }
@@ -1167,6 +1471,204 @@ async function loadApiBaseValue() {
   });
 }
 
+async function loadFrontendBaseValue() {
+  return await new Promise((resolve) => {
+    loadFrontendBase((base) => resolve(base));
+  });
+}
+
+async function loadAuthTokenValue() {
+  return await new Promise((resolve) => {
+    chrome.storage.local.get([STORAGE_AUTH_TOKEN], (r) => {
+      resolve(typeof r[STORAGE_AUTH_TOKEN] === 'string' ? r[STORAGE_AUTH_TOKEN].trim() : '');
+    });
+  });
+}
+
+async function setAuthTokenValue(token) {
+  await new Promise((resolve) => {
+    chrome.storage.local.set({ [STORAGE_AUTH_TOKEN]: token || '' }, resolve);
+  });
+  setAuthGateVisible(false);
+  await updateAuthMenuState();
+}
+
+async function clearAuthTokenValue() {
+  await new Promise((resolve) => {
+    chrome.storage.local.remove([STORAGE_AUTH_TOKEN], resolve);
+  });
+  await updateAuthMenuState();
+  void syncSettingsAccountSection();
+}
+
+/** Updates Account section in fullscreen settings (signed-in hint + Sign out enabled state). */
+async function syncSettingsAccountSection() {
+  if (!settingsLogoutBtn || !settingsAccountHelp) return;
+  const token = await loadAuthTokenValue();
+  if (!token) {
+    settingsLogoutBtn.disabled = true;
+    settingsAccountHelp.textContent =
+      'You are signed out. Use Sign in on the banner to connect your organization.';
+    return;
+  }
+  settingsLogoutBtn.disabled = false;
+  let signedLine = '';
+  try {
+    const user = await fetchCurrentAuthUser(token);
+    if (user?.email) signedLine = `Signed in as ${user.email}. `;
+  } catch {
+    /* keep generic copy */
+  }
+  const still = await loadAuthTokenValue();
+  if (!still) {
+    settingsLogoutBtn.disabled = true;
+    settingsAccountHelp.textContent =
+      'You are signed out. Use Sign in on the banner to connect your organization.';
+    return;
+  }
+  settingsAccountHelp.textContent =
+    `${signedLine}Sign out clears this extension session on this device. You can sign in again anytime.`;
+}
+
+function initSettingsFooterVersion() {
+  try {
+    const v = chrome.runtime.getManifest().version;
+    if (settingsExtensionVersion) settingsExtensionVersion.textContent = `Logistic Copilot · extension v${v}`;
+  } catch {
+    /* ignore */
+  }
+}
+
+async function buildAuthHeaders(extra = {}) {
+  const token = await loadAuthTokenValue();
+  return {
+    ...extra,
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+async function clearAuthOnUnauthorized(response, tokenUsedForRequest) {
+  if (response.status !== 401 && response.status !== 403) return;
+  if (tokenUsedForRequest) {
+    const latest = await loadAuthTokenValue();
+    if (latest !== tokenUsedForRequest) return;
+  }
+  await clearAuthTokenValue();
+}
+
+async function fetchCurrentAuthUser(token) {
+  if (!token) return null;
+  const apiBase = await loadApiBaseValue();
+  const response = await fetch(`${apiBase}/api/auth/me`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    await clearAuthOnUnauthorized(response, token);
+    return null;
+  }
+  return response.json();
+}
+
+function randomState() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function setAuthGateVisible(show) {
+  if (!authGate) return;
+  if (show) authGate.removeAttribute('hidden');
+  else authGate.setAttribute('hidden', '');
+}
+
+async function updateAuthMenuState() {
+  const gen = ++_authMenuFetchGen;
+  const token = await loadAuthTokenValue();
+  if (gen !== _authMenuFetchGen) return;
+
+  function syncDrawerAccount(title, meta, showLogoutBtn) {
+    if (chatPickerAccountTitle) chatPickerAccountTitle.textContent = title;
+    if (chatPickerAccountMeta) chatPickerAccountMeta.textContent = meta;
+    if (chatPickerLogoutBtn) chatPickerLogoutBtn.hidden = !showLogoutBtn;
+  }
+
+  if (!token) {
+    syncDrawerAccount('Signed out', 'Sign in via the banner · hover icons for Settings', false);
+    setAuthGateVisible(true);
+    return;
+  }
+
+  syncDrawerAccount('Checking session…', 'Validating token…', true);
+
+  try {
+    const user = await fetchCurrentAuthUser(token);
+    if (gen !== _authMenuFetchGen) return;
+    if (!user) {
+      syncDrawerAccount('Signed out', 'Session expired · sign in from the banner', false);
+      setAuthGateVisible(true);
+      return;
+    }
+    const role = user.role ? `Role: ${user.role}` : 'Organization session active';
+    syncDrawerAccount(user.email || 'Signed in', role, true);
+    setAuthGateVisible(false);
+  } catch {
+    if (gen !== _authMenuFetchGen) return;
+    syncDrawerAccount('Signed in', 'Using saved token for freight tools.', true);
+    setAuthGateVisible(false);
+  }
+}
+
+async function signInWithWeb() {
+  const hasChromeIdentity = Boolean(chrome?.identity?.launchWebAuthFlow && chrome.identity.getRedirectURL);
+  if (!hasChromeIdentity) {
+    const frontendBase = await loadFrontendBaseValue();
+    const filePreviewHint = window.location.protocol === 'file:'
+      ? 'This side panel is open as a file preview, so Chrome Identity is not available. Load it as an unpacked Chrome extension to test one-click extension sign-in.'
+      : 'Chrome Identity is not available in this browser context.';
+    appendSystemNote(`${filePreviewHint} Opening the web dashboard login instead.`);
+    try {
+      window.open(`${frontendBase.replace(/\/$/, '')}/?next=${encodeURIComponent('/dashboard')}`, '_blank', 'noopener,noreferrer');
+    } catch {
+      /* Window popups can be blocked in preview contexts; the note above is enough. */
+    }
+    return;
+  }
+  const apiBase = await loadApiBaseValue();
+  const frontendBase = await loadFrontendBaseValue();
+  const state = randomState();
+  const redirectUri = chrome.identity.getRedirectURL('auth');
+  const authUrl = `${frontendBase.replace(/\/$/, '')}/extension/login?redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`;
+  chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, async (callbackUrl) => {
+    if (chrome.runtime.lastError || !callbackUrl) {
+      appendSystemNote(chrome.runtime.lastError?.message || 'Extension sign-in was cancelled.');
+      return;
+    }
+    const url = new URL(callbackUrl);
+    const code = url.searchParams.get('code') || '';
+    const returnedState = url.searchParams.get('state') || '';
+    if (!code || returnedState !== state) {
+      appendSystemNote('Extension sign-in failed: invalid authorization state.');
+      return;
+    }
+    try {
+      const response = await fetch(`${apiBase}/api/auth/extension/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, state }),
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(text || `HTTP ${response.status}`);
+      }
+      const payload = await response.json();
+      await setAuthTokenValue(payload.access_token);
+      appendSystemNote(`Signed in as ${payload.email || 'Logistic Copilot user'}.`);
+    } catch (error) {
+      appendSystemNote(`Extension sign-in failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+}
+
 function abortCurrentChat() {
   if (activeChatAbortController) {
     activeChatAbortController.abort();
@@ -1300,6 +1802,7 @@ async function transcribeAudioBlob(blob) {
     const response = await fetch(`${apiBase}/api/audio/transcriptions`, {
       method: 'POST',
       body: formData,
+      headers: await buildAuthHeaders(),
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -1403,7 +1906,7 @@ function setChatPickerOpen(open) {
       chatPicker.setAttribute('hidden', '');
       chatPickerHideTimer = null;
     }, CHAT_PICKER_TRANSITION_MS);
-    topbarMenuTrigger?.focus({ preventScroll: true });
+    openSettingsBtn?.focus({ preventScroll: true });
   }
 }
 
@@ -1412,33 +1915,31 @@ function setChatPickerStatus(msg, isError) {
   if (!msg) {
     chatPickerStatus.setAttribute('hidden', '');
     chatPickerStatus.textContent = '';
-    chatPickerStatus.classList.remove('chat-picker-status--error');
+    chatPickerStatus.classList.remove('chat-picker-status--error', 'chat-picker-status--error-box');
     return;
   }
   chatPickerStatus.removeAttribute('hidden');
   chatPickerStatus.textContent = msg;
   chatPickerStatus.classList.toggle('chat-picker-status--error', Boolean(isError));
+  chatPickerStatus.classList.toggle('chat-picker-status--error-box', Boolean(isError));
 }
 
-/**
- * @param {string} id
- * @param {HTMLDetailsElement | null} menuDetails
- */
-async function handleDeleteConversationFromDrawer(id, menuDetails) {
+/** @param {string} id @param {Element | null} rowWrap */
+async function handleDeleteConversationFromDrawer(id, rowWrap) {
   if (!id) return;
-  if (!confirm('Delete this conversation permanently? This cannot be undone.')) return;
-  if (menuDetails) menuDetails.open = false;
+  disarmConversationDelete(id);
+  const delWrapEl = rowWrap instanceof Element ? rowWrap.querySelector('.chat-picker-delete-wrap') : null;
+  if (delWrapEl) setDeleteArmCountdownRunning(delWrapEl, false);
   try {
     const apiBase = await loadApiBaseValue();
     await deleteConversationOnServer(apiBase, id);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    setChatPickerStatus(`Could not delete: ${msg}`, true);
+    setChatPickerStatus(friendlyDrawerApiError(err, 'delete'), true);
     return;
   }
   setChatPickerStatus('', false);
-  const wrap = menuDetails?.closest('.chat-picker-row-wrap');
-  if (wrap) wrap.remove();
+  const wrap = rowWrap instanceof Element ? rowWrap : null;
+  if (wrap?.parentNode) wrap.remove();
   const deletedWasCurrent = conversationId && String(conversationId) === String(id);
   if (deletedWasCurrent) {
     conversationId = null;
@@ -1458,6 +1959,7 @@ async function handleDeleteConversationFromDrawer(id, menuDetails) {
 /** @param {Array<{ id: string, title?: string, created_at?: string, message_count?: number }>} conversations */
 function renderConversationRows(conversations) {
   if (!chatPickerList) return;
+  clearConversationDeleteArms();
   chatPickerList.innerHTML = '';
   const cur = conversationId ? String(conversationId) : null;
   if (!conversations.length) {
@@ -1491,39 +1993,48 @@ function renderConversationRows(conversations) {
       void selectConversationFromServer(id);
     });
 
-    const actions = document.createElement('details');
-    actions.className = 'chat-picker-row-menu';
-    const sum = document.createElement('summary');
-    sum.className = 'chat-picker-row-more';
-    sum.setAttribute('aria-label', 'More actions for this chat');
-    sum.innerHTML = ROW_MORE_ICON;
-    const panel = document.createElement('div');
-    panel.className = 'chat-picker-row-menu-panel';
+    const delWrap = document.createElement('div');
+    delWrap.className = 'chat-picker-delete-wrap';
+
+    const countdown = document.createElement('span');
+    countdown.className = 'chat-picker-delete-countdown';
+    countdown.setAttribute('aria-hidden', 'true');
+
     const delBtn = document.createElement('button');
     delBtn.type = 'button';
-    delBtn.className = 'chat-picker-row-delete';
-    delBtn.innerHTML = `${DELETE_ICON}<span>Delete</span>`;
+    delBtn.className = 'chat-picker-row-delete-icon';
+    delBtn.title = 'Tap twice to delete';
+    delBtn.setAttribute('aria-label', 'Delete conversation — tap twice to confirm.');
+    delBtn.innerHTML = DELETE_ICON;
+    delWrap.appendChild(countdown);
+    delWrap.appendChild(delBtn);
     delBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      void handleDeleteConversationFromDrawer(id, actions);
-    });
-    panel.appendChild(delBtn);
-    actions.appendChild(sum);
-    actions.appendChild(panel);
-    actions.addEventListener('toggle', () => {
-      wrap.classList.toggle('chat-picker-row-wrap--menu-open', actions.open);
-      if (!actions.open) return;
-      chatPickerList?.querySelectorAll('details.chat-picker-row-menu').forEach((d) => {
-        if (!(d instanceof HTMLDetailsElement)) return;
-        if (d === actions) return;
-        d.open = false;
-        d.closest('.chat-picker-row-wrap')?.classList.remove('chat-picker-row-wrap--menu-open');
-      });
+      const armedUntil = conversationDeleteArmExpiry.get(id);
+      const now = Date.now();
+      if (armedUntil && armedUntil > now) {
+        void handleDeleteConversationFromDrawer(id, wrap);
+        setDeleteArmCountdownRunning(delWrap, false);
+        return;
+      }
+      const prevTimer = conversationDeleteArmTimers.get(id);
+      if (prevTimer != null) clearTimeout(prevTimer);
+      conversationDeleteArmExpiry.set(id, now + DELETE_CONFIRM_MS);
+      const tid = setTimeout(() => {
+        conversationDeleteArmExpiry.delete(id);
+        conversationDeleteArmTimers.delete(id);
+        setDeleteArmCountdownRunning(delWrap, false);
+      }, DELETE_CONFIRM_MS);
+      conversationDeleteArmTimers.set(id, tid);
+      setDeleteArmCountdownRunning(delWrap, true);
     });
 
-    wrap.appendChild(btn);
-    wrap.appendChild(actions);
+    const inner = document.createElement('div');
+    inner.className = 'chat-picker-row-inner';
+    inner.appendChild(btn);
+    inner.appendChild(delWrap);
+    wrap.appendChild(inner);
     chatPickerList.appendChild(wrap);
   }
 }
@@ -1533,7 +2044,10 @@ async function refreshChatPickerList() {
   chatPickerListAbortController?.abort();
   chatPickerListAbortController = new AbortController();
   const signal = chatPickerListAbortController.signal;
-  if (chatPickerList) chatPickerList.innerHTML = '';
+  if (chatPickerList) {
+    chatPickerList.innerHTML = '';
+    clearConversationDeleteArms();
+  }
   setChatPickerStatus('Loading…', false);
   try {
     const apiBase = await loadApiBaseValue();
@@ -1542,9 +2056,11 @@ async function refreshChatPickerList() {
     renderConversationRows(Array.isArray(list) ? list : []);
   } catch (e) {
     if (e instanceof Error && e.name === 'AbortError') return;
-    const msg = e instanceof Error ? e.message : String(e);
-    setChatPickerStatus(`Could not load chats: ${msg}`, true);
-    if (chatPickerList) chatPickerList.innerHTML = '';
+    setChatPickerStatus(friendlyDrawerApiError(e, 'list'), true);
+    if (chatPickerList) {
+      chatPickerList.innerHTML = '';
+      clearConversationDeleteArms();
+    }
   }
 }
 
@@ -1570,8 +2086,7 @@ async function selectConversationFromServer(id) {
     scrollToBottom();
   } catch (e) {
     if (e instanceof Error && e.name === 'AbortError') return;
-    const msg = e instanceof Error ? e.message : String(e);
-    setChatPickerStatus(`Could not open chat: ${msg}`, true);
+    setChatPickerStatus(friendlyDrawerApiError(e, 'open'), true);
     void refreshChatPickerList();
   }
 }
@@ -1584,8 +2099,13 @@ function startNewChatFromPicker() {
   chrome.storage.local.remove([STORAGE_CONVERSATION]);
   history = [];
   clearThreadTurns();
+  ensurePageContextCard();
+  appendWelcomeStarterTurn();
   saveMessages([]);
   setChatPickerOpen(false);
+  void requestCurrentPageContext(false).then((snap) => {
+    renderPageContext(snap);
+  });
 }
 
 async function sendMessage() {
@@ -1618,7 +2138,7 @@ async function sendMessage() {
     });
   });
 
-  if (usePageContextToggle?.checked) {
+  if (document.getElementById('usePageContextToggle')?.checked) {
     try {
       const freshSnapshot = await requestCurrentPageContext(true);
       renderPageContext(freshSnapshot);
@@ -1882,35 +2402,6 @@ function setSending(nextSending) {
   updateComposerControls();
 }
 
-menuClearBtn?.addEventListener('click', async () => {
-  if (!confirm('Delete this chat? Server copy removed if linked.')) return;
-  closeTopbarMenu();
-  const id = conversationId;
-  if (id) {
-    try {
-      const apiBase = await loadApiBaseValue();
-      await deleteConversationOnServer(apiBase, id);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      appendSystemNote(`Could not delete conversation on server: ${msg}`);
-      return;
-    }
-  }
-  history = [];
-  conversationId = null;
-  chrome.storage.local.remove([STORAGE_MESSAGES, STORAGE_CONVERSATION]);
-  messagesEl.innerHTML = '';
-  const t = getTime();
-  appendAssistantTurn('Chat cleared. **Conversation** reset.', t, null);
-  history.push({
-    role: 'assistant',
-    time: t,
-    segments: [{ type: 'text', text: 'Chat cleared. Conversation reset.' }],
-    text: 'Chat cleared. Conversation reset.',
-  });
-  saveMessages(history);
-});
-
 /**
  * Send: bright “ready” fill when there is text.
  * Mic: separate “voice armed” look only when there is text and capture is idle (recording/transcribe use their own skins).
@@ -2129,56 +2620,101 @@ micBtn?.addEventListener('click', () => {
   void startVoiceRecording();
 });
 
-saveApiBtn.addEventListener('click', () => {
-  saveApiBase(apiBaseInput.value, (saved) => {
-    apiBaseInput.value = saved;
-    void loadToolLabelsFromBackend();
-    saveApiBtn.textContent = 'Saved';
-    closeTopbarMenu();
-    setTimeout(() => {
-      saveApiBtn.textContent = 'Save';
-    }, 1200);
-  });
-});
-
-saveFrontendBtn?.addEventListener('click', () => {
-  saveFrontendBase(frontendBaseInput?.value || '', (saved) => {
-    currentFrontendBase = saved;
-    if (frontendBaseInput) frontendBaseInput.value = saved;
-    saveFrontendBtn.textContent = 'Saved';
-    closeTopbarMenu();
-    setTimeout(() => {
-      if (saveFrontendBtn) saveFrontendBtn.textContent = 'Save link base';
-    }, 1200);
-  });
-});
-
-refreshPageContextBtn?.addEventListener('click', async () => {
-  refreshPageContextBtn.disabled = true;
-  const previous = refreshPageContextBtn.textContent;
-  refreshPageContextBtn.textContent = 'Refreshing…';
-  const snapshot = await requestCurrentPageContext(true);
-  renderPageContext(snapshot);
-  refreshPageContextBtn.textContent = previous || 'Refresh';
-  refreshPageContextBtn.disabled = false;
-});
-
-usePageContextToggle?.addEventListener('change', () => {
-  saveUsePageContext(usePageContextToggle.checked);
-});
-
-menuNewChatBtn?.addEventListener('click', () => {
-  closeTopbarMenu();
-  startNewChatFromPicker();
-});
-
-menuChatsBtn?.addEventListener('click', () => {
-  closeTopbarMenu();
+openSettingsBtn?.addEventListener('click', () => {
   setChatPickerOpen(true);
   void refreshChatPickerList();
 });
 
+settingsFullscreen?.addEventListener('click', (e) => {
+  if (e.target === settingsFullscreen || e.target === settingsFullscreenScrim) {
+    closeSettingsFullscreen();
+    openSettingsBtn?.focus();
+  }
+});
+
+settingsFullscreen?.querySelector('.fullscreen-settings__sheet')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+});
+
+settingsFullscreenClose?.addEventListener('click', () => {
+  closeSettingsFullscreen();
+});
+
+settingsLogoutBtn?.addEventListener('click', async () => {
+  await clearAuthTokenValue();
+  closeSettingsFullscreen();
+});
+
+function openExtensionEnvironmentPage() {
+  const url = chrome.runtime.getURL('options.html');
+  /** `openOptionsPage` often fails from the side panel (error only in `lastError`); `tabs.create` is reliable. */
+  if (chrome.tabs?.create) {
+    chrome.tabs.create({ url }, () => {
+      if (chrome.runtime.lastError) {
+        appendSystemNote(
+          `Could not open API & environment: ${chrome.runtime.lastError.message}. Use chrome://extensions → Logistic Copilot → Extension options.`
+        );
+      }
+    });
+    return;
+  }
+  chrome.runtime.openOptionsPage(() => {
+    if (chrome.runtime.lastError) {
+      appendSystemNote(
+        `Could not open extension options: ${chrome.runtime.lastError.message}. Use chrome://extensions → Logistic Copilot → Extension options.`
+      );
+    }
+  });
+}
+
+settingsOpenExtensionOptionsBtn?.addEventListener('click', () => {
+  openExtensionEnvironmentPage();
+});
+
+settingsOpenDashboardBtn?.addEventListener('click', () => {
+  loadFrontendBase((fb) => {
+    const base = (fb || DEFAULT_FRONTEND_BASE).replace(/\/$/, '');
+    window.open(`${base}/dashboard`, '_blank', 'noopener,noreferrer');
+  });
+});
+
+settingsUsePageContextToggle?.addEventListener('change', (e) => {
+  const t = e.target;
+  if (!(t instanceof HTMLInputElement)) return;
+  saveUsePageContext(t.checked);
+  const chatToggle = document.getElementById('usePageContextToggle');
+  if (chatToggle instanceof HTMLInputElement) chatToggle.checked = t.checked;
+});
+
+authGateSignInBtn?.addEventListener('click', () => {
+  void signInWithWeb();
+});
+
+chatPickerSettingsBtn?.addEventListener('click', () => {
+  setChatPickerOpen(false);
+  openSettingsFullscreen();
+});
+
+chatPickerLogoutBtn?.addEventListener('click', async () => {
+  await clearAuthTokenValue();
+});
+
 messagesEl.addEventListener('click', (e) => {
+  const refreshBtn = e.target instanceof Element ? e.target.closest('#refreshPageContextBtn') : null;
+  if (refreshBtn instanceof HTMLButtonElement) {
+    e.preventDefault();
+    void (async () => {
+      refreshBtn.disabled = true;
+      const previous = refreshBtn.textContent;
+      refreshBtn.textContent = 'Refreshing…';
+      const snapshot = await requestCurrentPageContext(true);
+      renderPageContext(snapshot);
+      refreshBtn.textContent = previous || 'Refresh';
+      refreshBtn.disabled = false;
+    })();
+    return;
+  }
+
   const target = e.target instanceof Element ? e.target : null;
   const link = target?.closest('a.quote-token-link, a[href*="?quote="], a');
   if (!(link instanceof HTMLAnchorElement)) return;
@@ -2212,20 +2748,16 @@ messagesEl.addEventListener('click', (e) => {
   );
 });
 
-document.addEventListener('click', (e) => {
-  if (!(e.target instanceof Node)) return;
-  if (topbarMenu instanceof HTMLDetailsElement && topbarMenu.open && !topbarMenu.contains(e.target)) {
-    topbarMenu.open = false;
-  }
-  chatPickerList?.querySelectorAll('details.chat-picker-row-menu').forEach((d) => {
-    if (d instanceof HTMLDetailsElement && d.open && !d.contains(e.target)) {
-      d.open = false;
-    }
-  });
-});
-
 messagesEl.addEventListener('scroll', () => {
   setAutoStickToBottom(isMessagesScrolledToBottom());
+});
+
+messagesEl.addEventListener('change', (e) => {
+  const t = e.target;
+  if (!(t instanceof HTMLInputElement) || t.id !== 'usePageContextToggle') return;
+  saveUsePageContext(t.checked);
+  const st = settingsUsePageContextToggle;
+  if (st instanceof HTMLInputElement) st.checked = t.checked;
 });
 
 chatPickerBackdrop?.addEventListener('click', () => {
@@ -2240,35 +2772,88 @@ newChatBtn?.addEventListener('click', () => {
   startNewChatFromPicker();
 });
 
+openAgentStoriesBtn?.addEventListener('click', () => {
+  openAgentStories();
+});
+
+agentStoriesBackdrop?.addEventListener('click', () => {
+  closeAgentStories();
+});
+
+agentStoriesClose?.addEventListener('click', () => {
+  closeAgentStories();
+});
+
+agentStoriesViewport?.addEventListener(
+  'scroll',
+  () => {
+    scheduleAgentStoriesTicksSync();
+  },
+  { passive: true }
+);
+
+agentStoriesPrev?.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  stepAgentStories(-1);
+});
+
+agentStoriesNext?.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  stepAgentStories(1);
+});
+
+window.addEventListener('resize', () => {
+  if (agentStories && !agentStories.hasAttribute('hidden')) scheduleAgentStoriesTicksSync();
+});
+
 document.addEventListener('keydown', (e) => {
+  if (agentStories && !agentStories.hasAttribute('hidden')) {
+    if (e.key === 'Escape') {
+      closeAgentStories();
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'ArrowLeft') {
+      stepAgentStories(-1);
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'ArrowRight') {
+      stepAgentStories(1);
+      e.preventDefault();
+      return;
+    }
+  }
   if (e.key !== 'Escape') return;
-  if (chatPicker && !chatPicker.hasAttribute('hidden')) {
-    setChatPickerOpen(false);
+  if (settingsFullscreen && !settingsFullscreen.hasAttribute('hidden')) {
+    closeSettingsFullscreen();
+    openSettingsBtn?.focus();
     e.preventDefault();
     return;
   }
-  if (topbarMenu instanceof HTMLDetailsElement && topbarMenu.open) {
-    topbarMenu.open = false;
+  if (chatPicker && !chatPicker.hasAttribute('hidden')) {
+    setChatPickerOpen(false);
     e.preventDefault();
   }
 });
 
-loadApiBase((base) => {
-  apiBaseInput.value = base;
-});
-
-loadFrontendBase((base) => {
-  currentFrontendBase = base;
-  if (frontendBaseInput) frontendBaseInput.value = base;
+loadFrontendBase((fb) => {
+  currentFrontendBase = fb;
 });
 
 loadUsePageContext((enabled) => {
-  if (usePageContextToggle) usePageContextToggle.checked = enabled;
+  const el = document.getElementById('usePageContextToggle');
+  if (el instanceof HTMLInputElement) el.checked = enabled;
+  const s = settingsUsePageContextToggle;
+  if (s instanceof HTMLInputElement) s.checked = enabled;
 });
 
 loadMessages((saved) => {
   if (saved.length === 0) return;
-  messagesEl.innerHTML = '';
+  clearThreadTurns();
+  ensurePageContextCard();
   history = saved;
   saved.forEach((msg) => {
     if (msg.role === 'user') appendUserTurn(msg.text, msg.time);
@@ -2286,6 +2871,7 @@ syncComposerFilledButtons();
 autoResize();
 window.addEventListener('resize', () => autoResize());
 void loadToolLabelsFromBackend();
+void updateAuthMenuState();
 
 requestCurrentPageContext(false).then((snapshot) => {
   renderPageContext(snapshot);
@@ -2294,6 +2880,28 @@ requestCurrentPageContext(false).then((snapshot) => {
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'PAGE_CONTEXT_UPDATED') {
     renderPageContext(message.payload || null);
+  }
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  if (changes[STORAGE_API_BASE] || changes[STORAGE_FRONTEND_BASE]) {
+    loadFrontendBase((fb) => {
+      currentFrontendBase = fb;
+      if (settingsPrivacyLink instanceof HTMLAnchorElement) {
+        const base = (fb || DEFAULT_FRONTEND_BASE).replace(/\/$/, '');
+        settingsPrivacyLink.href = `${base}/privacy-policy`;
+      }
+    });
+    void loadToolLabelsFromBackend();
+  }
+  const ch = changes[STORAGE_AUTH_TOKEN];
+  if (ch) {
+    const hadToken = typeof ch.oldValue === 'string' && ch.oldValue.trim() !== '';
+    const nextRaw = ch.newValue;
+    const hasToken = typeof nextRaw === 'string' && nextRaw.trim() !== '';
+    if (hadToken && !hasToken) startNewChatFromPicker();
+    void updateAuthMenuState();
   }
 });
 

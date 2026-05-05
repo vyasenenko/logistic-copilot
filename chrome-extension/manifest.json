@@ -1,11 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Logistic Copilot",
-  "version": "1.0.0", 
+  "version": "1.0.1", 
   "description": "Chrome extension with Logistic Copilot AI agent side panel",
   "permissions": [
     "sidePanel",
     "storage",
+    "identity",
     "tabs",
     "activeTab",
     "scripting"
@@ -24,8 +25,27 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://logisticopilot.com/*",
+        "https://www.logisticopilot.com/*",
+        "https://*.logisticopilot.com/*",
+        "http://localhost:3000/*",
+        "http://localhost:3001/*",
+        "http://127.0.0.1:3000/*",
+        "http://127.0.0.1:3001/*"
+      ],
+      "js": ["content-dash-auth-bridge.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "side_panel": {
     "default_path": "sidepanel.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "action": {
     "default_icon": {
@@ -40,5 +60,16 @@
     "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
+  },
+  "externally_connectable": {
+    "matches": [
+      "https://logisticopilot.com/*",
+      "https://www.logisticopilot.com/*",
+      "https://*.logisticopilot.com/*",
+      "http://localhost:3000/*",
+      "http://localhost:3001/*",
+      "http://127.0.0.1:3000/*",
+      "http://127.0.0.1:3001/*"
+    ]
   }
 }

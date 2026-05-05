@@ -3,8 +3,19 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Send, Loader2, Wrench } from "lucide-react";
+import { PUBLIC_API_URL as API_URL } from "@/constants/publicApi";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+function authHeaders(extra?: HeadersInit): HeadersInit {
+  const authToken =
+    typeof window !== "undefined"
+      ? window.localStorage.getItem("logistic_copilot_auth_token")
+      : null;
+  return {
+    ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+    ...(extra || {}),
+  };
+}
 
 interface Message {
   role: "user" | "assistant";
@@ -36,7 +47,9 @@ export function Chat({ conversationId, onConversationCreated }: ChatProps) {
       setMessages([]);
       return;
     }
-    fetch(`${API_URL}/api/conversations/${conversationId}/messages`)
+    fetch(`${API_URL}/api/conversations/${conversationId}/messages`, {
+      headers: authHeaders(),
+    })
       .then((r) => r.json())
       .then((data) =>
         setMessages(
@@ -68,7 +81,7 @@ export function Chat({ conversationId, onConversationCreated }: ChatProps) {
     try {
       const response = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           content: text,
           conversation_id: conversationId,

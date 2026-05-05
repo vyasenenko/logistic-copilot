@@ -282,6 +282,7 @@ clean: ## Удалить локальные кэши Python/Node/Flutter (не d
 	$(Q)find backend -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	$(Q)rm -rf frontend/.next frontend/node_modules/.cache
 	$(Q)rm -rf mobile/build mobile/.dart_tool
+	$(Q)rm -f "$(PROJECT_ROOT).k8s-dotenv.mk"
 	$(call log_ok,clean done)
 
 clean-docker: ## docker image prune -f (неиспользуемые образы)
@@ -297,12 +298,34 @@ clean-docker: ## docker image prune -f (неиспользуемые образ�
 
 K8S_DIR ?= k8s
 K8S_NS ?= ai-agent
+# Optional dotenv for k8s image builds (NEXT_PUBLIC_*, TAG, PLATFORM, DOCKER_REGISTRY). Override: K8S_BUILD_ENV=./prod.env
+K8S_BUILD_ENV ?= $(PROJECT_ROOT).env
+# $(shell) collapses newlines — write a small included makefile instead of $(eval $(shell ...)).
+$(shell $(PYTHON) "$(PROJECT_ROOT)scripts/k8s_build_env_from_dotenv.py" "$(K8S_BUILD_ENV)" > "$(PROJECT_ROOT).k8s-dotenv.mk" 2>/dev/null)
+-include $(PROJECT_ROOT).k8s-dotenv.mk
+
 DOCKER_REGISTRY ?= issist
 IMAGE_BACKEND ?= $(DOCKER_REGISTRY)/logistic-copilot-backend
 IMAGE_FRONTEND ?= $(DOCKER_REGISTRY)/logistic-copilot-frontend
 TAG ?= latest
 PLATFORM ?= linux/amd64
-NEXT_PUBLIC_API_URL ?= https://api.logisticopilot.com
+# Root .env usually sets NEXT_PUBLIC_API_URL=http://localhost:* for docker-compose; that is merged above.
+# Baking localhost into a prod frontend breaks login (browser calls user's loopback). Force public API unless unset was intentional non-loopback (e.g. staging).
+ifeq ($(NEXT_PUBLIC_API_URL),)
+NEXT_PUBLIC_API_URL := https://api.logisticopilot.com
+else ifneq ($(findstring localhost,$(NEXT_PUBLIC_API_URL)),)
+NEXT_PUBLIC_API_URL := https://api.logisticopilot.com
+else ifneq ($(findstring 127.0.0.1,$(NEXT_PUBLIC_API_URL)),)
+NEXT_PUBLIC_API_URL := https://api.logisticopilot.com
+else ifneq ($(findstring [::1],$(NEXT_PUBLIC_API_URL)),)
+NEXT_PUBLIC_API_URL := https://api.logisticopilot.com
+endif
+# Public site key — must match Cloudflare widget; baked in at Next.js build (Dockerfile builder stage).
+NEXT_PUBLIC_TURNSTILE_SITE_KEY ?=
+# Turnstile widget (see Cloudflare docs: theme, language, size).
+NEXT_PUBLIC_TURNSTILE_THEME ?= light
+NEXT_PUBLIC_TURNSTILE_LANGUAGE ?= en
+NEXT_PUBLIC_TURNSTILE_SIZE ?= flexible
 # buildx --provenance=false avoids unknown/unknown in Hub manifest lists for single-platform pushes
 K8S_BUILDX_EXTRA ?= --provenance=false
 # Path to env file for k8s-secret-from-env (only key=value lines, no export)
@@ -315,10 +338,16 @@ HELM_NS_CERT_MANAGER ?= cert-manager
 
 k8s-vars: ## Показать переменные K8s/образов (TAG, PLATFORM, K8S_NS, …)
 	$(call log_info,Kubernetes / image variables)
+	$(Q)printf '  K8S_BUILD_ENV=%s\n' "$(K8S_BUILD_ENV)"
 	$(Q)printf '  K8S_DIR=%s K8S_NS=%s\n' "$(K8S_DIR)" "$(K8S_NS)"
 	$(Q)printf '  IMAGE_BACKEND=%s:%s\n' "$(IMAGE_BACKEND)" "$(TAG)"
 	$(Q)printf '  IMAGE_FRONTEND=%s:%s\n' "$(IMAGE_FRONTEND)" "$(TAG)"
 	$(Q)printf '  PLATFORM=%s NEXT_PUBLIC_API_URL=%s\n' "$(PLATFORM)" "$(NEXT_PUBLIC_API_URL)"
+	$(Q)if [ -z "$(NEXT_PUBLIC_TURNSTILE_SITE_KEY)" ]; then \
+		printf '  NEXT_PUBLIC_TURNSTILE_SITE_KEY=(empty — pass for prod frontend build)\n'; \
+	else \
+		printf '  NEXT_PUBLIC_TURNSTILE_SITE_KEY=(set)\n'; \
+	fi
 	$(Q)printf '  DO_CLUSTER=%s K8S_SECRET_ENV=%s\n' "$(DO_CLUSTER)" "$(K8S_SECRET_ENV)"
 
 k8s-context: ## Текущий kubectl context (проверка перед деплоем)
@@ -330,10 +359,14 @@ k8s-buildx-backend: ## Сборка и push backend (linux/amd64 по умолч
 	$(Q)docker buildx build --platform $(PLATFORM) -t $(IMAGE_BACKEND):$(TAG) \
 		$(K8S_BUILDX_EXTRA) "$(PROJECT_ROOT)backend" --push
 
-k8s-buildx-frontend: ## Сборка и push frontend (NEXT_PUBLIC_API_URL из переменной)
+k8s-buildx-frontend: ## Сборка и push frontend (NEXT_PUBLIC_* из переменных; Turnstile site key для prod)
 	$(call log_info,buildx push $(IMAGE_FRONTEND):$(TAG))
 	$(Q)docker buildx build --platform $(PLATFORM) \
 		--build-arg NEXT_PUBLIC_API_URL=$(NEXT_PUBLIC_API_URL) \
+		--build-arg NEXT_PUBLIC_TURNSTILE_SITE_KEY=$(NEXT_PUBLIC_TURNSTILE_SITE_KEY) \
+		--build-arg NEXT_PUBLIC_TURNSTILE_THEME=$(NEXT_PUBLIC_TURNSTILE_THEME) \
+		--build-arg NEXT_PUBLIC_TURNSTILE_LANGUAGE=$(NEXT_PUBLIC_TURNSTILE_LANGUAGE) \
+		--build-arg NEXT_PUBLIC_TURNSTILE_SIZE=$(NEXT_PUBLIC_TURNSTILE_SIZE) \
 		-t $(IMAGE_FRONTEND):$(TAG) $(K8S_BUILDX_EXTRA) "$(PROJECT_ROOT)frontend" --push
 
 k8s-buildx-all: k8s-buildx-backend k8s-buildx-frontend ## Собрать и запушить оба образа

@@ -13,6 +13,7 @@ from uuid import UUID
 from langchain_core.tools import tool
 from sqlalchemy import select
 
+from app.agent.runtime import get_current_user_context
 from app.config import settings
 from app.memory.database import Carrier, Client, EmailThread, Shipment, WorkflowEvent, async_session
 from app.schemas import (
@@ -60,6 +61,28 @@ from app.services.workflow_event_codec import workflow_event_to_record
 
 def _json(obj) -> str:
     return json.dumps(obj, indent=2, default=str, ensure_ascii=False)
+
+
+def _tool_context_or_error():
+    context = get_current_user_context()
+    if context is None:
+        return None, (
+            "Error: freight tools require an authenticated organization context. "
+            "Please sign in through Logistic Copilot before using freight data tools."
+        )
+    return context, None
+
+
+async def _get_tool_shipment(session, shipment_id: UUID, *, include_archived: bool = False) -> tuple[Shipment | None, str | None]:
+    context, error = _tool_context_or_error()
+    if error:
+        return None, error
+    shipment = await session.get(Shipment, shipment_id)
+    if shipment is None or shipment.organization_id != context.organization_id:
+        return None, f"Error: shipment not found: {shipment_id}"
+    if not include_archived and shipment.is_archived:
+        return None, f"Error: active shipment not found: {shipment_id}"
+    return shipment, None
 
 
 def _parse_tool_datetime(value: str | None) -> datetime | None:
@@ -121,7 +144,7 @@ async def _update_shipment_details_impl(
             except ValueError:
                 return {"updated": False, "error": "client_id must be a valid UUID."}
             client = await session.get(Client, cid)
-            if client is None:
+            if client is None or client.organization_id != shipment.organization_id:
                 return {"updated": False, "error": f"Client not found: {client_id}"}
             shipment.client_id = cid
 
@@ -224,6 +247,7 @@ async def _update_shipment_details_impl(
         }
 
     evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
         stage=shipment.status,
@@ -236,7 +260,7 @@ async def _update_shipment_details_impl(
     session.add(evt)
     await session.commit()
     await freight_realtime_hub.notify_workflow_event(evt)
-    updated = await get_shipment_brief(session, shipment.id)
+    updated = await get_shipment_brief(session, shipment.id, organization_id=shipment.organization_id)
     return {
         "updated": True,
         "shipment_id": str(shipment.id),
@@ -282,8 +306,11 @@ async def freight_domain_foundation() -> str:
 @tool
 async def freight_get_overview() -> str:
     """Return JSON overview: entity counts, shipments per stage, status SLA metrics."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        overview = await build_freight_overview(session)
+        overview = await build_freight_overview(session, organization_id=context.organization_id)
         return overview.model_dump_json(indent=2)
 
 
@@ -295,6 +322,9 @@ async def freight_list_shipments(
     limit: int = 50,
 ) -> str:
     """List active shipments by date scope. date_scope: today, last_2_days, last_7_days, current_month, last_30_days, all. date_field: created_at, updated_at, ready_at_local. limit capped at 200."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
         rows = await list_shipments_brief(
             session,
@@ -302,6 +332,7 @@ async def freight_list_shipments(
             date_scope=date_scope,
             date_field=date_field,
             status=status,
+            organization_id=context.organization_id,
         )
         return _json(rows)
 
@@ -317,6 +348,9 @@ async def freight_query_shipments(
     limit: int = 50,
 ) -> str:
     """Query active shipments with filters and summary metadata. date_scope: today, last_2_days, last_7_days, current_month, last_30_days, all. date_field/sort_by: created_at, updated_at, ready_at_local. attention_only limits to review-like shipments."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
         result = await query_shipments_brief(
             session,
@@ -327,6 +361,7 @@ async def freight_query_shipments(
             attention_only=attention_only,
             sort_by=sort_by,
             limit=limit,
+            organization_id=context.organization_id,
         )
         return _json(result)
 
@@ -338,8 +373,11 @@ async def freight_get_shipment(shipment_id: str) -> str:
         sid = UUID(shipment_id.strip())
     except ValueError:
         return "Error: shipment_id must be a valid UUID."
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        row = await get_shipment_brief(session, sid)
+        row = await get_shipment_brief(session, sid, organization_id=context.organization_id)
         if row is None:
             return f"Error: shipment not found: {shipment_id}"
         return _json(row)
@@ -348,8 +386,11 @@ async def freight_get_shipment(shipment_id: str) -> str:
 @tool
 async def freight_get_shipment_by_token(quote_token: str) -> str:
     """Get one active shipment by quote token like Q-87845634 (JSON)."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        row = await get_shipment_brief_by_token(session, quote_token)
+        row = await get_shipment_brief_by_token(session, quote_token, organization_id=context.organization_id)
         if row is None:
             return f"Error: shipment not found for quote token: {quote_token}"
         return _json(row)
@@ -377,9 +418,9 @@ async def freight_update_shipment_details(
     except ValueError:
         return "Error: shipment_id must be a valid UUID."
     async with async_session() as session:
-        shipment = await session.get(Shipment, sid)
-        if shipment is None or shipment.is_archived:
-            return f"Error: active shipment not found: {shipment_id}"
+        shipment, error = await _get_tool_shipment(session, sid)
+        if error:
+            return error
         result = await _update_shipment_details_impl(
             shipment=shipment,
             session=session,
@@ -418,9 +459,16 @@ async def freight_update_shipment_details_by_token(
     clear_notes: bool = False,
 ) -> str:
     """Update active shipment details by quote token like Q-87845634. Date fields accept local wall time only; UTC/timezone are derived automatically from route."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
         result = await session.execute(
-            select(Shipment).where(Shipment.quote_token == quote_token.strip(), Shipment.is_archived.is_(False))
+            select(Shipment).where(
+                Shipment.organization_id == context.organization_id,
+                Shipment.quote_token == quote_token.strip(),
+                Shipment.is_archived.is_(False),
+            )
         )
         shipment = result.scalar_one_or_none()
         if shipment is None:
@@ -449,32 +497,61 @@ async def freight_update_shipment_details_by_token(
 @tool
 async def freight_search_shipments(query: str, status: str | None = None, limit: int = 50) -> str:
     """Search active shipments by token, route/city, equipment, notes, or status."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        rows = await search_shipments_brief(session, query=query, status=status, limit=limit)
+        rows = await search_shipments_brief(
+            session,
+            query=query,
+            status=status,
+            limit=limit,
+            organization_id=context.organization_id,
+        )
         return _json(rows)
 
 
 @tool
 async def freight_list_shipments_by_city(city: str, date_scope: str = "today", limit: int = 50) -> str:
     """List active shipments touching a city in origin/destination. date_scope: today or all."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        rows = await list_shipments_by_city_brief(session, city=city, date_scope=date_scope, limit=limit)
+        rows = await list_shipments_by_city_brief(
+            session,
+            city=city,
+            date_scope=date_scope,
+            limit=limit,
+            organization_id=context.organization_id,
+        )
         return _json(rows)
 
 
 @tool
 async def freight_list_today_shipments(status: str | None = None, limit: int = 100) -> str:
     """List today's active shipments using pickup-local date, with created_at fallback."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        rows = await list_today_shipments_brief(session, status=status, limit=limit)
+        rows = await list_today_shipments_brief(
+            session,
+            status=status,
+            limit=limit,
+            organization_id=context.organization_id,
+        )
         return _json(rows)
 
 
 @tool
 async def freight_summarize_shipment_case(quote_token: str) -> str:
     """Summarize one shipment case by quote token: shipment, recent events, and bid snapshot."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        summary = await summarize_shipment_case(session, quote_token)
+        summary = await summarize_shipment_case(session, quote_token, organization_id=context.organization_id)
         if summary is None:
             return f"Error: shipment not found for quote token: {quote_token}"
         return _json(summary)
@@ -487,8 +564,16 @@ async def freight_get_shipment_thread(shipment_id: str, limit: int = 24) -> str:
         sid = UUID(shipment_id.strip())
     except ValueError:
         return "Error: shipment_id must be a valid UUID."
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        row = await get_shipment_thread_transcript(session, sid, limit=limit)
+        row = await get_shipment_thread_transcript(
+            session,
+            sid,
+            limit=limit,
+            organization_id=context.organization_id,
+        )
         if row is None:
             return f"Error: active shipment thread not found: {shipment_id}"
         return _json(row)
@@ -497,8 +582,16 @@ async def freight_get_shipment_thread(shipment_id: str, limit: int = 24) -> str:
 @tool
 async def freight_get_shipment_thread_by_token(quote_token: str, limit: int = 24) -> str:
     """Get the linked email thread transcript for one active shipment by quote token."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        row = await get_shipment_thread_transcript_by_token(session, quote_token, limit=limit)
+        row = await get_shipment_thread_transcript_by_token(
+            session,
+            quote_token,
+            limit=limit,
+            organization_id=context.organization_id,
+        )
         if row is None:
             return f"Error: active shipment thread not found for quote token: {quote_token}"
         return _json(row)
@@ -511,8 +604,11 @@ async def freight_diagnose_shipment_issue(shipment_id: str) -> str:
         sid = UUID(shipment_id.strip())
     except ValueError:
         return "Error: shipment_id must be a valid UUID."
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        row = await diagnose_shipment_issue(session, sid)
+        row = await diagnose_shipment_issue(session, sid, organization_id=context.organization_id)
         if row is None:
             return f"Error: active shipment diagnosis not available: {shipment_id}"
         return _json(row)
@@ -521,8 +617,15 @@ async def freight_diagnose_shipment_issue(shipment_id: str) -> str:
 @tool
 async def freight_diagnose_shipment_issue_by_token(quote_token: str) -> str:
     """Return a deterministic diagnosis summary for one active shipment by quote token."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        row = await diagnose_shipment_issue_by_token(session, quote_token)
+        row = await diagnose_shipment_issue_by_token(
+            session,
+            quote_token,
+            organization_id=context.organization_id,
+        )
         if row is None:
             return f"Error: active shipment diagnosis not available for quote token: {quote_token}"
         return _json(row)
@@ -531,16 +634,32 @@ async def freight_diagnose_shipment_issue_by_token(quote_token: str) -> str:
 @tool
 async def freight_search_archived_shipments(query: str = "", reason_code: str | None = None, limit: int = 50) -> str:
     """Search archived shipments only. Use only when user asks about archive/ignored/deleted shipments."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        rows = await search_archived_shipments_brief(session, query=query, reason_code=reason_code, limit=limit)
+        rows = await search_archived_shipments_brief(
+            session,
+            query=query,
+            reason_code=reason_code,
+            limit=limit,
+            organization_id=context.organization_id,
+        )
         return _json(rows)
 
 
 @tool
 async def freight_get_archived_shipment_by_token(quote_token: str) -> str:
     """Get one archived shipment by quote token. Use only for archive lookup."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        row = await get_archived_shipment_brief_by_token(session, quote_token)
+        row = await get_archived_shipment_brief_by_token(
+            session,
+            quote_token,
+            organization_id=context.organization_id,
+        )
         if row is None:
             return f"Error: archived shipment not found for quote token: {quote_token}"
         return _json(row)
@@ -549,8 +668,15 @@ async def freight_get_archived_shipment_by_token(quote_token: str) -> str:
 @tool
 async def freight_summarize_archived_shipment(quote_token: str) -> str:
     """Summarize one archived shipment case by quote token."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        summary = await summarize_archived_shipment_case(session, quote_token)
+        summary = await summarize_archived_shipment_case(
+            session,
+            quote_token,
+            organization_id=context.organization_id,
+        )
         if summary is None:
             return f"Error: archived shipment not found for quote token: {quote_token}"
         return _json(summary)
@@ -576,9 +702,9 @@ async def freight_archive_shipment(
         return f"Error: reason_code must be one of: {allowed}"
 
     async with async_session() as session:
-        shipment = await session.get(Shipment, sid)
-        if shipment is None or shipment.is_archived:
-            return f"Error: active shipment not found: {shipment_id}"
+        shipment, error = await _get_tool_shipment(session, sid)
+        if error:
+            return error
         thread = await session.get(EmailThread, shipment.email_thread_id) if shipment.email_thread_id else None
         if dry_run:
             return _json(
@@ -605,6 +731,7 @@ async def freight_archive_shipment(
         shipment.updated_at = now
         session.add(
             WorkflowEvent(
+                organization_id=shipment.organization_id,
                 shipment_id=shipment.id,
                 event_type=WorkflowEventType.SHIPMENT_ARCHIVED.value,
                 stage=shipment.status,
@@ -623,6 +750,7 @@ async def freight_archive_shipment(
             thread.shipment_ingest_suppressed_at = now
             session.add(
                 WorkflowEvent(
+                    organization_id=shipment.organization_id,
                     shipment_id=shipment.id,
                     event_type=WorkflowEventType.SHIPMENT_SOURCE_SUPPRESSED.value,
                     stage=shipment.status,
@@ -665,12 +793,15 @@ async def freight_list_workflow_events(shipment_id: str, limit: int = 40) -> str
         return "Error: shipment_id must be a valid UUID."
     lim = max(1, min(limit, 100))
     async with async_session() as session:
-        shipment = await session.get(Shipment, sid)
-        if shipment is None or shipment.is_archived:
-            return f"Error: shipment not found: {shipment_id}"
+        shipment, error = await _get_tool_shipment(session, sid, include_archived=True)
+        if error:
+            return error
         result = await session.execute(
             select(WorkflowEvent)
-            .where(WorkflowEvent.shipment_id == sid)
+            .where(
+                WorkflowEvent.organization_id == shipment.organization_id,
+                WorkflowEvent.shipment_id == sid,
+            )
             .order_by(WorkflowEvent.created_at.desc())
             .limit(lim)
         )
@@ -681,8 +812,15 @@ async def freight_list_workflow_events(shipment_id: str, limit: int = 40) -> str
 @tool
 async def freight_list_clients() -> str:
     """List all freight clients (JSON)."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        result = await session.execute(select(Client).order_by(Client.created_at.desc()))
+        result = await session.execute(
+            select(Client)
+            .where(Client.organization_id == context.organization_id)
+            .order_by(Client.created_at.desc())
+        )
         rows = [
             {
                 "id": str(c.id),
@@ -700,8 +838,15 @@ async def freight_list_clients() -> str:
 @tool
 async def freight_list_carriers() -> str:
     """List active-oriented carriers (JSON)."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
     async with async_session() as session:
-        result = await session.execute(select(Carrier).order_by(Carrier.rating.desc(), Carrier.created_at.desc()))
+        result = await session.execute(
+            select(Carrier)
+            .where(Carrier.organization_id == context.organization_id)
+            .order_by(Carrier.rating.desc(), Carrier.created_at.desc())
+        )
         rows = [
             {
                 "id": str(c.id),
@@ -725,6 +870,9 @@ async def freight_evaluate_shipment_bids(shipment_id: str) -> str:
     except ValueError:
         return "Error: shipment_id must be a valid UUID."
     async with async_session() as session:
+        _shipment, error = await _get_tool_shipment(session, sid)
+        if error:
+            return error
         try:
             out = await evaluate_shipment_bids(session, sid)
             return out.model_dump_json(indent=2)
@@ -759,6 +907,9 @@ async def freight_intake_carrier_bid(
         create_carrier_if_missing=create_carrier_if_missing,
     )
     async with async_session() as session:
+        _shipment, error = await _get_tool_shipment(session, sid)
+        if error:
+            return error
         try:
             out = await intake_bid(session, req)
             return out.model_dump_json(indent=2)
@@ -779,6 +930,9 @@ async def freight_send_customer_quote(
     except ValueError:
         return "Error: shipment_id must be a valid UUID."
     async with async_session() as session:
+        _shipment, error = await _get_tool_shipment(session, sid)
+        if error:
+            return error
         try:
             out = await send_customer_quote(
                 session,
@@ -804,6 +958,9 @@ async def freight_handoff_shipment_to_tms(
     except ValueError:
         return "Error: shipment_id must be a valid UUID."
     async with async_session() as session:
+        _shipment, error = await _get_tool_shipment(session, sid, include_archived=True)
+        if error:
+            return error
         try:
             out = await handoff_to_tms(session, shipment_id=sid, bid_id=bid_id, dry_run=dry_run)
             return out.model_dump_json(indent=2)
@@ -825,6 +982,19 @@ async def freight_send_carrier_outreach(
         return "Error: shipment_id must be a valid UUID."
     ids: list[str] = [x.strip() for x in carrier_ids.split(",") if x.strip()]
     async with async_session() as session:
+        _shipment, error = await _get_tool_shipment(session, sid)
+        if error:
+            return error
+        context = get_current_user_context()
+        if ids:
+            for carrier_id in ids:
+                try:
+                    cid = UUID(carrier_id)
+                except ValueError:
+                    return f"Error: carrier_id must be a valid UUID: {carrier_id}"
+                carrier = await session.get(Carrier, cid)
+                if carrier is None or carrier.organization_id != context.organization_id:
+                    return f"Error: carrier not found: {carrier_id}"
         try:
             out = await create_carrier_outreach(
                 session,
@@ -855,6 +1025,18 @@ async def freight_send_carrier_followup(
     if not carrier_id and not carrier_email:
         return "Error: carrier_id or carrier_email is required."
     async with async_session() as session:
+        _shipment, error = await _get_tool_shipment(session, sid)
+        if error:
+            return error
+        context = get_current_user_context()
+        if carrier_id:
+            try:
+                cid = UUID(carrier_id)
+            except ValueError:
+                return "Error: carrier_id must be a valid UUID."
+            carrier = await session.get(Carrier, cid)
+            if carrier is None or carrier.organization_id != context.organization_id:
+                return f"Error: carrier not found: {carrier_id}"
         try:
             out = await send_carrier_followup(
                 session,

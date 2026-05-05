@@ -8,7 +8,6 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.memory.database import Carrier, CarrierBid, Client, EmailMessage, EmailThread, Shipment, WorkflowEvent
 from app.schemas import (
     CarrierFollowupResponse,
@@ -20,7 +19,10 @@ from app.schemas import (
 from app.services.email_correlation import attach_quote_token, generate_quote_reference, normalize_subject
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import format_ready_at_wall_display
-from app.services.outlook import OutlookGraphClient
+from app.services.outlook_organization import (
+    build_outlook_graph_client_for_shipment,
+    organization_outlook_mailbox,
+)
 
 
 def _build_outreach_subject(shipment: Shipment, thread: EmailThread) -> str:
@@ -101,7 +103,7 @@ async def deliver_carrier_thread_email(
     if dry_run:
         return delivery_payload
 
-    outlook = OutlookGraphClient()
+    outlook = await build_outlook_graph_client_for_shipment(session, shipment)
     if anchor is not None:
         await outlook.reply_to_message(
             message_id=anchor.provider_message_id,
@@ -124,9 +126,11 @@ async def _ensure_thread(session: AsyncSession, shipment: Shipment) -> EmailThre
 
     reference = generate_quote_reference()
     quote_token = shipment.quote_token or reference.subject_token
+    thread_mailbox = await organization_outlook_mailbox(session, shipment.organization_id)
     thread = EmailThread(
+        organization_id=shipment.organization_id,
         provider="outlook",
-        mailbox=settings.microsoft_mailbox or "unknown",
+        mailbox=thread_mailbox,
         quote_token=quote_token,
         subject=attach_quote_token("Freight quote request", quote_token),
         normalized_subject=normalize_subject("Freight quote request"),
@@ -142,19 +146,25 @@ async def _ensure_thread(session: AsyncSession, shipment: Shipment) -> EmailThre
 async def _load_target_carriers(
     session: AsyncSession,
     carrier_ids: list[str],
+    *,
+    shipment: Shipment,
 ) -> list[Carrier]:
     if carrier_ids:
         uuids = [UUID(carrier_id) for carrier_id in carrier_ids]
         result = await session.execute(
             select(Carrier)
-            .where(Carrier.id.in_(uuids), Carrier.is_active.is_(True))
+            .where(
+                Carrier.organization_id == shipment.organization_id,
+                Carrier.id.in_(uuids),
+                Carrier.is_active.is_(True),
+            )
             .order_by(Carrier.rating.desc(), Carrier.created_at.desc())
         )
         return list(result.scalars().all())
 
     result = await session.execute(
         select(Carrier)
-        .where(Carrier.is_active.is_(True))
+        .where(Carrier.organization_id == shipment.organization_id, Carrier.is_active.is_(True))
         .order_by(Carrier.rating.desc(), Carrier.created_at.desc())
     )
     return list(result.scalars().all())
@@ -173,14 +183,14 @@ async def create_carrier_outreach(
     if shipment is None:
         raise RuntimeError("Shipment not found")
 
-    carriers = await _load_target_carriers(session, carrier_ids)
+    carriers = await _load_target_carriers(session, carrier_ids, shipment=shipment)
     if not carriers:
         raise RuntimeError("No active carriers available for outreach")
 
     thread = await _ensure_thread(session, shipment)
     subject = _build_outreach_subject(shipment, thread)
     body = _build_outreach_body(shipment, custom_message)
-    outlook = OutlookGraphClient()
+    outlook = await build_outlook_graph_client_for_shipment(session, shipment)
 
     created_bids = 0
     results: list[CarrierOutreachItem] = []
@@ -218,8 +228,9 @@ async def create_carrier_outreach(
             await outlook.send_mail(subject=subject, body=body, recipients=[carrier.email])
 
         outbound_message = EmailMessage(
+            organization_id=shipment.organization_id,
             thread_id=thread.id,
-            sender=settings.microsoft_mailbox or "unknown",
+            sender=await organization_outlook_mailbox(session, shipment.organization_id),
             recipients_json=[carrier.email],
             direction="outbound",
             subject=subject,
@@ -231,6 +242,7 @@ async def create_carrier_outreach(
         await session.flush()
 
         bid = CarrierBid(
+            organization_id=shipment.organization_id,
             shipment_id=shipment.id,
             carrier_id=carrier.id,
             email_message_id=outbound_message.id,
@@ -260,6 +272,7 @@ async def create_carrier_outreach(
     thread.last_message_at = now
 
     workflow_event = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.CARRIER_OUTREACH_SENT.value,
         stage=shipment.status,
@@ -336,8 +349,9 @@ async def send_carrier_followup(
     outbound_message: EmailMessage | None = None
     if shipment.email_thread_id:
         outbound_message = EmailMessage(
+            organization_id=shipment.organization_id,
             thread_id=shipment.email_thread_id,
-            sender=settings.microsoft_mailbox or "unknown",
+            sender=await organization_outlook_mailbox(session, shipment.organization_id),
             recipients_json=[carrier.email],
             direction="outbound",
             subject=followup_subject,
@@ -358,6 +372,7 @@ async def send_carrier_followup(
     shipment.updated_at = datetime.now(timezone.utc)
     thread.last_message_at = shipment.updated_at
     workflow_event = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.CARRIER_FOLLOWUP_SENT.value,
         stage=shipment.status,
@@ -482,8 +497,9 @@ async def send_carrier_award_confirmation(
     outbound_message: EmailMessage | None = None
     if shipment.email_thread_id and not dry_run:
         outbound_message = EmailMessage(
+            organization_id=shipment.organization_id,
             thread_id=shipment.email_thread_id,
-            sender=settings.microsoft_mailbox or "unknown",
+            sender=await organization_outlook_mailbox(session, shipment.organization_id),
             recipients_json=[carrier.email],
             direction="outbound",
             subject=subject,
@@ -505,6 +521,7 @@ async def send_carrier_award_confirmation(
     shipment.updated_at = datetime.now(timezone.utc)
     thread.last_message_at = shipment.updated_at
     workflow_event = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.CARRIER_AWARD_SENT.value,
         stage=shipment.status,

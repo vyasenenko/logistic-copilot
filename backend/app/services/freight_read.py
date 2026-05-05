@@ -126,11 +126,14 @@ def is_status_stale(
     return last_status_event_at < _status_event_cutoff(now=now)
 
 
-async def status_metrics_summary(session: AsyncSession) -> FreightStatusMetrics:
+async def status_metrics_summary(session: AsyncSession, *, organization_id: UUID | None = None) -> FreightStatusMetrics:
+    shipment_filters = [Shipment.is_archived.is_(False)]
+    if organization_id is not None:
+        shipment_filters.append(Shipment.organization_id == organization_id)
     result = await session.execute(
         select(WorkflowEvent.event_type, WorkflowEvent.payload_json, WorkflowEvent.created_at, Shipment.id, Shipment.status)
         .join(Shipment, Shipment.id == WorkflowEvent.shipment_id)
-        .where(Shipment.is_archived.is_(False))
+        .where(*shipment_filters)
         .order_by(WorkflowEvent.created_at.desc())
     )
     metrics = FreightStatusMetrics()
@@ -162,7 +165,7 @@ async def status_metrics_summary(session: AsyncSession) -> FreightStatusMetrics:
         }:
             latest_status_event_at[shipment_id] = created_at
 
-    shipment_result = await session.execute(select(Shipment.id, Shipment.status).where(Shipment.is_archived.is_(False)))
+    shipment_result = await session.execute(select(Shipment.id, Shipment.status).where(*shipment_filters))
     for shipment_id, shipment_status in shipment_result.all():
         if is_status_stale(
             shipment_status=shipment_status,
@@ -174,26 +177,41 @@ async def status_metrics_summary(session: AsyncSession) -> FreightStatusMetrics:
     return metrics
 
 
-async def build_freight_overview(session: AsyncSession) -> FreightOverviewResponse:
+async def build_freight_overview(session: AsyncSession, *, organization_id: UUID | None = None) -> FreightOverviewResponse:
     """Return current freight data footprint and shipment stage distribution."""
+    client_filters = []
+    carrier_filters = []
+    thread_filters = []
+    message_filters = []
+    shipment_filters = [Shipment.is_archived.is_(False)]
+    bid_filters = []
+    event_filters = []
+    if organization_id is not None:
+        client_filters.append(Client.organization_id == organization_id)
+        carrier_filters.append(Carrier.organization_id == organization_id)
+        thread_filters.append(EmailThread.organization_id == organization_id)
+        message_filters.append(EmailMessage.organization_id == organization_id)
+        shipment_filters.append(Shipment.organization_id == organization_id)
+        bid_filters.append(CarrierBid.organization_id == organization_id)
+        event_filters.append(WorkflowEvent.organization_id == organization_id)
     counts = FreightOverviewCounts(
-        clients=await session.scalar(select(func.count()).select_from(Client)) or 0,
-        carriers=await session.scalar(select(func.count()).select_from(Carrier)) or 0,
-        email_threads=await session.scalar(select(func.count()).select_from(EmailThread)) or 0,
-        email_messages=await session.scalar(select(func.count()).select_from(EmailMessage)) or 0,
-        shipments=await session.scalar(select(func.count()).select_from(Shipment).where(Shipment.is_archived.is_(False))) or 0,
-        bids=await session.scalar(select(func.count()).select_from(CarrierBid)) or 0,
-        workflow_events=await session.scalar(select(func.count()).select_from(WorkflowEvent)) or 0,
+        clients=await session.scalar(select(func.count()).select_from(Client).where(*client_filters)) or 0,
+        carriers=await session.scalar(select(func.count()).select_from(Carrier).where(*carrier_filters)) or 0,
+        email_threads=await session.scalar(select(func.count()).select_from(EmailThread).where(*thread_filters)) or 0,
+        email_messages=await session.scalar(select(func.count()).select_from(EmailMessage).where(*message_filters)) or 0,
+        shipments=await session.scalar(select(func.count()).select_from(Shipment).where(*shipment_filters)) or 0,
+        bids=await session.scalar(select(func.count()).select_from(CarrierBid).where(*bid_filters)) or 0,
+        workflow_events=await session.scalar(select(func.count()).select_from(WorkflowEvent).where(*event_filters)) or 0,
     )
 
     result = await session.execute(
         select(Shipment.status, func.count(Shipment.id))
-        .where(Shipment.is_archived.is_(False))
+        .where(*shipment_filters)
         .group_by(Shipment.status)
         .order_by(Shipment.status)
     )
     active_stages = {str(status): total for status, total in result.all()}
-    status_metrics = await status_metrics_summary(session)
+    status_metrics = await status_metrics_summary(session, organization_id=organization_id)
 
     return FreightOverviewResponse(
         counts=counts,
@@ -212,6 +230,7 @@ async def list_notification_feed(
     *,
     limit: int = 20,
     offset: int = 0,
+    organization_id: UUID | None = None,
 ) -> NotificationFeedResponse:
     """Build a paginated notification feed from persisted workflow events."""
     safe_limit = max(1, min(limit, 100))
@@ -223,9 +242,11 @@ async def list_notification_feed(
         .where(WorkflowEvent.event_type.in_(NOTIFICATION_EVENT_TYPES))
         .order_by(WorkflowEvent.created_at.desc())
     )
-    total = await session.scalar(
-        select(func.count()).select_from(WorkflowEvent).where(WorkflowEvent.event_type.in_(NOTIFICATION_EVENT_TYPES))
-    ) or 0
+    total_stmt = select(func.count()).select_from(WorkflowEvent).where(WorkflowEvent.event_type.in_(NOTIFICATION_EVENT_TYPES))
+    if organization_id is not None:
+        base_stmt = base_stmt.where(WorkflowEvent.organization_id == organization_id)
+        total_stmt = total_stmt.where(WorkflowEvent.organization_id == organization_id)
+    total = await session.scalar(total_stmt) or 0
     result = await session.execute(base_stmt.offset(safe_offset).limit(safe_limit + 1))
 
     rows = result.all()
@@ -332,11 +353,14 @@ async def list_shipments_brief(
     date_scope: str = "all",
     date_field: str = "created_at",
     status: str | None = None,
+    organization_id: UUID | None = None,
 ) -> list[dict]:
     """Lightweight shipment rows for agents (no enrichment join fan-out)."""
     lim = max(1, min(limit, 200))
     column, date_conditions = _shipment_date_conditions(date_scope=date_scope, date_field=date_field)
     conditions = [Shipment.is_archived.is_(False)]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
     if status:
         conditions.append(Shipment.status == status)
     conditions.extend(date_conditions)
@@ -376,6 +400,7 @@ async def query_shipments_brief(
     attention_only: bool = False,
     sort_by: str = "date_field",
     limit: int = 50,
+    organization_id: UUID | None = None,
 ) -> dict:
     """Agent-friendly shipment query with metadata and bounded results."""
     lim = max(1, min(limit, 200))
@@ -388,6 +413,8 @@ async def query_shipments_brief(
     )
     sort_column = _shipment_query_sort_column(sort_by=normalized_sort_by, date_field=normalized_date_field)
     conditions = [Shipment.is_archived.is_(False), *date_conditions]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
     if status:
         conditions.append(Shipment.status == status)
     if city and city.strip():
@@ -521,33 +548,53 @@ def _notification_from_event(event: WorkflowEvent, shipment: Shipment | None) ->
     )
 
 
-async def get_shipment_brief(session: AsyncSession, shipment_id: UUID) -> dict | None:
+async def get_shipment_brief(
+    session: AsyncSession,
+    shipment_id: UUID,
+    *,
+    organization_id: UUID | None = None,
+) -> dict | None:
     """Single shipment core fields (no enrichment)."""
     shipment = await session.get(Shipment, shipment_id)
     if shipment is None or shipment.is_archived:
         return None
+    if organization_id is not None and shipment.organization_id != organization_id:
+        return None
     return _shipment_brief_row(shipment)
 
 
-async def get_archived_shipment_brief(session: AsyncSession, shipment_id: UUID) -> dict | None:
+async def get_archived_shipment_brief(
+    session: AsyncSession,
+    shipment_id: UUID,
+    *,
+    organization_id: UUID | None = None,
+) -> dict | None:
     """Single archived shipment core fields."""
     shipment = await session.get(Shipment, shipment_id)
     if shipment is None or not shipment.is_archived:
         return None
+    if organization_id is not None and shipment.organization_id != organization_id:
+        return None
     return _shipment_brief_row(shipment)
 
 
-async def get_shipment_brief_by_token(session: AsyncSession, quote_token: str) -> dict | None:
+async def get_shipment_brief_by_token(
+    session: AsyncSession,
+    quote_token: str,
+    *,
+    organization_id: UUID | None = None,
+) -> dict | None:
     """Single shipment core fields by quote token."""
     normalized = quote_token.strip().upper()
     if not normalized:
         return None
-    shipment = await session.scalar(
-        select(Shipment).where(
-            Shipment.is_archived.is_(False),
-            func.upper(Shipment.quote_token) == normalized,
-        )
-    )
+    conditions = [
+        Shipment.is_archived.is_(False),
+        func.upper(Shipment.quote_token) == normalized,
+    ]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
+    shipment = await session.scalar(select(Shipment).where(*conditions))
     return _shipment_brief_row(shipment) if shipment else None
 
 
@@ -557,6 +604,7 @@ async def search_shipments_brief(
     query: str,
     status: str | None = None,
     limit: int = 50,
+    organization_id: UUID | None = None,
 ) -> list[dict]:
     """Search active shipments by token, lane, equipment, notes, or status."""
     lim = max(1, min(limit, 200))
@@ -572,6 +620,8 @@ async def search_shipments_brief(
             Shipment.status.ilike(q),
         ),
     ]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
     if status:
         conditions.append(Shipment.status == status)
     result = await session.execute(
@@ -595,12 +645,16 @@ async def list_today_shipments_brief(
     *,
     status: str | None = None,
     limit: int = 100,
+    organization_id: UUID | None = None,
 ) -> list[dict]:
     """List shipments for today's board using pickup-local date with created_at fallback."""
     lim = max(1, min(limit, 200))
+    conditions = [Shipment.is_archived.is_(False)]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
     result = await session.execute(
         select(Shipment)
-        .where(Shipment.is_archived.is_(False))
+        .where(*conditions)
         .order_by(Shipment.updated_at.desc(), Shipment.created_at.desc())
         .limit(500)
     )
@@ -623,16 +677,17 @@ async def list_shipments_by_city_brief(
     city: str,
     date_scope: str = "today",
     limit: int = 50,
+    organization_id: UUID | None = None,
 ) -> list[dict]:
     """List shipments whose origin or destination contains a city string."""
     lim = max(1, min(limit, 200))
     q = f"%{city.strip()}%"
+    conditions = [Shipment.is_archived.is_(False), or_(Shipment.origin.ilike(q), Shipment.destination.ilike(q))]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
     result = await session.execute(
         select(Shipment)
-        .where(
-            Shipment.is_archived.is_(False),
-            or_(Shipment.origin.ilike(q), Shipment.destination.ilike(q)),
-        )
+        .where(*conditions)
         .order_by(Shipment.updated_at.desc(), Shipment.created_at.desc())
         .limit(500)
     )
@@ -647,15 +702,21 @@ async def list_shipments_by_city_brief(
     return rows
 
 
-async def summarize_shipment_case(session: AsyncSession, quote_token: str) -> dict | None:
+async def summarize_shipment_case(
+    session: AsyncSession,
+    quote_token: str,
+    *,
+    organization_id: UUID | None = None,
+) -> dict | None:
     """Compact case summary for agent answers."""
     normalized = quote_token.strip().upper()
-    shipment = await session.scalar(
-        select(Shipment).where(
-            Shipment.is_archived.is_(False),
-            func.upper(Shipment.quote_token) == normalized,
-        )
-    )
+    conditions = [
+        Shipment.is_archived.is_(False),
+        func.upper(Shipment.quote_token) == normalized,
+    ]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
+    shipment = await session.scalar(select(Shipment).where(*conditions))
     if shipment is None:
         return None
     events_result = await session.execute(
@@ -706,10 +767,13 @@ async def get_shipment_thread_transcript(
     shipment_id: UUID,
     *,
     limit: int = 24,
+    organization_id: UUID | None = None,
 ) -> dict | None:
     """Return active shipment thread transcript in chronological order."""
     shipment = await session.get(Shipment, shipment_id)
     if shipment is None or shipment.is_archived:
+        return None
+    if organization_id is not None and shipment.organization_id != organization_id:
         return None
     if not shipment.email_thread_id:
         return {
@@ -725,7 +789,10 @@ async def get_shipment_thread_transcript(
     thread = await session.get(EmailThread, shipment.email_thread_id)
     result = await session.execute(
         select(EmailMessage)
-        .where(EmailMessage.thread_id == shipment.email_thread_id)
+        .where(
+            EmailMessage.organization_id == shipment.organization_id,
+            EmailMessage.thread_id == shipment.email_thread_id,
+        )
         .order_by(EmailMessage.received_at.desc())
         .limit(max(1, min(limit, 100)))
     )
@@ -746,20 +813,22 @@ async def get_shipment_thread_transcript_by_token(
     quote_token: str,
     *,
     limit: int = 24,
+    organization_id: UUID | None = None,
 ) -> dict | None:
     """Return active shipment transcript by quote token."""
     normalized = quote_token.strip().upper()
     if not normalized:
         return None
-    shipment = await session.scalar(
-        select(Shipment).where(
-            Shipment.is_archived.is_(False),
-            func.upper(Shipment.quote_token) == normalized,
-        )
-    )
+    conditions = [
+        Shipment.is_archived.is_(False),
+        func.upper(Shipment.quote_token) == normalized,
+    ]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
+    shipment = await session.scalar(select(Shipment).where(*conditions))
     if shipment is None:
         return None
-    return await get_shipment_thread_transcript(session, shipment.id, limit=limit)
+    return await get_shipment_thread_transcript(session, shipment.id, limit=limit, organization_id=organization_id)
 
 
 async def diagnose_shipment_issue(
@@ -768,16 +837,27 @@ async def diagnose_shipment_issue(
     *,
     thread_limit: int = 12,
     event_limit: int = 12,
+    organization_id: UUID | None = None,
 ) -> dict | None:
     """Deterministic shipment diagnosis summary for agent troubleshooting."""
     shipment = await session.get(Shipment, shipment_id)
     if shipment is None or shipment.is_archived:
         return None
+    if organization_id is not None and shipment.organization_id != organization_id:
+        return None
 
-    transcript = await get_shipment_thread_transcript(session, shipment_id, limit=thread_limit)
+    transcript = await get_shipment_thread_transcript(
+        session,
+        shipment_id,
+        limit=thread_limit,
+        organization_id=organization_id,
+    )
     events_result = await session.execute(
         select(WorkflowEvent)
-        .where(WorkflowEvent.shipment_id == shipment.id)
+        .where(
+            WorkflowEvent.organization_id == shipment.organization_id,
+            WorkflowEvent.shipment_id == shipment.id,
+        )
         .order_by(WorkflowEvent.created_at.desc())
         .limit(max(1, min(event_limit, 30)))
     )
@@ -793,7 +873,10 @@ async def diagnose_shipment_issue(
     client = await session.get(Client, shipment.client_id) if shipment.client_id else None
     message_rows_result = await session.execute(
         select(EmailMessage)
-        .where(EmailMessage.thread_id == shipment.email_thread_id)
+        .where(
+            EmailMessage.organization_id == shipment.organization_id,
+            EmailMessage.thread_id == shipment.email_thread_id,
+        )
         .order_by(EmailMessage.received_at.desc())
         .limit(max(1, min(thread_limit, 30)))
     ) if shipment.email_thread_id else None
@@ -922,20 +1005,28 @@ async def diagnose_shipment_issue_by_token(
     *,
     thread_limit: int = 12,
     event_limit: int = 12,
+    organization_id: UUID | None = None,
 ) -> dict | None:
     """Deterministic shipment diagnosis summary by quote token."""
     normalized = quote_token.strip().upper()
     if not normalized:
         return None
-    shipment = await session.scalar(
-        select(Shipment).where(
-            Shipment.is_archived.is_(False),
-            func.upper(Shipment.quote_token) == normalized,
-        )
-    )
+    conditions = [
+        Shipment.is_archived.is_(False),
+        func.upper(Shipment.quote_token) == normalized,
+    ]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
+    shipment = await session.scalar(select(Shipment).where(*conditions))
     if shipment is None:
         return None
-    return await diagnose_shipment_issue(session, shipment.id, thread_limit=thread_limit, event_limit=event_limit)
+    return await diagnose_shipment_issue(
+        session,
+        shipment.id,
+        thread_limit=thread_limit,
+        event_limit=event_limit,
+        organization_id=organization_id,
+    )
 
 
 async def search_archived_shipments_brief(
@@ -944,12 +1035,16 @@ async def search_archived_shipments_brief(
     query: str | None = None,
     reason_code: str | None = None,
     limit: int = 50,
+    organization_id: UUID | None = None,
 ) -> list[dict]:
     """Search archived shipments only."""
     lim = max(1, min(limit, 200))
+    conditions = [Shipment.is_archived.is_(True)]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
     result = await session.execute(
         select(Shipment)
-        .where(Shipment.is_archived.is_(True))
+        .where(*conditions)
         .order_by(Shipment.archived_at.desc().nullslast(), Shipment.created_at.desc())
         .limit(500)
     )
@@ -979,34 +1074,49 @@ async def search_archived_shipments_brief(
     return rows
 
 
-async def get_archived_shipment_brief_by_token(session: AsyncSession, quote_token: str) -> dict | None:
+async def get_archived_shipment_brief_by_token(
+    session: AsyncSession,
+    quote_token: str,
+    *,
+    organization_id: UUID | None = None,
+) -> dict | None:
     """Single archived shipment by quote token."""
     normalized = quote_token.strip().upper()
     if not normalized:
         return None
-    shipment = await session.scalar(
-        select(Shipment).where(
-            Shipment.is_archived.is_(True),
-            func.upper(Shipment.quote_token) == normalized,
-        )
-    )
+    conditions = [
+        Shipment.is_archived.is_(True),
+        func.upper(Shipment.quote_token) == normalized,
+    ]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
+    shipment = await session.scalar(select(Shipment).where(*conditions))
     return _shipment_brief_row(shipment) if shipment else None
 
 
-async def summarize_archived_shipment_case(session: AsyncSession, quote_token: str) -> dict | None:
+async def summarize_archived_shipment_case(
+    session: AsyncSession,
+    quote_token: str,
+    *,
+    organization_id: UUID | None = None,
+) -> dict | None:
     """Compact archived case summary for agent answers."""
     normalized = quote_token.strip().upper()
-    shipment = await session.scalar(
-        select(Shipment).where(
-            Shipment.is_archived.is_(True),
-            func.upper(Shipment.quote_token) == normalized,
-        )
-    )
+    conditions = [
+        Shipment.is_archived.is_(True),
+        func.upper(Shipment.quote_token) == normalized,
+    ]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
+    shipment = await session.scalar(select(Shipment).where(*conditions))
     if shipment is None:
         return None
     events_result = await session.execute(
         select(WorkflowEvent)
-        .where(WorkflowEvent.shipment_id == shipment.id)
+        .where(
+            WorkflowEvent.organization_id == shipment.organization_id,
+            WorkflowEvent.shipment_id == shipment.id,
+        )
         .order_by(WorkflowEvent.created_at.desc())
         .limit(8)
     )

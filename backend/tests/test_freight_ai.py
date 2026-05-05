@@ -390,3 +390,9 @@ def test_shipment_extraction_result_accepts_null_notes_from_llm():
     )
     assert model.notes is None
     assert model.ready_at is not None
+
+
+def test_extract_bid_amount_trailing_dollar():
+    from app.services.freight_ai import _extract_bid_amount
+
+    assert _extract_bid_amount("We can do 1000$ for this lane.") == 1000.0

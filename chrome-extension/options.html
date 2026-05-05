@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Logistic Copilot — API &amp; environment</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="options-shell">
+      <h1 class="options-title">API &amp; environment</h1>
+      <p class="options-lede">
+        These URLs are shared with the side panel. Changing them clears your extension sign-in for safety. Reload the side panel after saving.
+      </p>
+      <p id="optionsStatus" class="options-status" role="status" aria-live="polite"></p>
+
+      <section class="options-card" aria-label="Presets">
+        <h2 class="options-kicker">Presets</h2>
+        <div class="options-env-switch" role="group" aria-label="Environment preset">
+          <button type="button" id="optEnvProd" class="options-env-btn options-env-btn--active">Production</button>
+          <button type="button" id="optEnvLocal" class="options-env-btn">Local dev</button>
+        </div>
+        <p class="options-urls" id="optUrlsSummary"></p>
+      </section>
+
+      <section class="options-card" aria-label="Custom URLs">
+        <h2 class="options-kicker">Custom URLs</h2>
+        <label class="options-label" for="optApiBase">Backend URL</label>
+        <input type="url" id="optApiBase" class="options-input" placeholder="https://api.logisticopilot.com" autocomplete="off" />
+        <label class="options-label" for="optFrontendBase">Frontend URL</label>
+        <input type="url" id="optFrontendBase" class="options-input" placeholder="https://logisticopilot.com" autocomplete="off" />
+        <button type="button" id="optApplyCustom" class="options-btn options-btn--primary">Apply custom URLs</button>
+      </section>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -1,13 +1,31 @@
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 
-from app.services.outlook import OutlookGraphClient
+from app.services.outlook import OutlookGraphClient, OutlookGraphCredentials
+
+
+def _test_client() -> OutlookGraphClient:
+    creds = OutlookGraphCredentials(
+        tenant_id="tenant",
+        client_id="cid",
+        client_secret="sec",
+        mailbox="example@contoso.com",
+        organization_id=uuid4(),
+    )
+    return OutlookGraphClient(
+        creds,
+        webhook_notification_url="https://bc08-87-196-72-44.ngrok-free.app/api/freight/outlook/webhook",
+        webhook_resource="users/example@contoso.com/mailFolders('Inbox')/messages",
+        webhook_client_state="org:deadbeef",
+        webhook_change_type="created",
+    )
 
 
 @pytest.mark.asyncio
 async def test_ensure_inbox_webhook_subscription_reuses_active_subscription(monkeypatch):
-    client = OutlookGraphClient()
+    client = _test_client()
 
     async def _list_subscriptions():
         return [
@@ -24,9 +42,6 @@ async def test_ensure_inbox_webhook_subscription_reuses_active_subscription(monk
     monkeypatch.setattr(client, "list_subscriptions", _list_subscriptions)
     monkeypatch.setattr(client, "create_webhook_subscription", lambda: pytest.fail("should not create"))
     monkeypatch.setattr(client, "renew_webhook_subscription", lambda _subscription_id: pytest.fail("should not renew"))
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_webhook_public_base_url", "https://bc08-87-196-72-44.ngrok-free.app", raising=False)
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_mailbox", "example@contoso.com", raising=False)
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_webhook_change_type", "created", raising=False)
 
     result = await client.ensure_inbox_webhook_subscription()
 
@@ -36,7 +51,7 @@ async def test_ensure_inbox_webhook_subscription_reuses_active_subscription(monk
 
 @pytest.mark.asyncio
 async def test_ensure_inbox_webhook_subscription_renews_expiring_subscription(monkeypatch):
-    client = OutlookGraphClient()
+    client = _test_client()
 
     async def _list_subscriptions():
         return [
@@ -56,9 +71,6 @@ async def test_ensure_inbox_webhook_subscription_renews_expiring_subscription(mo
     monkeypatch.setattr(client, "list_subscriptions", _list_subscriptions)
     monkeypatch.setattr(client, "renew_webhook_subscription", _renew)
     monkeypatch.setattr(client, "create_webhook_subscription", lambda: pytest.fail("should not create"))
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_webhook_public_base_url", "https://bc08-87-196-72-44.ngrok-free.app", raising=False)
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_mailbox", "example@contoso.com", raising=False)
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_webhook_change_type", "created", raising=False)
 
     result = await client.ensure_inbox_webhook_subscription()
 
@@ -68,7 +80,7 @@ async def test_ensure_inbox_webhook_subscription_renews_expiring_subscription(mo
 
 @pytest.mark.asyncio
 async def test_ensure_inbox_webhook_subscription_creates_when_missing(monkeypatch):
-    client = OutlookGraphClient()
+    client = _test_client()
 
     async def _list_subscriptions():
         return []
@@ -79,9 +91,6 @@ async def test_ensure_inbox_webhook_subscription_creates_when_missing(monkeypatc
     monkeypatch.setattr(client, "webhook_is_configured", lambda: True)
     monkeypatch.setattr(client, "list_subscriptions", _list_subscriptions)
     monkeypatch.setattr(client, "create_webhook_subscription", _create)
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_webhook_public_base_url", "https://bc08-87-196-72-44.ngrok-free.app", raising=False)
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_mailbox", "example@contoso.com", raising=False)
-    monkeypatch.setattr("app.services.outlook.settings.microsoft_webhook_change_type", "created", raising=False)
 
     result = await client.ensure_inbox_webhook_subscription()
 

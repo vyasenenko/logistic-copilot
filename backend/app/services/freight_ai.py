@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar, get_origin
 
 from app.agent.llm import try_get_primary_llm
+from app.services.email_triage import classify_email_triage_heuristic
 from app.services.location_timezone import (
     infer_delivery_timezone,
     infer_shipment_timezone,
@@ -17,13 +18,24 @@ from app.services.location_timezone import (
 from app.schemas import (
     CarrierBidExtractionResult,
     CarrierStatusUpdateExtractionResult,
+    EmailTriageClassification,
+    EmailTriageResult,
     IntentResult,
     ShipmentFieldExtractionResult,
     ShipmentExtractionResult,
     StatusRequestExtractionResult,
 )
 
-TStructured = TypeVar("TStructured", IntentResult, ShipmentExtractionResult, ShipmentFieldExtractionResult, CarrierBidExtractionResult, StatusRequestExtractionResult, CarrierStatusUpdateExtractionResult)
+TStructured = TypeVar(
+    "TStructured",
+    IntentResult,
+    ShipmentExtractionResult,
+    ShipmentFieldExtractionResult,
+    CarrierBidExtractionResult,
+    StatusRequestExtractionResult,
+    CarrierStatusUpdateExtractionResult,
+    EmailTriageResult,
+)
 logger = logging.getLogger(__name__)
 MAX_DEBUG_TEXT_CHARS = 1800
 
@@ -45,12 +57,15 @@ EQUIPMENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 AMOUNT_PATTERN = re.compile(
-    r"(?:\$|usd\s*)(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)|(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)\s*(?:all in|total|usd)",
+    r"(?:\$|usd\s*)(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)"
+    r"|(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)\s*(?:all in|total|usd)"
+    r"|(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)\s*\$",
     re.IGNORECASE,
 )
 RATE_PATTERNS = [
     re.compile(r"(?:rate|quote|can do|all[- ]?in|our price|best rate|we can do|i can do)\D{0,12}\$?\s*(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE),
     re.compile(r"\$\s*(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)", re.IGNORECASE),
+    re.compile(r"\b(\d{2,7}(?:,\d{3})*(?:\.\d{1,2})?)\s*\$", re.IGNORECASE),
 ]
 ETA_PATTERN = re.compile(r"((?:eta|delivery|pickup)[^.,;\n]{0,80})", re.IGNORECASE)
 READY_AT_PATTERN = re.compile(
@@ -249,20 +264,24 @@ async def _invoke_structured_with_fallback(
 
 def _context_blob(email_context: dict) -> str:
     now_utc = datetime.now(timezone.utc)
-    return "\n".join(
-        [
-            f"current_datetime_utc: {now_utc.isoformat()}",
-            f"current_date_utc: {now_utc.date().isoformat()}",
-            f"sender_email: {email_context.get('sender_email', '')}",
-            f"sender_role: {email_context.get('sender_role', '')}",
-            f"subject: {email_context.get('subject', '')}",
-            f"body_preview: {email_context.get('body_preview', '')}",
-            f"thread_subject: {email_context.get('thread_subject', '')}",
-            f"shipment_status: {email_context.get('shipment_status', '')}",
-            f"known_client: {email_context.get('known_client', '')}",
-            f"known_carrier: {email_context.get('known_carrier', '')}",
-        ]
-    )
+    lines = [
+        f"current_datetime_utc: {now_utc.isoformat()}",
+        f"current_date_utc: {now_utc.date().isoformat()}",
+        f"sender_email: {email_context.get('sender_email', '')}",
+        f"sender_role: {email_context.get('sender_role', '')}",
+        f"subject: {email_context.get('subject', '')}",
+        f"body_preview: {email_context.get('body_preview', '')}",
+        f"thread_subject: {email_context.get('thread_subject', '')}",
+        f"shipment_status: {email_context.get('shipment_status', '')}",
+        f"known_client: {email_context.get('known_client', '')}",
+        f"known_carrier: {email_context.get('known_carrier', '')}",
+    ]
+    if email_context.get("collecting_carrier_bids"):
+        lines.append("collecting_carrier_bids: true")
+    qt = email_context.get("shipment_quote_token")
+    if qt:
+        lines.append(f"shipment_quote_token: {qt}")
+    return "\n".join(lines)
 
 
 def _first_meaningful_reply_line(text: str) -> str:
@@ -271,6 +290,126 @@ def _first_meaningful_reply_line(text: str) -> str:
         if stripped:
             return stripped
     return ""
+
+
+def _recommended_action_for_triage(classification: EmailTriageClassification) -> str:
+    mapping = {
+        EmailTriageClassification.FREIGHT_QUOTE_REQUEST: "create_shipment",
+        EmailTriageClassification.CARRIER_REPLY: "link_to_existing_shipment",
+        EmailTriageClassification.STATUS_OR_OPS: "link_to_existing_shipment",
+        EmailTriageClassification.FRAUD_OR_PHISHING: "mark_fraud_email",
+        EmailTriageClassification.NOISE_OR_UNHANDLED: "mark_not_shipment",
+        EmailTriageClassification.NEEDS_OPERATOR_TRIAGE: "create_shipment",
+    }
+    return mapping.get(classification, "create_shipment")
+
+
+def _normalize_llm_triage_result(raw: EmailTriageResult) -> EmailTriageResult:
+    action = (raw.recommended_action or "").strip()
+    expected = _recommended_action_for_triage(raw.classification)
+    allowed = {
+        "create_shipment",
+        "mark_not_shipment",
+        "mark_fraud_email",
+        "mark_fraud_domain",
+        "link_to_existing_shipment",
+    }
+    if action not in allowed:
+        raw.recommended_action = expected
+    raw.confidence = max(0.0, min(float(raw.confidence or 0.0), 1.0))
+    signals = dict(raw.signals or {})
+    signals.setdefault("source", "llm_triage")
+    raw.signals = signals
+    return raw
+
+
+def _merge_email_triage_llm(heuristic: EmailTriageResult, llm_result: EmailTriageResult) -> EmailTriageResult:
+    """Prefer LLM when configured unless heuristic locked fraud/phishing."""
+    if heuristic.classification == EmailTriageClassification.FRAUD_OR_PHISHING:
+        merged_signals = dict(heuristic.signals or {})
+        merged_signals["llm_classification_skipped"] = llm_result.classification.value
+        merged_signals["llm_confidence_skipped"] = llm_result.confidence
+        return EmailTriageResult(
+            classification=heuristic.classification,
+            confidence=heuristic.confidence,
+            reason=heuristic.reason,
+            recommended_action=heuristic.recommended_action,
+            signals=merged_signals,
+        )
+    normalized = _normalize_llm_triage_result(llm_result)
+    if normalized.confidence >= 0.48:
+        merged_signals = dict(normalized.signals or {})
+        merged_signals["heuristic_classification"] = heuristic.classification.value
+        merged_signals["heuristic_confidence"] = heuristic.confidence
+        normalized.signals = merged_signals
+        return normalized
+    merged_signals = dict(heuristic.signals or {})
+    merged_signals["llm_classification_low_confidence"] = normalized.classification.value
+    merged_signals["llm_confidence"] = normalized.confidence
+    return EmailTriageResult(
+        classification=heuristic.classification,
+        confidence=heuristic.confidence,
+        reason=heuristic.reason,
+        recommended_action=heuristic.recommended_action,
+        signals=merged_signals,
+    )
+
+
+async def classify_email_triage_with_ai(
+    *,
+    subject: str,
+    body_preview: str,
+    sender_email: str,
+    quote_token: str | None = None,
+    existing_shipment_linked: bool = False,
+    fraud_reasons: list[str] | None = None,
+    fraud_risk_level: str | None = None,
+) -> EmailTriageResult:
+    """Triage inbound mail with LLM when available; keep heuristic fraud locks."""
+    heuristic = classify_email_triage_heuristic(
+        subject=subject,
+        body_preview=body_preview,
+        sender_email=sender_email,
+        quote_token=quote_token,
+        existing_shipment_linked=existing_shipment_linked,
+        fraud_reasons=fraud_reasons,
+        fraud_risk_level=fraud_risk_level,
+    )
+    if heuristic.classification == EmailTriageClassification.FRAUD_OR_PHISHING:
+        return heuristic
+    llm = _choose_llm()
+    if llm is None:
+        return heuristic
+
+    try:
+        prompt = (
+            "You triage inbound freight emails before they attach to workflow.\n"
+            "Pick exactly one classification:\n"
+            "- freight_quote_request: brand-new customer quote / load request that should open a shipment.\n"
+            "- carrier_reply: carrier gave pricing, capacity, transit time, or a firm yes/no on covering the lane "
+            "in an existing RFQ thread (often Re:/Fwd:, quote token in subject, or continuing carrier outreach). "
+            "Choose this when existing_shipment_linked or quote_token indicates an active shipment even if the "
+            "subject repeats customer lane text.\n"
+            "- status_or_ops: operational updates (in transit, POD, appointment, delay explanation) not primarily a price quote.\n"
+            "- fraud_or_phishing: scams, payment phishing, denylisted sender context.\n"
+            "- noise_or_unhandled: newsletters, HR, unrelated content.\n"
+            "- needs_operator_triage: freight-related but ambiguous; operator should decide.\n"
+            "recommended_action must be one of: create_shipment, link_to_existing_shipment, mark_not_shipment, mark_fraud_email, mark_fraud_domain.\n"
+            "Set confidence 0..1. Prefer carrier_reply over freight_quote_request when existing_shipment_linked is true "
+            "and the sender is negotiating coverage or price for that thread.\n\n"
+            f"sender_email: {sender_email}\n"
+            f"quote_token: {quote_token or ''}\n"
+            f"existing_shipment_linked: {existing_shipment_linked}\n"
+            f"fraud_risk_level: {fraud_risk_level or ''}\n"
+            f"fraud_reasons: {list(fraud_reasons or [])}\n"
+            f"subject: {subject}\n"
+            f"body_preview: {body_preview}\n"
+        )
+        llm_result = await _invoke_structured_with_fallback(llm=llm, schema=EmailTriageResult, prompt=prompt)
+        return _merge_email_triage_llm(heuristic, llm_result)
+    except Exception:
+        logger.exception("freight_ai.classify_email_triage.failed")
+        return heuristic
 
 
 async def classify_email_intent(email_context: dict) -> IntentResult:
@@ -286,6 +425,10 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
             "Allowed intents: new_quote_request, carrier_bid_reply, "
             "customer_quote_confirmation, customer_clarification, customer_status_request, carrier_status_update, exception_or_issue, noise_or_unhandled. "
             "Return high confidence only when the intent is clear. "
+            "When collecting_carrier_bids is present in the context and true, or shipment_status is waiting_bids, "
+            "and the sender is negotiating price/capacity/transit for the quoted lane, classify carrier_bid_reply "
+            "even if the subject line repeats customer route text (Re: Quote request …). "
+            "Prefer carrier_bid_reply over new_quote_request when known_carrier is set or sender_role is carrier and the body quotes or confirms a rate. "
             "When sender_role is client and shipment_status is quoted or awaiting_confirmation, "
             "a short affirmative body such as OK, Okay, Yes, Confirm, Approved, Book it, Окей, ОК, Да, or Подтверждаю means customer_quote_confirmation.\n\n"
             f"{_context_blob(email_context)}"
@@ -400,6 +543,7 @@ async def extract_carrier_bid(email_context: dict) -> CarrierBidExtractionResult
         prompt = (
             "Extract a structured carrier bid from the freight email. "
             "Use intent carrier_bid_reply. Populate amount, currency, eta_text, notes, ambiguity_reasons and confidence. "
+            "Recognize prices in forms such as $1200, USD 1200, 1200 USD, 1200$, or 1,250 all in. "
             "If no clear price is present, keep amount null and reduce confidence. "
             "If the email contains multiple possible rates or attachment-only pricing, add ambiguity_reasons.\n\n"
             f"{_context_blob(email_context)}"
@@ -469,6 +613,10 @@ def _classify_with_heuristics(email_context: dict) -> IntentResult:
     sender_role = email_context.get("sender_role")
     shipment_status = email_context.get("shipment_status") or ""
 
+    if sender_role == "carrier" and shipment_status == "waiting_bids":
+        if _extract_bid_amount(text) is not None or any(token in text for token in BID_HINTS):
+            amount = _extract_bid_amount(text)
+            return IntentResult(intent="carrier_bid_reply", confidence=0.88 if amount is not None else 0.74)
     if sender_role == "carrier" and any(token in text for token in CARRIER_STATUS_HINTS):
         return IntentResult(intent="carrier_status_update", confidence=0.72)
     if any(token in text for token in ISSUE_HINTS):
@@ -660,6 +808,13 @@ def _merge_intent_results(
         and fallback.confidence >= 0.85
         and primary_intent
         in {"noise_or_unhandled", "new_quote_request", "customer_clarification", "customer_status_request"}
+    ):
+        return fallback
+    if (
+        fallback_intent == "carrier_bid_reply"
+        and fallback.confidence >= 0.68
+        and primary_intent == "new_quote_request"
+        and primary.confidence <= 0.84
     ):
         return fallback
     # Otherwise AI remains source of truth. Heuristics only rescue obviously weak/noisy outputs.
@@ -1068,7 +1223,7 @@ def _extract_bid_amount(text: str) -> float | None:
         fallback = AMOUNT_PATTERN.search(text)
         if not fallback:
             return None
-        raw = fallback.group(1) or fallback.group(2)
+        raw = fallback.group(1) or fallback.group(2) or fallback.group(3)
         return float(raw.replace(",", "")) if raw else None
     candidates.sort(key=lambda item: item[1], reverse=True)
     return candidates[0][0]

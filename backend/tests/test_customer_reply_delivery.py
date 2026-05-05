@@ -19,10 +19,14 @@ class FakeScalarSession:
             return self.scalar_results.pop(0)
         return None
 
+    async def get(self, _model, _ident):
+        return None
+
 
 def _shipment(thread_id=None):
     return Shipment(
         id=uuid4(),
+        organization_id=uuid4(),
         email_thread_id=thread_id or uuid4(),
         status="received",
     )
@@ -108,7 +112,10 @@ async def test_deliver_customer_thread_email_replies_when_anchor_exists(monkeypa
         async def send_mail(self, **kwargs):
             calls.append(("send", kwargs))
 
-    monkeypatch.setattr(freight_execution, "OutlookGraphClient", FakeOutlook)
+    async def _fake_build(_session, _shipment):
+        return FakeOutlook()
+
+    monkeypatch.setattr(freight_execution, "build_outlook_graph_client_for_shipment", _fake_build)
     thread_id = uuid4()
     shipment = _shipment(thread_id)
     anchor = _inbound_message(thread_id=thread_id, message_id="msg-123")
@@ -150,7 +157,10 @@ async def test_deliver_customer_thread_email_falls_back_to_send_mail_without_anc
         async def send_mail(self, **kwargs):
             calls.append(("send", kwargs))
 
-    monkeypatch.setattr(freight_execution, "OutlookGraphClient", FakeOutlook)
+    async def _fake_build(_session, _shipment):
+        return FakeOutlook()
+
+    monkeypatch.setattr(freight_execution, "build_outlook_graph_client_for_shipment", _fake_build)
     shipment = _shipment()
     session = FakeScalarSession([None, None])
 
@@ -190,7 +200,10 @@ async def test_deliver_customer_thread_email_dry_run_reports_reply_without_sendi
         async def send_mail(self, **kwargs):
             calls.append(("send", kwargs))
 
-    monkeypatch.setattr(freight_execution, "OutlookGraphClient", FakeOutlook)
+    async def _fake_build(_session, _shipment):
+        return FakeOutlook()
+
+    monkeypatch.setattr(freight_execution, "build_outlook_graph_client_for_shipment", _fake_build)
     thread_id = uuid4()
     shipment = _shipment(thread_id)
     anchor = _inbound_message(thread_id=thread_id, message_id="msg-123")

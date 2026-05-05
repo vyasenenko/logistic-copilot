@@ -44,6 +44,7 @@ from app.services.freight_execution import (
 from app.services.freight_realtime import freight_realtime_hub
 from app.services.location_timezone import normalize_delivery_datetime_fields, normalize_pickup_datetime_fields
 from app.services.freight_outreach import create_carrier_outreach
+from app.services.outlook_organization import organization_outlook_mailbox
 
 CRITICAL_SHIPMENT_FIELDS = {"origin", "destination"}
 RECOMMENDED_SHIPMENT_FIELDS = {"pallets", "weight_lb", "equipment_type", "ready_at"}
@@ -296,6 +297,8 @@ async def run_freight_inbox_orchestrator(
         "shipment_status": shipment.status if shipment else "",
         "known_client": client.email if client else "",
         "known_carrier": carrier.email if carrier else "",
+        "collecting_carrier_bids": bool(shipment and shipment.status == ShipmentStage.WAITING_BIDS.value),
+        "shipment_quote_token": shipment.quote_token if shipment else "",
     }
     intent_result = await classify_email_intent(email_context)
 
@@ -468,13 +471,20 @@ async def evaluate_expired_quote_windows(
     session: AsyncSession,
     *,
     policy: AutomationPolicy | None = None,
+    organization_id: UUID | None = None,
+    system_scope: bool = False,
 ) -> list[WorkflowDecisionResult]:
     """Evaluate shipments whose bid collection windows are already expired."""
+    if organization_id is None and not system_scope:
+        raise RuntimeError("organization_id is required unless system_scope=True.")
     policy = policy or AutomationPolicy()
     now = datetime.now(timezone.utc)
+    conditions = [Shipment.status.in_([ShipmentStage.WAITING_BIDS.value, ShipmentStage.QUOTED.value])]
+    if organization_id is not None:
+        conditions.append(Shipment.organization_id == organization_id)
     result = await session.execute(
         select(Shipment)
-        .where(Shipment.status.in_([ShipmentStage.WAITING_BIDS.value, ShipmentStage.QUOTED.value]))
+        .where(*conditions)
         .order_by(Shipment.updated_at.asc())
     )
     decisions: list[WorkflowDecisionResult] = []
@@ -963,7 +973,10 @@ async def _handle_customer_clarification(
         shipment.destination,
         shipment.status,
     )
-    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+    await freight_realtime_hub.publish_shipment_updated(
+        organization_id=shipment.organization_id,
+        shipment_id=str(shipment.id),
+    )
     if extraction.ambiguity_reasons:
         await _log_manual_review(
             session,
@@ -1558,8 +1571,9 @@ async def send_customer_clarification(
     )
     session.add(
         EmailMessage(
+            organization_id=shipment.organization_id,
             thread_id=shipment.email_thread_id,
-            sender=settings.microsoft_mailbox or "unknown",
+            sender=await organization_outlook_mailbox(session, shipment.organization_id),
             recipients_json=[client.email],
             direction="outbound",
             subject=subject,
@@ -1576,6 +1590,7 @@ async def send_customer_clarification(
     shipment.updated_at = datetime.now(timezone.utc)
     session.add(
         WorkflowEvent(
+            organization_id=shipment.organization_id,
             shipment_id=shipment.id,
             event_type=WorkflowEventType.CUSTOMER_DETAILS_REQUESTED.value,
             stage=shipment.status,
@@ -1587,7 +1602,10 @@ async def send_customer_clarification(
         )
     )
     await session.commit()
-    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+    await freight_realtime_hub.publish_shipment_updated(
+        organization_id=shipment.organization_id,
+        shipment_id=str(shipment.id),
+    )
     return True
 
 
@@ -1667,7 +1685,9 @@ async def _log_event(
 ) -> None:
     if shipment_id is None:
         return
+    shipment = await session.get(Shipment, shipment_id)
     evt = WorkflowEvent(
+        organization_id=shipment.organization_id if shipment is not None else None,
         shipment_id=shipment_id,
         event_type=event_type,
         stage=stage,

@@ -9,9 +9,14 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.memory.database import EmailMessage, Shipment, WorkflowEvent
+from app.memory.database import EmailMessage, EmailThread, Shipment, WorkflowEvent
 from app.schemas import ShipmentStage, WorkflowEventType
 from app.services.outlook import OutlookGraphClient
+from app.services.outlook_organization import (
+    build_outlook_graph_client,
+    build_outlook_graph_client_for_shipment,
+    graph_mailbox_for_email_thread,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,34 @@ OUTLOOK_CATEGORY_VERIFY_SENDER = "⚠️ Verify Sender"
 OUTLOOK_CATEGORY_PROBABLE_FRAUD = "‼️ Probable Fraud"
 OUTLOOK_CATEGORY_NOT_SHIPMENT = "🚫 Not Shipment"
 OUTLOOK_CATEGORY_TRIAGE = "🔍 Triage"
+
+
+async def _outlook_client_for_email_message(
+    session: AsyncSession,
+    message: EmailMessage,
+) -> OutlookGraphClient | None:
+    org_id = message.organization_id
+    if org_id is None and message.thread_id:
+        thread = await session.get(EmailThread, message.thread_id)
+        if thread is not None:
+            org_id = thread.organization_id
+    if org_id is None:
+        return None
+    mailbox, email_connection_id = await graph_mailbox_for_email_thread(
+        session,
+        organization_id=org_id,
+        email_thread_id=message.thread_id,
+    )
+    try:
+        return await build_outlook_graph_client(
+            session,
+            org_id,
+            mailbox=mailbox,
+            email_connection_id=email_connection_id,
+        )
+    except RuntimeError:
+        return None
+
 
 OUTLOOK_CATEGORY_COLORS = {
     OUTLOOK_CATEGORY_NEW_QUOTE: "preset4",
@@ -149,8 +182,12 @@ async def add_email_message_categories(
     if not effective_categories:
         return {"attempted": False, "status": "no_categories"}
 
+    outlook = await _outlook_client_for_email_message(session, message)
+    if outlook is None:
+        return {"attempted": False, "status": "outlook_not_configured"}
+
     try:
-        result = await OutlookGraphClient().add_message_categories(
+        result = await outlook.add_message_categories(
             message.provider_message_id,
             effective_categories,
             category_colors=OUTLOOK_CATEGORY_COLORS,
@@ -230,8 +267,12 @@ async def mark_email_message_read_after_ai_success(
     if not message.provider_message_id:
         return {"attempted": False, "status": "missing_provider_message_id"}
 
+    outlook = await _outlook_client_for_email_message(session, message)
+    if outlook is None:
+        return {"attempted": False, "status": "outlook_not_configured"}
+
     try:
-        result = await OutlookGraphClient().mark_message_read(message.provider_message_id)
+        result = await outlook.mark_message_read(message.provider_message_id)
     except Exception as exc:
         logger.warning(
             "outlook_mail_action.mark_read_failed email_message_id=%s provider_message_id=%s shipment_id=%s reason=%s error=%s",
@@ -309,7 +350,14 @@ async def move_shipment_thread_messages_to_archive(
     if not messages:
         return {"attempted": False, "status": "no_provider_messages", "moved": 0, "failed": 0}
 
-    outlook = OutlookGraphClient()
+    if not shipment.organization_id:
+        return {"attempted": False, "status": "missing_organization_id", "moved": 0, "failed": 0}
+
+    try:
+        outlook = await build_outlook_graph_client_for_shipment(session, shipment)
+    except RuntimeError:
+        return {"attempted": False, "status": "outlook_not_configured", "moved": 0, "failed": 0}
+
     moved: list[dict] = []
     failed: list[dict] = []
     for message in messages:

@@ -14,23 +14,28 @@ from app.agent.graph import run_agent_stream
 from app.memory.database import Conversation, Message, get_session
 from app.schemas import MessageRequest
 from app.services.browser_context import browser_context_hint_text, get_browser_context, save_browser_context
+from app.services.auth import CurrentUserContext, get_current_user_context
 
 router = APIRouter()
 
 
 async def _get_or_create_conversation(
-    conversation_id, session: AsyncSession
+    conversation_id, session: AsyncSession, context: CurrentUserContext
 ) -> Conversation:
     """Get existing conversation or create a new one."""
     if conversation_id:
         result = await session.execute(
-            select(Conversation).where(Conversation.id == conversation_id)
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.organization_id == context.organization_id,
+                Conversation.user_id == context.user_id,
+            )
         )
         conv = result.scalar_one_or_none()
         if conv:
             return conv
 
-    conv = Conversation(id=uuid4())
+    conv = Conversation(id=uuid4(), organization_id=context.organization_id, user_id=context.user_id)
     session.add(conv)
     await session.commit()
     return conv
@@ -56,9 +61,10 @@ async def _load_history(conversation_id, session: AsyncSession) -> list:
 async def chat(
     request: MessageRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ):
     """Send a message to the agent and receive a streaming response (SSE)."""
-    conv = await _get_or_create_conversation(request.conversation_id, session)
+    conv = await _get_or_create_conversation(request.conversation_id, session, context)
     history = await _load_history(conv.id, session)
     browser_context = await save_browser_context(session, conv, request.browser_context)
     if browser_context is None:
@@ -90,6 +96,7 @@ async def chat(
             user_message=runtime_user_message,
             conversation_history=history,
             conversation_id=conv.id,
+            user_context=context,
         ):
             if event["event"] == "token":
                 full_response.append(event["data"])

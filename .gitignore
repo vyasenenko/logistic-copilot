@@ -29,6 +29,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Kubernetes
+k8s/secrets.yaml
+.k8s-dotenv.mk
+
 # Environment
 .env
 .env.local

@@ -6,8 +6,8 @@ import logging
 import re
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from sqlalchemy import case, func, or_, select
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from sqlalchemy import case, cast, func, literal, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -15,15 +15,18 @@ from app.memory.database import (
     Carrier,
     CarrierBid,
     Client,
+    EmailConnection,
     EmailMessage,
     EmailThread,
     EmailTriageItem,
     FraudDenylistEntry,
+    OrganizationTmsIntegration,
     Shipment,
     WorkflowEvent,
     async_session,
     get_session,
 )
+from app.services.auth import CurrentUserContext, get_current_user_context, hash_token, log_audit
 from app.schemas import (
     ArchiveReasonCode,
     AutomationPolicy,
@@ -35,12 +38,14 @@ from app.schemas import (
     CarrierFollowupResponse,
     CarrierOutreachRequest,
     CarrierOutreachResponse,
+    CarrierListPage,
     CarrierRecord,
     CarrierStatusUpdateRequest,
     CarrierStatusUpdateResponse,
     CarrierUpsertRequest,
     ClientAcknowledgementRequest,
     ClientAcknowledgementResponse,
+    ClientListPage,
     ClientRecord,
     ClientUpsertRequest,
     CustomerQuoteRequest,
@@ -59,12 +64,14 @@ from app.schemas import (
     EmailTriageAction,
     EmailTriageActionRequest,
     EmailTriageClassification,
+    EmailTriageQueuePage,
     EmailTriageRecord,
     OutlookIngestRequest,
     OutlookIngestResult,
     OutlookSyncRequest,
     OutlookSyncResponse,
     OutlookWebhookStatusResponse,
+    OutlookWebhookNotification,
     OutlookWebhookRequest,
     OutlookWebhookResponse,
     OperatorAction,
@@ -72,6 +79,7 @@ from app.schemas import (
     MarginPolicy,
     NotificationFeedResponse,
     ShipmentEvaluationResponse,
+    ShipmentArchivePage,
     ShipmentRecord,
     ShipmentThreadMessageRecord,
     ShipmentThreadResponse,
@@ -143,6 +151,15 @@ from app.services.workflow_event_codec import workflow_event_to_record
 from app.services.freight_outreach import create_carrier_outreach, send_carrier_followup
 from app.services.mailbox_sync import ingest_outlook_message
 from app.services.outlook import OutlookGraphClient
+from app.services.outlook_organization import (
+    apply_graph_subscription_to_email_connection,
+    build_outlook_graph_client,
+    get_organization_outlook_row,
+    inbox_subscription_resource,
+    mailbox_from_graph_resource,
+    missing_fields_for_outlook_row,
+)
+from app.services.outlook_webhook_state import parse_outlook_webhook_client_state
 from app.services.outlook_mail_actions import (
     add_email_message_categories,
     mark_email_message_read_after_ai_success,
@@ -155,6 +172,118 @@ from app.services.freight_read import build_freight_overview, is_status_stale as
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_outlook_sync_context(
+    session: AsyncSession,
+    *,
+    context: CurrentUserContext | None = None,
+    mailbox: str | None = None,
+) -> tuple[UUID, str]:
+    """Resolve the organization/mailbox pair for Outlook ingestion.
+
+    Dashboard-triggered sync uses the authenticated organization. Webhooks do not
+    have a user bearer token, so they must resolve through an active EmailConnection.
+    """
+    if context is not None:
+        normalized_mailbox = (mailbox or context.email or "unknown").strip().lower()
+        connection = await session.scalar(
+            select(EmailConnection).where(
+                EmailConnection.organization_id == context.organization_id,
+                EmailConnection.user_id == context.user_id,
+                EmailConnection.provider == "outlook",
+                EmailConnection.mailbox == normalized_mailbox,
+                EmailConnection.status == "active",
+            )
+        )
+        if connection is None:
+            raise RuntimeError("Outlook sync is not enabled for your mailbox. Enable auto-sync from Organization settings.")
+        return context.organization_id, normalized_mailbox
+
+    normalized_mailbox = (mailbox or "unknown").strip().lower()
+    connection = await session.scalar(
+        select(EmailConnection)
+        .where(
+            EmailConnection.provider == "outlook",
+            EmailConnection.mailbox == normalized_mailbox,
+            EmailConnection.status == "active",
+        )
+        .order_by(EmailConnection.created_at.asc())
+    )
+    if connection is not None:
+        return connection.organization_id, normalized_mailbox
+    raise RuntimeError(
+        f"No active Outlook email connection is configured for mailbox {normalized_mailbox!r}."
+    )
+
+
+async def _resolve_outlook_webhook_context(
+    session: AsyncSession,
+    notification: OutlookWebhookNotification,
+) -> tuple[UUID, str, UUID | None] | None:
+    parsed = parse_outlook_webhook_client_state(notification.clientState)
+    if parsed is not None:
+        org_id, connection_id = parsed
+        if connection_id is not None:
+            connection = await session.scalar(
+                select(EmailConnection).where(
+                    EmailConnection.id == connection_id,
+                    EmailConnection.organization_id == org_id,
+                    EmailConnection.provider == "outlook",
+                    EmailConnection.status == "active",
+                )
+            )
+            if connection is None:
+                return None
+            return org_id, connection.mailbox, connection.id
+        resource_mailbox = mailbox_from_graph_resource(notification.resource)
+        if not resource_mailbox:
+            return None
+        return org_id, resource_mailbox, None
+
+    cs = (notification.clientState or "").strip()
+    legacy = (settings.microsoft_webhook_client_state or "").strip()
+    if cs and legacy and cs != legacy:
+        return None
+    mb = mailbox_from_graph_resource(notification.resource)
+    if not mb:
+        return None
+    try:
+        org_id, mailbox_value = await _resolve_outlook_sync_context(session, mailbox=mb)
+    except RuntimeError:
+        return None
+    return org_id, mailbox_value, None
+
+
+async def _get_scoped_shipment(
+    session: AsyncSession,
+    shipment_id: UUID,
+    context: CurrentUserContext,
+    *,
+    include_archived: bool = False,
+) -> Shipment:
+    shipment = await session.get(Shipment, shipment_id)
+    if (
+        shipment is None
+        or shipment.organization_id != context.organization_id
+        or (shipment.is_archived and not include_archived)
+    ):
+        raise HTTPException(status_code=404, detail="Shipment not found.")
+    return shipment
+
+
+async def _get_scoped_client(session: AsyncSession, client_id: UUID, context: CurrentUserContext) -> Client:
+    client = await session.get(Client, client_id)
+    if client is None or client.organization_id != context.organization_id:
+        raise HTTPException(status_code=404, detail="Client not found.")
+    return client
+
+
+async def _get_scoped_carrier(session: AsyncSession, carrier_id: UUID, context: CurrentUserContext) -> Carrier:
+    carrier = await session.get(Carrier, carrier_id)
+    if carrier is None or carrier.organization_id != context.organization_id:
+        raise HTTPException(status_code=404, detail="Carrier not found.")
+    return carrier
 
 
 def _parse_graph_datetime(value: str | None) -> datetime | None:
@@ -170,24 +299,24 @@ def _outlook_webhook_status_response(
     *,
     outlook: OutlookGraphClient,
     subscriptions: list[dict],
+    expected_notification_url: str | None,
+    expected_resource: str | None,
+    expected_change_type: str | None,
     subscription_action: str | None = None,
 ) -> OutlookWebhookStatusResponse:
     now = datetime.now(timezone.utc)
-    expected_url = settings.microsoft_webhook_notification_url or None
-    expected_resource = settings.microsoft_webhook_effective_resource or None
-    expected_change_type = settings.microsoft_webhook_change_type or None
-    missing_fields = outlook.missing_settings()
-    if not expected_url:
+    missing_fields = list(outlook.missing_settings())
+    if not expected_notification_url:
         missing_fields.append("microsoft_webhook_public_base_url")
     if not expected_resource:
-        missing_fields.append("microsoft_webhook_resource")
+        missing_fields.append("mailbox")
 
     if missing_fields:
         return OutlookWebhookStatusResponse(
             configured=False,
             status="missing_configuration",
             missing_fields=sorted(set(missing_fields)),
-            expected_notification_url=expected_url,
+            expected_notification_url=expected_notification_url,
             expected_resource=expected_resource,
             expected_change_type=expected_change_type,
             total_subscriptions=len(subscriptions),
@@ -197,7 +326,7 @@ def _outlook_webhook_status_response(
     matching = [
         item
         for item in subscriptions
-        if item.get("notificationUrl") == expected_url
+        if item.get("notificationUrl") == expected_notification_url
         and item.get("resource") == expected_resource
         and item.get("changeType") == expected_change_type
     ]
@@ -220,7 +349,7 @@ def _outlook_webhook_status_response(
     return OutlookWebhookStatusResponse(
         configured=True,
         status=status,
-        expected_notification_url=expected_url,
+        expected_notification_url=expected_notification_url,
         expected_resource=expected_resource,
         expected_change_type=expected_change_type,
         subscription_id=str(primary.get("id")) if primary and primary.get("id") else None,
@@ -255,6 +384,7 @@ async def _serialize_shipment_detail(session: AsyncSession, shipment: Shipment) 
     tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id])
     status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id])
     document_action_payloads = await _latest_document_action_payloads(session, [shipment.id])
+    source_mailbox_payloads = await _source_mailbox_payloads(session, [shipment])
     clarification_flags = await _customer_clarification_requested_flags(session, [shipment])
     attachment_counts = await _attachment_counts(session, [shipment])
     document_summaries = await _document_booking_summaries(session, [shipment], document_action_payloads)
@@ -274,6 +404,7 @@ async def _serialize_shipment_detail(session: AsyncSession, shipment: Shipment) 
             **(status_review_payloads.get(shipment.id) or {}),
             **(tms_identity_payloads.get(shipment.id) or {}),
             **(status_workflow_payloads.get(shipment.id) or {}),
+            **(source_mailbox_payloads.get(shipment.id) or {}),
             "attachment_count": attachment_counts.get(shipment.id, 0),
             "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
             "document_enrichment": document_summaries.get(shipment.id, {}).get("document_enrichment", {}),
@@ -293,6 +424,34 @@ async def _serialize_shipment_detail(session: AsyncSession, shipment: Shipment) 
             "customer_clarification_requested": clarification_flags.get(shipment.id, False),
         },
     )
+
+
+async def _source_mailbox_payloads(session: AsyncSession, shipments: list[Shipment]) -> dict[UUID, dict]:
+    thread_ids = [shipment.email_thread_id for shipment in shipments if shipment.email_thread_id]
+    if not thread_ids:
+        return {}
+    result = await session.execute(
+        select(EmailThread, EmailConnection)
+        .outerjoin(
+            EmailConnection,
+            (EmailConnection.organization_id == EmailThread.organization_id)
+            & (EmailConnection.provider == EmailThread.provider)
+            & (EmailConnection.mailbox == EmailThread.mailbox),
+        )
+        .where(EmailThread.id.in_(thread_ids))
+    )
+    by_thread_id: dict[UUID, dict] = {}
+    for thread, connection in result.all():
+        by_thread_id[thread.id] = {
+            "source_mailbox": thread.mailbox,
+            "source_mailbox_owner_user_id": str(connection.user_id) if connection is not None else None,
+            "source_mailbox_visibility_mode": (connection.visibility_mode if connection is not None else "metadata_only") or "private",
+        }
+    return {
+        shipment.id: by_thread_id[shipment.email_thread_id]
+        for shipment in shipments
+        if shipment.email_thread_id in by_thread_id
+    }
 
 
 def _clean_message_excerpt(value: str | None) -> str:
@@ -522,8 +681,12 @@ async def _create_sender_review_event(
         source_email_id=result.email_message_id,
     ):
         return
+    shipment = await session.get(Shipment, UUID(result.shipment_id))
+    if shipment is None:
+        return
     event = WorkflowEvent(
-        shipment_id=UUID(result.shipment_id),
+        organization_id=shipment.organization_id,
+        shipment_id=shipment.id,
         event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
         stage=ShipmentStage.PARSING.value,
         payload_json={
@@ -617,11 +780,15 @@ async def _process_outlook_mailbox_message(
     *,
     mailbox_message,
     policy: AutomationPolicy,
+    organization_id: UUID,
+    mailbox: str | None = None,
     create_client_if_missing: bool = True,
 ) -> OutlookIngestResult | None:
     result = await ingest_outlook_message(
         session,
         mailbox_message,
+        organization_id=organization_id,
+        mailbox=mailbox,
         create_client_if_missing=create_client_if_missing,
     )
     if result is None:
@@ -880,6 +1047,9 @@ def _serialize_shipment(shipment: Shipment, ai_payload: dict | None = None) -> S
         id=str(shipment.id),
         client_id=str(shipment.client_id) if shipment.client_id else None,
         email_thread_id=str(shipment.email_thread_id) if shipment.email_thread_id else None,
+        source_mailbox=ai_payload.get("source_mailbox"),
+        source_mailbox_owner_user_id=ai_payload.get("source_mailbox_owner_user_id"),
+        source_mailbox_visibility_mode=ai_payload.get("source_mailbox_visibility_mode"),
         status=shipment.status,
         quote_token=shipment.quote_token,
         origin=shipment.origin,
@@ -1139,6 +1309,7 @@ async def _archive_shipment_and_optionally_suppress_source(
     shipment.updated_at = now
 
     archive_event = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.SHIPMENT_ARCHIVED.value,
         stage=shipment.status,
@@ -1158,6 +1329,7 @@ async def _archive_shipment_and_optionally_suppress_source(
         thread.shipment_ingest_suppressed_reason = archive_reason
         thread.shipment_ingest_suppressed_at = now
         suppress_event = WorkflowEvent(
+            organization_id=shipment.organization_id,
             shipment_id=shipment.id,
             event_type=WorkflowEventType.SHIPMENT_SOURCE_SUPPRESSED.value,
             stage=shipment.status,
@@ -1178,8 +1350,14 @@ async def _archive_shipment_and_optionally_suppress_source(
         shipment=shipment,
         reason=archive_reason,
     )
-    await freight_realtime_hub.publish_overview_stale_throttled(reason="shipment_archived")
-    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+    await freight_realtime_hub.publish_overview_stale_throttled(
+        reason="shipment_archived",
+        organization_id=shipment.organization_id,
+    )
+    await freight_realtime_hub.publish_shipment_updated(
+        organization_id=shipment.organization_id,
+        shipment_id=str(shipment.id),
+    )
     return shipment, thread
 
 
@@ -1872,6 +2050,7 @@ def _record_status_task_resolution(
     source: str | None = None,
 ) -> WorkflowEvent:
     evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
         stage=shipment.status,
@@ -2063,27 +2242,33 @@ def _build_resolved_status_queue_item(
     )
 
 
-async def _active_status_queue_items(session: AsyncSession) -> list[StatusQueueItem]:
+async def _active_status_queue_items(session: AsyncSession, *, organization_id: UUID | None = None) -> list[StatusQueueItem]:
+    conditions = [
+        WorkflowEvent.event_type.in_(
+            [
+                WorkflowEventType.CUSTOMER_STATUS_SENT.value,
+                WorkflowEventType.TMS_STATUS_UPDATED.value,
+                WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
+                WorkflowEventType.EXCEPTION_RAISED.value,
+                WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
+            ]
+        )
+    ]
+    if organization_id is not None:
+        conditions.append(WorkflowEvent.organization_id == organization_id)
     result = await session.execute(
         select(WorkflowEvent)
-        .where(
-            WorkflowEvent.event_type.in_(
-                [
-                    WorkflowEventType.CUSTOMER_STATUS_SENT.value,
-                    WorkflowEventType.TMS_STATUS_UPDATED.value,
-                    WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
-                    WorkflowEventType.EXCEPTION_RAISED.value,
-                    WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value,
-                ]
-            )
-        )
+        .where(*conditions)
         .order_by(WorkflowEvent.created_at.desc())
     )
     events = list(result.scalars().all())
     shipment_ids = list({event.shipment_id for event in events})
     shipments_by_id: dict[UUID, Shipment] = {}
     if shipment_ids:
-        shipment_result = await session.execute(select(Shipment).where(Shipment.id.in_(shipment_ids)))
+        shipment_conditions = [Shipment.id.in_(shipment_ids)]
+        if organization_id is not None:
+            shipment_conditions.append(Shipment.organization_id == organization_id)
+        shipment_result = await session.execute(select(Shipment).where(*shipment_conditions))
         shipments_by_id = {shipment.id: shipment for shipment in shipment_result.scalars().all()}
     status_payloads = await _latest_status_payloads(session, shipment_ids)
     tms_identity_payloads = await _latest_tms_identity_payloads(session, shipment_ids)
@@ -2129,10 +2314,18 @@ async def _active_status_queue_items(session: AsyncSession) -> list[StatusQueueI
     return sorted(items, key=_status_queue_priority)
 
 
-async def _resolved_status_queue_items(session: AsyncSession, *, limit: int = 25) -> list[StatusQueueItem]:
+async def _resolved_status_queue_items(
+    session: AsyncSession,
+    *,
+    limit: int = 25,
+    organization_id: UUID | None = None,
+) -> list[StatusQueueItem]:
+    conditions = [WorkflowEvent.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value]
+    if organization_id is not None:
+        conditions.append(WorkflowEvent.organization_id == organization_id)
     result = await session.execute(
         select(WorkflowEvent)
-        .where(WorkflowEvent.event_type == WorkflowEventType.STATUS_WORKFLOW_RESOLVED.value)
+        .where(*conditions)
         .order_by(WorkflowEvent.created_at.desc())
     )
     resolution_events = list(result.scalars().all())
@@ -2140,7 +2333,10 @@ async def _resolved_status_queue_items(session: AsyncSession, *, limit: int = 25
         return []
 
     shipment_ids = list({event.shipment_id for event in resolution_events})
-    shipment_result = await session.execute(select(Shipment).where(Shipment.id.in_(shipment_ids)))
+    shipment_conditions = [Shipment.id.in_(shipment_ids)]
+    if organization_id is not None:
+        shipment_conditions.append(Shipment.organization_id == organization_id)
+    shipment_result = await session.execute(select(Shipment).where(*shipment_conditions))
     shipments_by_id = {shipment.id: shipment for shipment in shipment_result.scalars().all()}
     status_payloads = await _latest_status_payloads(session, shipment_ids)
     tms_identity_payloads = await _latest_tms_identity_payloads(session, shipment_ids)
@@ -2153,7 +2349,10 @@ async def _resolved_status_queue_items(session: AsyncSession, *, limit: int = 25
     }
     source_events_by_id: dict[UUID, WorkflowEvent] = {}
     if source_task_ids:
-        source_result = await session.execute(select(WorkflowEvent).where(WorkflowEvent.id.in_(source_task_ids)))
+        source_conditions = [WorkflowEvent.id.in_(source_task_ids)]
+        if organization_id is not None:
+            source_conditions.append(WorkflowEvent.organization_id == organization_id)
+        source_result = await session.execute(select(WorkflowEvent).where(*source_conditions))
         source_events_by_id = {event.id: event for event in source_result.scalars().all()}
 
     items: list[StatusQueueItem] = []
@@ -2352,6 +2551,7 @@ def _persist_document_analysis_events(
 ) -> list[WorkflowEvent]:
     events_out: list[WorkflowEvent] = []
     analyzed = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=event_type.value,
         stage=shipment.status,
@@ -2374,6 +2574,7 @@ def _persist_document_analysis_events(
     events_out.append(analyzed)
     if document_health.get("review_required"):
         review_evt = WorkflowEvent(
+            organization_id=shipment.organization_id,
             shipment_id=shipment.id,
             event_type=WorkflowEventType.MANUAL_REVIEW_REQUIRED.value,
             stage=shipment.status,
@@ -2393,8 +2594,11 @@ def _persist_document_analysis_events(
 
 
 @router.get("/freight/foundation", response_model=FreightFoundationResponse)
-async def freight_foundation() -> FreightFoundationResponse:
+async def freight_foundation(
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> FreightFoundationResponse:
     """Return workflow enums and deterministic correlation strategy details."""
+    _ = context
     return FreightFoundationResponse(
         stages=list(ShipmentStage),
         event_types=list(WorkflowEventType),
@@ -2413,24 +2617,45 @@ async def freight_foundation() -> FreightFoundationResponse:
     )
 
 
-@router.get("/freight/clients", response_model=list[ClientRecord])
-async def list_clients(session: AsyncSession = Depends(get_session)) -> list[ClientRecord]:
-    """List all clients for freight workflows."""
-    result = await session.execute(select(Client).order_by(Client.created_at.desc()))
-    return [_serialize_client(client) for client in result.scalars().all()]
+@router.get("/freight/clients", response_model=ClientListPage)
+async def list_clients(
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+    q: str | None = Query(None, max_length=200, description="Filter by name or email (case-insensitive)."),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=500_000),
+) -> ClientListPage:
+    """List clients for freight workflows (paginated, optional server-side search)."""
+    stmt = select(Client).where(Client.organization_id == context.organization_id)
+    qnorm = (q or "").strip()
+    if qnorm:
+        pattern = f"%{qnorm}%"
+        stmt = stmt.where(or_(Client.name.ilike(pattern), Client.email.ilike(pattern)))
+    stmt = stmt.order_by(Client.created_at.desc()).offset(offset).limit(limit + 1)
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_offset = offset + len(rows)
+    return ClientListPage(items=[_serialize_client(client) for client in rows], has_more=has_more, next_offset=next_offset)
 
 
 @router.post("/freight/clients", response_model=ClientRecord)
 async def create_client(
     request: ClientUpsertRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ClientRecord:
     """Create a client record."""
-    existing = await session.scalar(select(Client).where(Client.email == request.email.lower()))
+    _require_freight_write(context)
+    existing = await session.scalar(
+        select(Client).where(Client.organization_id == context.organization_id, Client.email == request.email.lower())
+    )
     if existing is not None:
         raise HTTPException(status_code=409, detail="Client with this email already exists.")
 
     client = Client(
+        organization_id=context.organization_id,
         name=request.name,
         email=request.email.lower(),
         is_active=request.is_active,
@@ -2440,16 +2665,21 @@ async def create_client(
     session.add(client)
     await session.commit()
     await session.refresh(client)
-    await freight_realtime_hub.publish_overview_stale_throttled(reason="client_created")
+    await freight_realtime_hub.publish_overview_stale_throttled(
+        reason="client_created",
+        organization_id=context.organization_id,
+    )
     return _serialize_client(client)
 
 
 @router.get("/freight/clients/{client_id}", response_model=ClientRecord)
-async def get_client(client_id: UUID, session: AsyncSession = Depends(get_session)) -> ClientRecord:
+async def get_client(
+    client_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> ClientRecord:
     """Get a client by id."""
-    client = await session.get(Client, client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="Client not found.")
+    client = await _get_scoped_client(session, client_id, context)
     return _serialize_client(client)
 
 
@@ -2458,13 +2688,15 @@ async def update_client(
     client_id: UUID,
     request: ClientUpsertRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ClientRecord:
     """Update a client record."""
-    client = await session.get(Client, client_id)
-    if client is None:
-        raise HTTPException(status_code=404, detail="Client not found.")
+    _require_freight_write(context)
+    client = await _get_scoped_client(session, client_id, context)
 
-    existing = await session.scalar(select(Client).where(Client.email == request.email.lower()))
+    existing = await session.scalar(
+        select(Client).where(Client.organization_id == context.organization_id, Client.email == request.email.lower())
+    )
     if existing is not None and existing.id != client.id:
         raise HTTPException(status_code=409, detail="Client with this email already exists.")
 
@@ -2475,28 +2707,59 @@ async def update_client(
     client.default_margin_floor = request.default_margin_floor
     await session.commit()
     await session.refresh(client)
-    await freight_realtime_hub.publish_overview_stale_throttled(reason="client_updated")
+    await freight_realtime_hub.publish_overview_stale_throttled(
+        reason="client_updated",
+        organization_id=context.organization_id,
+    )
     return _serialize_client(client)
 
 
-@router.get("/freight/carriers", response_model=list[CarrierRecord])
-async def list_carriers(session: AsyncSession = Depends(get_session)) -> list[CarrierRecord]:
-    """List all carriers available for outreach."""
-    result = await session.execute(select(Carrier).order_by(Carrier.created_at.desc()))
-    return [_serialize_carrier(carrier) for carrier in result.scalars().all()]
+@router.get("/freight/carriers", response_model=CarrierListPage)
+async def list_carriers(
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+    q: str | None = Query(None, max_length=200, description="Filter by name, email, regions, or equipment (case-insensitive)."),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=500_000),
+) -> CarrierListPage:
+    """List carriers for outreach (paginated, optional server-side search)."""
+    stmt = select(Carrier).where(Carrier.organization_id == context.organization_id)
+    qnorm = (q or "").strip()
+    if qnorm:
+        pattern = f"%{qnorm}%"
+        stmt = stmt.where(
+            or_(
+                Carrier.name.ilike(pattern),
+                Carrier.email.ilike(pattern),
+                cast(Carrier.regions_json, String).ilike(pattern),
+                cast(Carrier.equipment_json, String).ilike(pattern),
+            )
+        )
+    stmt = stmt.order_by(Carrier.created_at.desc()).offset(offset).limit(limit + 1)
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_offset = offset + len(rows)
+    return CarrierListPage(items=[_serialize_carrier(carrier) for carrier in rows], has_more=has_more, next_offset=next_offset)
 
 
 @router.post("/freight/carriers", response_model=CarrierRecord)
 async def create_carrier(
     request: CarrierUpsertRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> CarrierRecord:
     """Create a carrier record."""
-    existing = await session.scalar(select(Carrier).where(Carrier.email == request.email.lower()))
+    _require_freight_write(context)
+    existing = await session.scalar(
+        select(Carrier).where(Carrier.organization_id == context.organization_id, Carrier.email == request.email.lower())
+    )
     if existing is not None:
         raise HTTPException(status_code=409, detail="Carrier with this email already exists.")
 
     carrier = Carrier(
+        organization_id=context.organization_id,
         name=request.name,
         email=request.email.lower(),
         rating=request.rating,
@@ -2508,16 +2771,21 @@ async def create_carrier(
     session.add(carrier)
     await session.commit()
     await session.refresh(carrier)
-    await freight_realtime_hub.publish_overview_stale_throttled(reason="carrier_created")
+    await freight_realtime_hub.publish_overview_stale_throttled(
+        reason="carrier_created",
+        organization_id=context.organization_id,
+    )
     return _serialize_carrier(carrier)
 
 
 @router.get("/freight/carriers/{carrier_id}", response_model=CarrierRecord)
-async def get_carrier(carrier_id: UUID, session: AsyncSession = Depends(get_session)) -> CarrierRecord:
+async def get_carrier(
+    carrier_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> CarrierRecord:
     """Get a carrier by id."""
-    carrier = await session.get(Carrier, carrier_id)
-    if carrier is None:
-        raise HTTPException(status_code=404, detail="Carrier not found.")
+    carrier = await _get_scoped_carrier(session, carrier_id, context)
     return _serialize_carrier(carrier)
 
 
@@ -2526,13 +2794,15 @@ async def update_carrier(
     carrier_id: UUID,
     request: CarrierUpsertRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> CarrierRecord:
     """Update a carrier record."""
-    carrier = await session.get(Carrier, carrier_id)
-    if carrier is None:
-        raise HTTPException(status_code=404, detail="Carrier not found.")
+    _require_freight_write(context)
+    carrier = await _get_scoped_carrier(session, carrier_id, context)
 
-    existing = await session.scalar(select(Carrier).where(Carrier.email == request.email.lower()))
+    existing = await session.scalar(
+        select(Carrier).where(Carrier.organization_id == context.organization_id, Carrier.email == request.email.lower())
+    )
     if existing is not None and existing.id != carrier.id:
         raise HTTPException(status_code=409, detail="Carrier with this email already exists.")
 
@@ -2545,7 +2815,10 @@ async def update_carrier(
     carrier.metadata_json = request.metadata
     await session.commit()
     await session.refresh(carrier)
-    await freight_realtime_hub.publish_overview_stale_throttled(reason="carrier_updated")
+    await freight_realtime_hub.publish_overview_stale_throttled(
+        reason="carrier_updated",
+        organization_id=context.organization_id,
+    )
     return _serialize_carrier(carrier)
 
 
@@ -2554,9 +2827,10 @@ async def list_fraud_denylist_entries(
     value: str | None = Query(default=None),
     include_inactive: bool = Query(default=True),
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> list[FraudDenylistEntryRecord]:
     """List fraud denylist entries, optionally scoped to one email/domain value."""
-    conditions = []
+    conditions = [FraudDenylistEntry.organization_id == context.organization_id]
     if not include_inactive:
         conditions.append(FraudDenylistEntry.is_active.is_(True))
     if value:
@@ -2586,19 +2860,23 @@ async def list_fraud_denylist_entries(
 async def create_fraud_denylist_entry(
     request: FraudDenylistEntryRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> FraudDenylistEntryRecord:
     """Create or reactivate a fraud denylist entry."""
+    _require_freight_write(context)
     normalized_value = _normalize_fraud_denylist_value(request.scope, request.value)
     if not normalized_value:
         raise HTTPException(status_code=400, detail="Cannot create fraud denylist entry without a sender value.")
     entry = await session.scalar(
         select(FraudDenylistEntry).where(
+            FraudDenylistEntry.organization_id == context.organization_id,
             FraudDenylistEntry.scope == request.scope.value,
             FraudDenylistEntry.value == normalized_value,
         )
     )
     if entry is None:
         entry = FraudDenylistEntry(
+            organization_id=context.organization_id,
             scope=request.scope.value,
             value=normalized_value,
             reason=request.reason,
@@ -2619,10 +2897,12 @@ async def update_fraud_denylist_entry(
     entry_id: UUID,
     request: FraudDenylistEntryUpdateRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> FraudDenylistEntryRecord:
     """Update fraud denylist entry state."""
+    _require_freight_write(context)
     entry = await session.get(FraudDenylistEntry, entry_id)
-    if entry is None:
+    if entry is None or entry.organization_id != context.organization_id:
         raise HTTPException(status_code=404, detail="Fraud denylist entry not found.")
     entry.reason = request.reason
     entry.is_active = request.is_active
@@ -2636,10 +2916,13 @@ async def update_fraud_denylist_entry(
 async def list_shipments(
     month: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}$"),
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> list[ShipmentRecord]:
     """List all tracked shipments."""
     result = await session.execute(
-        select(Shipment).where(Shipment.is_archived.is_(False)).order_by(Shipment.updated_at.desc(), Shipment.created_at.desc())
+        select(Shipment)
+        .where(Shipment.organization_id == context.organization_id, Shipment.is_archived.is_(False))
+        .order_by(Shipment.updated_at.desc(), Shipment.created_at.desc())
     )
     shipments = [
         shipment
@@ -2653,6 +2936,7 @@ async def list_shipments(
     status_review_payloads = await _latest_status_review_payloads(session, [shipment.id for shipment in shipments])
     tms_identity_payloads = await _latest_tms_identity_payloads(session, [shipment.id for shipment in shipments])
     status_workflow_payloads = await _status_workflow_payloads(session, [shipment.id for shipment in shipments])
+    source_mailbox_payloads = await _source_mailbox_payloads(session, shipments)
     document_action_payloads = await _latest_document_action_payloads(session, [shipment.id for shipment in shipments])
     clarification_flags = await _customer_clarification_requested_flags(session, shipments)
     attachment_counts = await _attachment_counts(session, shipments)
@@ -2669,6 +2953,7 @@ async def list_shipments(
                 **(status_review_payloads.get(shipment.id) or {}),
                 **(tms_identity_payloads.get(shipment.id) or {}),
                 **(status_workflow_payloads.get(shipment.id) or {}),
+                **(source_mailbox_payloads.get(shipment.id) or {}),
                 "attachment_count": attachment_counts.get(shipment.id, 0),
                 "document_summary": document_summaries.get(shipment.id, {}).get("document_summary", {}),
                 "document_enrichment": document_summaries.get(shipment.id, {}).get("document_enrichment", {}),
@@ -2705,16 +2990,19 @@ async def list_shipments(
 async def create_shipment(
     request: ShipmentUpsertRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentRecord:
     """Create a shipment manually from the dashboard."""
+    _require_freight_write(context)
     client_id = None
     if request.client_id:
         client_id = UUID(request.client_id)
         client = await session.get(Client, client_id)
-        if client is None:
+        if client is None or client.organization_id != context.organization_id:
             raise HTTPException(status_code=404, detail="Client not found.")
 
     shipment = Shipment(
+        organization_id=context.organization_id,
         client_id=client_id,
         status=request.status.value,
         origin=request.origin,
@@ -2733,7 +3021,10 @@ async def create_shipment(
     session.add(shipment)
     await session.commit()
     await session.refresh(shipment)
-    await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+    await freight_realtime_hub.publish_shipment_updated(
+        organization_id=shipment.organization_id,
+        shipment_id=str(shipment.id),
+    )
     return _serialize_shipment(shipment)
 
 
@@ -2741,6 +3032,7 @@ async def create_shipment(
 async def get_shipment_by_token(
     quote_token: str,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentRecord:
     """Get an active shipment by its public quote token."""
     normalized_token = quote_token.strip().upper()
@@ -2748,6 +3040,7 @@ async def get_shipment_by_token(
         raise HTTPException(status_code=404, detail="Shipment not found.")
     shipment = await session.scalar(
         select(Shipment).where(
+            Shipment.organization_id == context.organization_id,
             Shipment.is_archived.is_(False),
             func.upper(Shipment.quote_token) == normalized_token,
         )
@@ -2785,62 +3078,100 @@ def _shipment_archive_reason_note(shipment: Shipment) -> str | None:
     return str(legacy) if legacy else None
 
 
-@router.get("/freight/shipments/archive", response_model=list[ShipmentRecord])
+def _archived_reference_expr():
+    return func.coalesce(Shipment.archived_at, Shipment.updated_at, Shipment.created_at)
+
+
+def _effective_archive_reason_sql():
+    """SQL expression aligned with _shipment_archive_reason_code for archive filters."""
+    ar = Shipment.archived_reason
+    return case(
+        (Shipment.archive_reason_code.isnot(None), Shipment.archive_reason_code),
+        (or_(ar.is_(None), ar == ""), literal(ArchiveReasonCode.OTHER.value)),
+        (ar.ilike("%duplicate%"), literal(ArchiveReasonCode.DUPLICATE.value)),
+        (ar.ilike("%cancel%"), literal(ArchiveReasonCode.CANCELLED.value)),
+        (
+            or_(ar.ilike("%bounce%"), ar.ilike("%non-delivery%"), ar.ilike("%undeliver%")),
+            literal(ArchiveReasonCode.NON_DELIVERY_BOUNCE.value),
+        ),
+        (or_(ar.ilike("%fraud%"), ar.ilike("%spam%")), literal(ArchiveReasonCode.FRAUD.value)),
+        (ar.ilike("%test%"), literal(ArchiveReasonCode.TEST.value)),
+        (
+            or_(ar.ilike("%parse%"), ar.ilike("%invalid%"), ar.ilike("%error%")),
+            literal(ArchiveReasonCode.PARSED_ERROR.value),
+        ),
+        else_=literal(ArchiveReasonCode.OTHER.value),
+    )
+
+
+@router.get("/freight/shipments/archive", response_model=ShipmentArchivePage)
 async def list_archived_shipments(
     reason_code: ArchiveReasonCode | None = Query(default=None),
     query: str | None = Query(default=None),
     month: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}$"),
-    limit: int = Query(default=100, ge=1, le=300),
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=500_000),
     session: AsyncSession = Depends(get_session),
-) -> list[ShipmentRecord]:
-    """List archived shipments for the archive-only dashboard surface."""
-    result = await session.execute(
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> ShipmentArchivePage:
+    """List archived shipments with server-side filters, search, and pagination."""
+    ref = _archived_reference_expr()
+    stmt = (
         select(Shipment)
-        .where(Shipment.is_archived.is_(True))
+        .where(Shipment.organization_id == context.organization_id, Shipment.is_archived.is_(True))
         .order_by(Shipment.archived_at.desc().nullslast(), Shipment.created_at.desc())
-        .limit(500)
     )
-    query_text = (query or "").strip().lower()
-    rows: list[ShipmentRecord] = []
-    for shipment in result.scalars().all():
+    if month:
+        year_s, month_s = month.split("-", 1)
+        year_i = int(year_s)
+        month_i = int(month_s)
+        stmt = stmt.where(func.extract("year", ref) == year_i, func.extract("month", ref) == month_i)
+    if reason_code is not None:
+        stmt = stmt.where(_effective_archive_reason_sql() == reason_code.value)
+    qnorm = (query or "").strip()
+    if qnorm:
+        pattern = f"%{qnorm}%"
+        thread_id_txt = cast(Shipment.email_thread_id, String)
+        stmt = stmt.where(
+            or_(
+                Shipment.origin.ilike(pattern),
+                Shipment.destination.ilike(pattern),
+                Shipment.quote_token.ilike(pattern),
+                thread_id_txt.ilike(pattern),
+                Shipment.archived_reason.ilike(pattern),
+                Shipment.archive_reason_note.ilike(pattern),
+                Shipment.archive_reason_code.ilike(pattern),
+                Shipment.notes.ilike(pattern),
+            )
+        )
+    stmt = stmt.offset(offset).limit(limit + 1)
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_offset = offset + len(rows)
+    source_mailbox_payloads = await _source_mailbox_payloads(session, rows)
+    items: list[ShipmentRecord] = []
+    for shipment in rows:
         code = _shipment_archive_reason_code(shipment)
-        if reason_code and code != reason_code.value:
-            continue
-        archived_reference = shipment.archived_at or shipment.updated_at or shipment.created_at
-        if month and (archived_reference is None or archived_reference.strftime("%Y-%m") != month):
-            continue
-        if query_text:
-            haystack = " ".join(
-                [
-                    shipment.origin or "",
-                    shipment.destination or "",
-                    shipment.quote_token or "",
-                    str(shipment.email_thread_id or ""),
-                    shipment.archived_reason or "",
-                    _shipment_archive_reason_note(shipment) or "",
-                    code,
-                ]
-            ).lower()
-            if query_text not in haystack:
-                continue
-        record = _serialize_shipment(shipment)
+        record = _serialize_shipment(shipment, source_mailbox_payloads.get(shipment.id))
         record.archive_reason_code = ArchiveReasonCode(code)
         record.archive_reason_note = _shipment_archive_reason_note(shipment)
-        rows.append(record)
-        if len(rows) >= limit:
-            break
-    return rows
+        items.append(record)
+    return ShipmentArchivePage(items=items, has_more=has_more, next_offset=next_offset)
 
 
 @router.get("/freight/shipments/archive/by-token/{quote_token}", response_model=ShipmentRecord)
 async def get_archived_shipment_by_token(
     quote_token: str,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentRecord:
     """Get an archived shipment by quote token."""
     normalized_token = quote_token.strip().upper()
     shipment = await session.scalar(
         select(Shipment).where(
+            Shipment.organization_id == context.organization_id,
             Shipment.is_archived.is_(True),
             func.upper(Shipment.quote_token) == normalized_token,
         )
@@ -2854,10 +3185,11 @@ async def get_archived_shipment_by_token(
 async def get_archived_shipment(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentRecord:
     """Get an archived shipment by id."""
     shipment = await session.get(Shipment, shipment_id)
-    if shipment is None or not shipment.is_archived:
+    if shipment is None or shipment.organization_id != context.organization_id or not shipment.is_archived:
         raise HTTPException(status_code=404, detail="Archived shipment not found.")
     return await _serialize_shipment_detail(session, shipment)
 
@@ -2866,11 +3198,10 @@ async def get_archived_shipment(
 async def get_shipment(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentRecord:
     """Get a shipment by id."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None or shipment.is_archived:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    shipment = await _get_scoped_shipment(session, shipment_id, context)
     return await _serialize_shipment_detail(session, shipment)
 
 
@@ -2878,11 +3209,10 @@ async def get_shipment(
 async def get_shipment_thread(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentThreadResponse:
     """Return the email thread transcript linked to a shipment."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    shipment = await _get_scoped_shipment(session, shipment_id, context)
     if shipment.email_thread_id is None:
         return ShipmentThreadResponse(
             shipment_id=str(shipment.id),
@@ -2922,11 +3252,13 @@ async def magic_fill_shipment_field(
     shipment_id: UUID,
     request: ShipmentMagicFillRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentMagicFillResponse:
     """Use AI to recover one shipment field from the linked customer thread."""
+    _require_freight_write(context)
     logger.info("magic_fill.request shipment_id=%s field=%s apply_value=%s", shipment_id, request.field.value, request.apply_value)
     shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
+    if shipment is None or shipment.organization_id != context.organization_id:
         logger.warning("magic_fill.shipment_not_found shipment_id=%s", shipment_id)
         raise HTTPException(status_code=404, detail="Shipment not found.")
     if shipment.is_archived:
@@ -2939,7 +3271,7 @@ async def magic_fill_shipment_field(
         raise HTTPException(status_code=400, detail="Shipment has no linked customer.")
 
     client = await session.get(Client, shipment.client_id)
-    if client is None:
+    if client is None or client.organization_id != context.organization_id:
         logger.warning("magic_fill.linked_client_not_found shipment_id=%s client_id=%s", shipment_id, shipment.client_id)
         raise HTTPException(status_code=404, detail="Linked customer not found.")
 
@@ -3029,6 +3361,7 @@ async def magic_fill_shipment_field(
 
         response_confidence = max(extraction.confidence, 0.85) if used_full_extraction_fallback else extraction.confidence
         evt = WorkflowEvent(
+            organization_id=shipment.organization_id,
             shipment_id=shipment.id,
             event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
             stage=shipment.status,
@@ -3102,11 +3435,11 @@ async def update_shipment(
     shipment_id: UUID,
     request: ShipmentUpsertRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentRecord:
     """Update a shipment record."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    _require_freight_write(context)
+    shipment = await _get_scoped_shipment(session, shipment_id, context)
     if shipment.is_archived:
         raise HTTPException(status_code=409, detail="Shipment is archived and cannot be edited.")
 
@@ -3114,7 +3447,7 @@ async def update_shipment(
     if request.client_id:
         client_id = UUID(request.client_id)
         client = await session.get(Client, client_id)
-        if client is None:
+        if client is None or client.organization_id != context.organization_id:
             raise HTTPException(status_code=404, detail="Client not found.")
 
     previous_values = {
@@ -3170,6 +3503,7 @@ async def update_shipment(
     fields_evt: WorkflowEvent | None = None
     if changed_fields:
         fields_evt = WorkflowEvent(
+            organization_id=context.organization_id,
             shipment_id=shipment.id,
             event_type=WorkflowEventType.SHIPMENT_FIELDS_UPDATED.value,
             stage=shipment.status,
@@ -3186,7 +3520,10 @@ async def update_shipment(
     if fields_evt is not None:
         await freight_realtime_hub.notify_workflow_event(fields_evt)
     else:
-        await freight_realtime_hub.publish_shipment_updated(shipment_id=str(shipment.id))
+        await freight_realtime_hub.publish_shipment_updated(
+            organization_id=shipment.organization_id,
+            shipment_id=str(shipment.id),
+        )
     return _serialize_shipment(shipment)
 
 
@@ -3194,15 +3531,14 @@ async def update_shipment(
 async def list_shipment_events(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> list[WorkflowEventRecord]:
     """Return workflow events for a shipment timeline."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    shipment = await _get_scoped_shipment(session, shipment_id, context, include_archived=True)
 
     result = await session.execute(
         select(WorkflowEvent)
-        .where(WorkflowEvent.shipment_id == shipment_id)
+        .where(WorkflowEvent.organization_id == context.organization_id, WorkflowEvent.shipment_id == shipment_id)
         .order_by(WorkflowEvent.created_at.desc())
     )
     return [_serialize_workflow_event(event) for event in result.scalars().all()]
@@ -3213,19 +3549,22 @@ async def freight_notifications(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> NotificationFeedResponse:
     """Paginated notification feed projected from workflow events."""
-    return await list_notification_feed(session, limit=limit, offset=offset)
+    return await list_notification_feed(session, limit=limit, offset=offset, organization_id=context.organization_id)
 
 
 @router.get("/freight/reviews", response_model=list[ReviewQueueItem])
 async def freight_review_queue(
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> list[ReviewQueueItem]:
     """Return shipments requiring operator review."""
     result = await session.execute(
         select(WorkflowEvent)
         .where(WorkflowEvent.event_type == WorkflowEventType.MANUAL_REVIEW_REQUIRED.value)
+        .where(WorkflowEvent.organization_id == context.organization_id)
         .order_by(WorkflowEvent.created_at.desc())
         .limit(50)
     )
@@ -3233,7 +3572,9 @@ async def freight_review_queue(
     shipment_ids = [event.shipment_id for event in review_events]
     shipments_by_id: dict[UUID, Shipment] = {}
     if shipment_ids:
-        shipment_result = await session.execute(select(Shipment).where(Shipment.id.in_(shipment_ids)))
+        shipment_result = await session.execute(
+            select(Shipment).where(Shipment.organization_id == context.organization_id, Shipment.id.in_(shipment_ids))
+        )
         shipments_by_id = {shipment.id: shipment for shipment in shipment_result.scalars().all()}
     status_payloads = await _latest_status_payloads(session, shipment_ids)
     items = [
@@ -3248,20 +3589,112 @@ async def freight_review_queue(
     return sorted(items, key=_review_priority_score)
 
 
-async def _serialize_email_triage_item(session: AsyncSession, item: EmailTriageItem) -> EmailTriageRecord:
+def _has_shared_email_ops_access(context: CurrentUserContext) -> bool:
+    return context.role in {"owner", "admin", "member"} or "*" in context.permissions
+
+
+def _can_use_email_triage(context: CurrentUserContext) -> bool:
+    return "*" in context.permissions or "freight:write" in context.permissions
+
+
+def _require_freight_write(context: CurrentUserContext) -> None:
+    if "*" not in context.permissions and "freight:write" not in context.permissions:
+        raise HTTPException(status_code=403, detail="Freight write permission is required.")
+
+
+def _require_email_connect(context: CurrentUserContext) -> None:
+    if "*" not in context.permissions and "email:connect" not in context.permissions:
+        raise HTTPException(status_code=403, detail="Email sync permission is required.")
+
+
+async def _triage_email_access(
+    session: AsyncSession,
+    item: EmailTriageItem,
+    context: CurrentUserContext,
+) -> dict:
+    thread = await session.get(EmailThread, item.thread_id)
+    if thread is None or thread.organization_id != context.organization_id:
+        return {
+            "thread": None,
+            "connection": None,
+            "mailbox": None,
+            "mailbox_owner_user_id": None,
+            "visibility_mode": "metadata_only",
+            "can_view_record": False,
+            "can_view_body": False,
+            "can_take_action": False,
+        }
+    connection = await session.scalar(
+        select(EmailConnection).where(
+            EmailConnection.organization_id == context.organization_id,
+            EmailConnection.provider == thread.provider,
+            EmailConnection.mailbox == thread.mailbox,
+        )
+    )
+    mailbox = thread.mailbox
+    mailbox_owner_user_id = connection.user_id if connection is not None else None
+    visibility_mode = (connection.visibility_mode if connection is not None else "metadata_only") or "private"
+    is_owner = bool(mailbox_owner_user_id and mailbox_owner_user_id == context.user_id)
+    has_ops_access = _has_shared_email_ops_access(context)
+    if is_owner:
+        can_view_record = True
+        can_view_body = True
+        can_take_action = True
+    elif visibility_mode == "shared_ops" and has_ops_access:
+        can_view_record = True
+        can_view_body = True
+        can_take_action = True
+    elif visibility_mode == "metadata_only" and has_ops_access:
+        can_view_record = True
+        can_view_body = False
+        can_take_action = False
+    else:
+        can_view_record = False
+        can_view_body = False
+        can_take_action = False
+    return {
+        "thread": thread,
+        "connection": connection,
+        "mailbox": mailbox,
+        "mailbox_owner_user_id": str(mailbox_owner_user_id) if mailbox_owner_user_id else None,
+        "visibility_mode": visibility_mode,
+        "can_view_record": can_view_record,
+        "can_view_body": can_view_body,
+        "can_take_action": can_take_action,
+    }
+
+
+async def _serialize_email_triage_item(
+    session: AsyncSession,
+    item: EmailTriageItem,
+    context: CurrentUserContext,
+) -> EmailTriageRecord | None:
+    access = await _triage_email_access(session, item, context)
+    if not access["can_view_record"]:
+        return None
     message = await session.get(EmailMessage, item.email_message_id)
+    if message is not None and message.organization_id != context.organization_id:
+        return None
     shipment = None
     if item.created_shipment_id:
         shipment = await session.get(Shipment, item.created_shipment_id)
     elif item.thread_id:
         shipment = await session.scalar(
-            select(Shipment).where(Shipment.email_thread_id == item.thread_id).order_by(Shipment.created_at.desc())
+            select(Shipment)
+            .where(Shipment.organization_id == context.organization_id, Shipment.email_thread_id == item.thread_id)
+            .order_by(Shipment.created_at.desc())
         )
+    body_preview = message.body_preview if message and access["can_view_body"] else None
     return EmailTriageRecord(
         id=str(item.id),
         email_message_id=str(item.email_message_id),
         thread_id=str(item.thread_id),
         shipment_id=str(shipment.id) if shipment else None,
+        mailbox=access["mailbox"],
+        mailbox_owner_user_id=access["mailbox_owner_user_id"],
+        visibility_mode=access["visibility_mode"],
+        can_view_body=bool(access["can_view_body"]),
+        can_take_action=bool(access["can_take_action"]),
         classification=item.classification,
         confidence=float(item.confidence or 0),
         reason=item.reason,
@@ -3271,51 +3704,123 @@ async def _serialize_email_triage_item(session: AsyncSession, item: EmailTriageI
         created_shipment_id=str(item.created_shipment_id) if item.created_shipment_id else None,
         sender=message.sender if message else None,
         subject=message.subject if message else None,
-        body_preview=message.body_preview if message else None,
+        body_preview=body_preview,
         received_at=message.received_at if message else None,
         payload=dict(item.payload_json or {}),
         created_at=item.created_at,
     )
 
 
-@router.get("/freight/email-triage", response_model=list[EmailTriageRecord])
+# Confidence on EmailTriageItem is 0–1; items at or above this are "high confidence" for queue filtering.
+EMAIL_TRIAGE_HIGH_CONFIDENCE_THRESHOLD = 0.85
+
+
+@router.get("/freight/email-triage", response_model=EmailTriageQueuePage)
 async def freight_email_triage_queue(
     include_resolved: bool = Query(default=False),
-    limit: int = Query(default=50, ge=1, le=100),
+    include_high_confidence: bool = Query(
+        default=False,
+        description="When false (default), exclude items with confidence ≥ 0.85 so operators see uncertain cases first.",
+    ),
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=500_000),
+    q: str | None = Query(None, max_length=200),
     session: AsyncSession = Depends(get_session),
-) -> list[EmailTriageRecord]:
-    """Return pre-shipment email triage items for operator review."""
-    query = select(EmailTriageItem).order_by(EmailTriageItem.created_at.desc()).limit(limit)
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> EmailTriageQueuePage:
+    """Return pre-shipment email triage items for operator review (paginated, optional server-side search)."""
+    if not _can_use_email_triage(context):
+        raise HTTPException(status_code=403, detail="Email triage is available only to operators.")
+    stmt = (
+        select(EmailTriageItem)
+        .join(EmailMessage, EmailMessage.id == EmailTriageItem.email_message_id)
+        .join(EmailThread, EmailThread.id == EmailTriageItem.thread_id)
+        .where(EmailTriageItem.organization_id == context.organization_id)
+        .where(EmailMessage.organization_id == context.organization_id)
+        .where(EmailThread.organization_id == context.organization_id)
+        .order_by(EmailTriageItem.created_at.desc())
+    )
     if not include_resolved:
-        query = query.where(EmailTriageItem.resolved_at.is_(None))
-    result = await session.execute(query)
-    return [await _serialize_email_triage_item(session, item) for item in result.scalars().all()]
+        stmt = stmt.where(EmailTriageItem.resolved_at.is_(None))
+    if not include_high_confidence:
+        stmt = stmt.where(EmailTriageItem.confidence < EMAIL_TRIAGE_HIGH_CONFIDENCE_THRESHOLD)
+    qnorm = (q or "").strip()
+    if qnorm:
+        pattern = f"%{qnorm}%"
+        stmt = stmt.where(
+            or_(
+                EmailMessage.subject.ilike(pattern),
+                EmailMessage.sender.ilike(pattern),
+                EmailMessage.body_preview.ilike(pattern),
+                EmailTriageItem.reason.ilike(pattern),
+                EmailTriageItem.classification.ilike(pattern),
+                EmailThread.mailbox.ilike(pattern),
+            )
+        )
+    stmt = stmt.offset(offset).limit(limit + 1)
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_offset = offset + len(rows)
+    records: list[EmailTriageRecord] = []
+    for item in rows:
+        record = await _serialize_email_triage_item(session, item, context)
+        if record is not None:
+            records.append(record)
+    return EmailTriageQueuePage(items=records, has_more=has_more, next_offset=next_offset)
 
 
 @router.post("/freight/email-triage/{triage_id}/action", response_model=EmailTriageRecord)
 async def freight_email_triage_action(
     triage_id: UUID,
     request: EmailTriageActionRequest,
+    http_request: Request,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> EmailTriageRecord:
     """Resolve a triage item by creating/linking a shipment or marking it as non-shipment/fraud."""
+    if not _can_use_email_triage(context):
+        raise HTTPException(status_code=403, detail="Email triage actions are available only to operators.")
     item = await session.get(EmailTriageItem, triage_id)
-    if item is None:
+    if item is None or item.organization_id != context.organization_id:
         raise HTTPException(status_code=404, detail="Email triage item not found.")
     message = await session.get(EmailMessage, item.email_message_id)
     thread = await session.get(EmailThread, item.thread_id)
-    if message is None or thread is None:
+    if message is None or thread is None or message.organization_id != context.organization_id or thread.organization_id != context.organization_id:
         raise HTTPException(status_code=404, detail="Triage source email not found.")
+    access = await _triage_email_access(session, item, context)
+    if not access["can_take_action"]:
+        await log_audit(
+            session,
+            event_type="email_triage_access_denied",
+            organization_id=context.organization_id,
+            user_id=context.user_id,
+            actor=context.email,
+            request=http_request,
+            payload={
+                "triage_id": str(item.id),
+                "email_message_id": str(item.email_message_id),
+                "mailbox": access["mailbox"],
+                "visibility_mode": access["visibility_mode"],
+                "action": request.action.value,
+            },
+        )
+        await session.commit()
+        raise HTTPException(status_code=403, detail="You do not have access to act on this mailbox email.")
 
     now = datetime.now(timezone.utc)
     shipment: Shipment | None = None
     if request.action == EmailTriageAction.CREATE_SHIPMENT:
         shipment = await session.scalar(
-            select(Shipment).where(Shipment.email_thread_id == thread.id).order_by(Shipment.created_at.desc())
+            select(Shipment)
+            .where(Shipment.organization_id == context.organization_id, Shipment.email_thread_id == thread.id)
+            .order_by(Shipment.created_at.desc())
         )
         if shipment is None:
             thread.quote_token = thread.quote_token or generate_quote_reference().subject_token
             shipment = Shipment(
+                organization_id=context.organization_id,
                 email_thread_id=thread.id,
                 status=ShipmentStage.RECEIVED.value,
                 quote_token=thread.quote_token,
@@ -3333,7 +3838,7 @@ async def freight_email_triage_action(
         if not request.shipment_id:
             raise HTTPException(status_code=400, detail="shipment_id is required to link triage email.")
         shipment = await session.get(Shipment, UUID(str(request.shipment_id)))
-        if shipment is None:
+        if shipment is None or shipment.organization_id != context.organization_id:
             raise HTTPException(status_code=404, detail="Shipment not found.")
         shipment.email_thread_id = shipment.email_thread_id or thread.id
         item.created_shipment_id = shipment.id
@@ -3368,8 +3873,27 @@ async def freight_email_triage_action(
 
     item.resolved_at = item.resolved_at or now
     item.updated_at = now
+    await log_audit(
+        session,
+        event_type="email_triage_action_executed",
+        organization_id=context.organization_id,
+        user_id=context.user_id,
+        actor=context.email,
+        request=http_request,
+        payload={
+            "triage_id": str(item.id),
+            "email_message_id": str(item.email_message_id),
+            "mailbox": access["mailbox"],
+            "visibility_mode": access["visibility_mode"],
+            "action": request.action.value,
+            "created_shipment_id": str(item.created_shipment_id) if item.created_shipment_id else None,
+        },
+    )
     await session.commit()
-    return await _serialize_email_triage_item(session, item)
+    record = await _serialize_email_triage_item(session, item, context)
+    if record is None:
+        raise HTTPException(status_code=403, detail="You do not have access to this mailbox email.")
+    return record
 
 
 @router.get("/freight/status-queue", response_model=list[StatusQueueItem])
@@ -3377,12 +3901,17 @@ async def freight_status_queue(
     include_resolved: bool = Query(default=False),
     resolved_limit: int = Query(default=25, ge=1, le=100),
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> list[StatusQueueItem]:
     """Return active operator tasks for Phase 3 status workflows."""
-    active_items = await _active_status_queue_items(session)
+    active_items = await _active_status_queue_items(session, organization_id=context.organization_id)
     if not include_resolved:
         return active_items
-    resolved_items = await _resolved_status_queue_items(session, limit=resolved_limit)
+    resolved_items = await _resolved_status_queue_items(
+        session,
+        limit=resolved_limit,
+        organization_id=context.organization_id,
+    )
     return [*active_items, *resolved_items]
 
 
@@ -3391,13 +3920,15 @@ async def freight_status_queue_action(
     task_id: UUID,
     request: StatusQueueActionRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> StatusQueueActionResponse:
     """Run an operator action on a status queue task."""
+    _require_freight_write(context)
     task_event = await session.get(WorkflowEvent, task_id)
-    if task_event is None:
+    if task_event is None or task_event.organization_id != context.organization_id:
         raise HTTPException(status_code=404, detail="Status queue task not found.")
     shipment = await session.get(Shipment, task_event.shipment_id)
-    if shipment is None:
+    if shipment is None or shipment.organization_id != context.organization_id:
         raise HTTPException(status_code=404, detail="Shipment not found.")
 
     payload = dict(task_event.payload_json or {})
@@ -3609,18 +4140,47 @@ async def freight_status_queue_action(
 @router.post("/freight/tms/status-event", response_model=TmsStatusIngestResponse)
 async def freight_tms_status_event(
     request: TmsStatusIngestRequest,
+    authorization: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> TmsStatusIngestResponse:
     """Ingest an inbound TMS status event and reconcile it to a shipment."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="TMS inbound token is required.")
+    raw_token = authorization.split(" ", 1)[1].strip()
+    integration = await session.scalar(
+        select(OrganizationTmsIntegration).where(
+            OrganizationTmsIntegration.inbound_token_hash == hash_token(raw_token),
+            OrganizationTmsIntegration.status == "active",
+        )
+    )
+    if integration is None:
+        raise HTTPException(status_code=403, detail="Invalid TMS inbound token.")
+    organization_id = integration.organization_id
+
     shipment: Shipment | None = None
     if request.shipment_id:
-        shipment = await session.get(Shipment, UUID(request.shipment_id))
+        try:
+            candidate = await session.get(Shipment, UUID(request.shipment_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="shipment_id must be a valid UUID.") from exc
+        if candidate is not None and candidate.organization_id == organization_id:
+            shipment = candidate
     if shipment is None and request.quote_token:
-        shipment = await session.scalar(select(Shipment).where(Shipment.quote_token == request.quote_token))
+        shipment = await session.scalar(
+            select(Shipment).where(
+                Shipment.organization_id == organization_id,
+                Shipment.quote_token == request.quote_token,
+            )
+        )
     if shipment is None and request.external_load_ref:
-        shipment = await session.scalar(select(Shipment).where(Shipment.quote_token == request.external_load_ref))
+        shipment = await session.scalar(
+            select(Shipment).where(
+                Shipment.organization_id == organization_id,
+                Shipment.quote_token == request.external_load_ref,
+            )
+        )
     if shipment is None and request.tms_load_id:
-        shipment_result = await session.execute(select(Shipment))
+        shipment_result = await session.execute(select(Shipment).where(Shipment.organization_id == organization_id))
         for candidate in shipment_result.scalars().all():
             identity_payload = (await _latest_tms_identity_payloads(session, [candidate.id])).get(candidate.id) or {}
             if str(identity_payload.get("tms_load_id") or "") == request.tms_load_id:
@@ -3633,6 +4193,7 @@ async def freight_tms_status_event(
         select(WorkflowEvent)
         .where(
             WorkflowEvent.shipment_id == shipment.id,
+            WorkflowEvent.organization_id == organization_id,
             WorkflowEvent.event_type == WorkflowEventType.TMS_STATUS_INGESTED.value,
         )
         .order_by(WorkflowEvent.created_at.desc())
@@ -3671,6 +4232,7 @@ async def freight_tms_status_event(
             )
 
     ingest_evt = WorkflowEvent(
+        organization_id=shipment.organization_id,
         shipment_id=shipment.id,
         event_type=WorkflowEventType.TMS_STATUS_INGESTED.value,
         stage=shipment.status,
@@ -3728,11 +4290,11 @@ async def freight_operator_action(
     shipment_id: UUID,
     request: ShipmentOperatorActionRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentOperatorActionResponse:
     """Run an operator-approved Phase 1 action on a shipment."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    _require_freight_write(context)
+    shipment = await _get_scoped_shipment(session, shipment_id, context, include_archived=True)
 
     if shipment.is_archived and request.action not in {OperatorAction.ARCHIVE_SHIPMENT, OperatorAction.MARK_SENDER_FRAUD}:
         raise HTTPException(status_code=409, detail="Shipment is archived and cannot continue active workflow actions.")
@@ -3774,6 +4336,7 @@ async def freight_operator_action(
                     source_shipment_id=shipment.id,
                 )
                 fraud_evt = WorkflowEvent(
+                    organization_id=shipment.organization_id,
                     shipment_id=shipment.id,
                     event_type=WorkflowEventType.SENDER_FRAUD_MARKED.value,
                     stage=shipment.status,
@@ -3880,6 +4443,7 @@ async def freight_operator_action(
                     ),
                 )
             verify_evt = WorkflowEvent(
+                organization_id=shipment.organization_id,
                 shipment_id=shipment.id,
                 event_type=WorkflowEventType.SENDER_VERIFIED.value,
                 stage=shipment.status,
@@ -4150,6 +4714,7 @@ async def freight_operator_action(
             _attachments, document_health, document_context = await _collect_document_state(session, shipment)
             approved_fields = dict(document_health.get("document_enrichment", {}) or {})
             approve_evt = WorkflowEvent(
+                organization_id=shipment.organization_id,
                 shipment_id=shipment.id,
                 event_type=WorkflowEventType.DOCUMENT_VALUES_APPROVED.value,
                 stage=shipment.status,
@@ -4188,6 +4753,7 @@ async def freight_operator_action(
         if request.action == OperatorAction.IGNORE_DOCUMENT_WARNING:
             _attachments, document_health, document_context = await _collect_document_state(session, shipment)
             ignore_evt = WorkflowEvent(
+                organization_id=shipment.organization_id,
                 shipment_id=shipment.id,
                 event_type=WorkflowEventType.DOCUMENT_WARNING_IGNORED.value,
                 stage=shipment.status,
@@ -4246,6 +4812,7 @@ async def archive_shipment(
     shipment_id: UUID,
     request: ShipmentArchiveRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentOperatorActionResponse:
     return await freight_operator_action(
         shipment_id,
@@ -4257,6 +4824,7 @@ async def archive_shipment(
             fraud_block_scope=request.fraud_block_scope,
         ),
         session,
+        context,
     )
 
 
@@ -4264,16 +4832,15 @@ async def archive_shipment(
 async def list_shipment_bids(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> list[BidRecord]:
     """Return all bids for a shipment."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    shipment = await _get_scoped_shipment(session, shipment_id, context)
 
     result = await session.execute(
         select(CarrierBid, Carrier)
         .join(Carrier, Carrier.id == CarrierBid.carrier_id)
-        .where(CarrierBid.shipment_id == shipment_id)
+        .where(CarrierBid.organization_id == context.organization_id, CarrierBid.shipment_id == shipment.id)
         .order_by(CarrierBid.received_at.desc())
     )
     return [_serialize_bid_record(bid, carrier) for bid, carrier in result.all()]
@@ -4283,11 +4850,10 @@ async def list_shipment_bids(
 async def list_shipment_documents(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> list[ShipmentDocumentRecord]:
     """Return typed document metadata collected from the shipment email thread."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    shipment = await _get_scoped_shipment(session, shipment_id, context, include_archived=True)
     documents = await collect_shipment_attachments(session, shipment)
     return [_serialize_document_record(document) for document in documents]
 
@@ -4299,14 +4865,15 @@ async def list_shipment_documents(
 async def reprocess_shipment_documents(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentOperatorActionResponse:
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context, include_archived=True)
     return await freight_operator_action(
         shipment_id,
         ShipmentOperatorActionRequest(action=OperatorAction.RERUN_DOCUMENT_EXTRACTION),
         session,
+        context,
     )
 
 
@@ -4317,14 +4884,15 @@ async def reprocess_shipment_documents(
 async def approve_shipment_documents(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentOperatorActionResponse:
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context, include_archived=True)
     return await freight_operator_action(
         shipment_id,
         ShipmentOperatorActionRequest(action=OperatorAction.APPROVE_DOCUMENT_VALUES),
         session,
+        context,
     )
 
 
@@ -4335,14 +4903,15 @@ async def approve_shipment_documents(
 async def ignore_shipment_document_warning(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentOperatorActionResponse:
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context, include_archived=True)
     return await freight_operator_action(
         shipment_id,
         ShipmentOperatorActionRequest(action=OperatorAction.IGNORE_DOCUMENT_WARNING),
         session,
+        context,
     )
 
 
@@ -4354,11 +4923,11 @@ async def shipment_carrier_outreach(
     shipment_id: UUID,
     request: CarrierOutreachRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> CarrierOutreachResponse:
     """Create and optionally send anonymized outreach to carriers for a shipment."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
 
     try:
         return await create_carrier_outreach(
@@ -4380,8 +4949,11 @@ async def shipment_carrier_followup(
     shipment_id: UUID,
     request: CarrierFollowupRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> CarrierFollowupResponse:
     """Send a follow-up to one carrier, replying in-thread after first contact."""
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
     try:
         return await send_carrier_followup(
             session,
@@ -4400,10 +4972,14 @@ async def shipment_carrier_followup(
 async def freight_bid_intake(
     request: BidIntakeRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> BidIntakeResponse:
     """Intake a bid from a carrier reply or manual operator entry."""
+    _require_freight_write(context)
+    if request.shipment_id:
+        await _get_scoped_shipment(session, UUID(request.shipment_id), context)
     try:
-        return await intake_bid(session, request)
+        return await intake_bid(session, request, organization_id=context.organization_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -4415,8 +4991,11 @@ async def freight_bid_intake(
 async def freight_evaluate_shipment(
     shipment_id: UUID,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ShipmentEvaluationResponse:
     """Evaluate received bids and recommend the best option."""
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
     try:
         return await evaluate_shipment_bids(session, shipment_id)
     except RuntimeError as exc:
@@ -4431,8 +5010,11 @@ async def freight_client_acknowledgement(
     shipment_id: UUID,
     request: ClientAcknowledgementRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> ClientAcknowledgementResponse:
     """Build or send the initial acknowledgement back to the customer."""
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
     try:
         return await send_client_acknowledgement(
             session,
@@ -4452,8 +5034,11 @@ async def freight_customer_quote(
     shipment_id: UUID,
     request: CustomerQuoteRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> CustomerQuoteResponse:
     """Send or preview the customer quote based on the selected bid."""
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
     try:
         return await send_customer_quote(
             session,
@@ -4474,8 +5059,11 @@ async def freight_customer_status_reply(
     shipment_id: UUID,
     request: CustomerStatusReplyRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> CustomerStatusReplyResponse:
     """Build or send a customer-facing shipment status reply from current TMS status."""
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
     try:
         status_response = await fetch_tms_shipment_status(session, shipment_id=shipment_id)
         return await send_customer_status_reply(
@@ -4497,11 +5085,11 @@ async def freight_carrier_status_update(
     shipment_id: UUID,
     request: CarrierStatusUpdateRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> CarrierStatusUpdateResponse:
     """Preview or send a structured carrier status update into the TMS."""
-    shipment = await session.get(Shipment, shipment_id)
-    if shipment is None:
-        raise HTTPException(status_code=404, detail="Shipment not found.")
+    _require_freight_write(context)
+    shipment = await _get_scoped_shipment(session, shipment_id, context)
     try:
         latest_carrier_message = await _latest_carrier_message_for_shipment(session, shipment)
         parsed_status_text = request.status_text
@@ -4548,8 +5136,11 @@ async def freight_tms_handoff(
     shipment_id: UUID,
     request: TmsHandoffRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> TmsHandoffResponse:
     """Preview or submit the selected shipment to the TMS."""
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
     try:
         return await handoff_to_tms(
             session,
@@ -4569,8 +5160,11 @@ async def freight_book_shipment(
     shipment_id: UUID,
     request: TmsHandoffRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> BookingExecutionResponse:
     """Confirm booking, submit to TMS, and send customer booking confirmation."""
+    _require_freight_write(context)
+    await _get_scoped_shipment(session, shipment_id, context)
     try:
         handoff, confirmation = await confirm_booking_and_handoff(
             session,
@@ -4590,8 +5184,12 @@ async def freight_book_shipment(
 
 
 @router.get("/freight/reference-preview")
-async def freight_reference_preview(subject: str = "New quote request") -> dict:
+async def freight_reference_preview(
+    subject: str = "New quote request",
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> dict:
     """Preview deterministic quote reference generation and subject correlation."""
+    _ = context
     reference = generate_quote_reference()
     final_subject = f"{subject.strip()} [{reference.subject_token}]"
     signals = build_correlation_signals(subject=final_subject)
@@ -4605,9 +5203,10 @@ async def freight_reference_preview(subject: str = "New quote request") -> dict:
 @router.get("/freight/overview", response_model=FreightOverviewResponse)
 async def freight_overview(
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> FreightOverviewResponse:
     """Return current freight data footprint and shipment stage distribution."""
-    return await build_freight_overview(session)
+    return await build_freight_overview(session, organization_id=context.organization_id)
 
 
 def _financial_margin_amount(base_amount: float, margin_policy: dict) -> tuple[float, float]:
@@ -4622,9 +5221,10 @@ def _financial_margin_amount(base_amount: float, margin_policy: dict) -> tuple[f
 async def freight_financial_summary(
     month: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}$"),
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> FreightFinancialSummaryResponse:
     """Return bid-backed financial projections for the active shipment board."""
-    shipment_conditions = [Shipment.is_archived.is_(False)]
+    shipment_conditions = [Shipment.organization_id == context.organization_id, Shipment.is_archived.is_(False)]
     if month:
         year, month_number = (int(part) for part in month.split("-"))
         month_start = datetime(year, month_number, 1, tzinfo=timezone.utc)
@@ -4655,6 +5255,7 @@ async def freight_financial_summary(
             func.max(selected_amount).label("selected_bid_amount"),
         )
         .where(CarrierBid.shipment_id.in_(shipment_ids))
+        .where(CarrierBid.organization_id == context.organization_id)
         .group_by(CarrierBid.shipment_id)
     )
     bid_summaries = {
@@ -4713,8 +5314,10 @@ async def freight_financial_summary(
 async def freight_outlook_ingest(
     request: OutlookIngestRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> OutlookSyncResponse:
     """Normalize a provided Outlook message payload into freight workflow tables."""
+    _require_email_connect(context)
     policy = _build_automation_policy(
         auto_acknowledgement=request.auto_acknowledge_new_shipment,
         acknowledgement_dry_run=request.acknowledgement_dry_run,
@@ -4725,17 +5328,27 @@ async def freight_outlook_ingest(
         auto_book=request.auto_book_on_confirmation,
         booking_dry_run=request.booking_dry_run,
     )
-    client = OutlookGraphClient()
+    try:
+        organization_id, mailbox = await _resolve_outlook_sync_context(session, context=context)
+        client = await build_outlook_graph_client(session, context.organization_id, mailbox=mailbox)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     mailbox_message = client.normalize_message(request.message)
     result = await _process_outlook_mailbox_message(
         session,
         mailbox_message=mailbox_message,
         policy=policy,
+        organization_id=organization_id,
+        mailbox=mailbox,
         create_client_if_missing=request.create_client_if_missing,
     )
     if result is None:
         return OutlookSyncResponse(imported=0, skipped=1, results=[])
-    expired = await evaluate_expired_quote_windows(session, policy=policy)
+    expired = await evaluate_expired_quote_windows(
+        session,
+        policy=policy,
+        organization_id=organization_id,
+    )
 
     return OutlookSyncResponse(
         imported=1,
@@ -4757,8 +5370,10 @@ async def freight_outlook_ingest(
 async def freight_outlook_sync(
     request: OutlookSyncRequest,
     session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ) -> OutlookSyncResponse:
     """Pull recent Outlook inbox messages and ingest them into workflow tables."""
+    _require_email_connect(context)
     policy = _build_automation_policy(
         auto_acknowledgement=request.auto_acknowledge_new_shipments,
         acknowledgement_dry_run=request.acknowledgement_dry_run,
@@ -4769,7 +5384,11 @@ async def freight_outlook_sync(
         auto_book=request.auto_book_on_confirmation,
         booking_dry_run=request.booking_dry_run,
     )
-    outlook = OutlookGraphClient()
+    try:
+        organization_id, mailbox = await _resolve_outlook_sync_context(session, context=context)
+        outlook = await build_outlook_graph_client(session, context.organization_id, mailbox=mailbox)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     try:
         messages = await outlook.list_messages(limit=request.limit)
     except RuntimeError as exc:
@@ -4792,6 +5411,8 @@ async def freight_outlook_sync(
             session,
             mailbox_message=message,
             policy=policy,
+            organization_id=organization_id,
+            mailbox=mailbox,
         )
         if result is None:
             skipped += 1
@@ -4808,7 +5429,11 @@ async def freight_outlook_sync(
         manual_reviews += 1 if result.manual_review_required else 0
         results.append(result)
 
-    expired = await evaluate_expired_quote_windows(session, policy=policy)
+    expired = await evaluate_expired_quote_windows(
+        session,
+        policy=policy,
+        organization_id=organization_id,
+    )
     auto_evaluations += len(expired)
     auto_quotes += len([item for item in expired if item.quote_auto_sent])
 
@@ -4829,33 +5454,142 @@ async def freight_outlook_sync(
 
 
 @router.get("/freight/outlook/webhook/status", response_model=OutlookWebhookStatusResponse)
-async def freight_outlook_webhook_status() -> OutlookWebhookStatusResponse:
+async def freight_outlook_webhook_status(
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> OutlookWebhookStatusResponse:
     """Report whether the configured Outlook webhook subscription exists and is active."""
-    outlook = OutlookGraphClient()
-    if not outlook.webhook_is_configured():
-        return _outlook_webhook_status_response(outlook=outlook, subscriptions=[])
+    row = await get_organization_outlook_row(session, context.organization_id)
+    base_missing = missing_fields_for_outlook_row(row)
+    expected_url = settings.microsoft_webhook_notification_url or None
+    expected_resource: str | None = None
+    expected_change = settings.microsoft_webhook_change_type or None
+    connection = await session.scalar(
+        select(EmailConnection).where(
+            EmailConnection.organization_id == context.organization_id,
+            EmailConnection.user_id == context.user_id,
+            EmailConnection.provider == "outlook",
+            EmailConnection.mailbox == context.email.strip().lower(),
+            EmailConnection.status == "active",
+        )
+    )
+    if connection:
+        expected_resource = inbox_subscription_resource(connection.mailbox)
+
+    if base_missing or not expected_url or connection is None:
+        mf = sorted(set(base_missing + (["microsoft_webhook_public_base_url"] if not expected_url else []) + ([] if connection else ["email_connection"])))
+        now = datetime.now(timezone.utc)
+        return OutlookWebhookStatusResponse(
+            configured=False,
+            status="missing_configuration",
+            missing_fields=mf,
+            expected_notification_url=expected_url,
+            expected_resource=expected_resource,
+            expected_change_type=expected_change,
+            total_subscriptions=0,
+            last_checked_at=now.isoformat().replace("+00:00", "Z"),
+        )
+
+    try:
+        outlook = await build_outlook_graph_client(
+            session,
+            context.organization_id,
+            mailbox=connection.mailbox,
+            email_connection_id=connection.id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     try:
         subscriptions = await outlook.list_subscriptions()
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return _outlook_webhook_status_response(outlook=outlook, subscriptions=subscriptions)
+    return _outlook_webhook_status_response(
+        outlook=outlook,
+        subscriptions=subscriptions,
+        expected_notification_url=expected_url,
+        expected_resource=expected_resource,
+        expected_change_type=expected_change,
+    )
 
 
 @router.post("/freight/outlook/webhook/ensure", response_model=OutlookWebhookStatusResponse)
-async def freight_outlook_webhook_ensure() -> OutlookWebhookStatusResponse:
+async def freight_outlook_webhook_ensure(
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> OutlookWebhookStatusResponse:
     """Create or renew the configured Outlook webhook subscription."""
-    outlook = OutlookGraphClient()
+    _require_email_connect(context)
+    row = await get_organization_outlook_row(session, context.organization_id)
+    base_missing = missing_fields_for_outlook_row(row)
+    expected_url = settings.microsoft_webhook_notification_url or None
+    expected_resource: str | None = None
+    expected_change = settings.microsoft_webhook_change_type or None
+    connection = await session.scalar(
+        select(EmailConnection).where(
+            EmailConnection.organization_id == context.organization_id,
+            EmailConnection.user_id == context.user_id,
+            EmailConnection.provider == "outlook",
+            EmailConnection.mailbox == context.email.strip().lower(),
+            EmailConnection.status == "active",
+        )
+    )
+    if connection:
+        expected_resource = inbox_subscription_resource(connection.mailbox)
+    if base_missing or not expected_url or connection is None:
+        mf = sorted(set(base_missing + (["microsoft_webhook_public_base_url"] if not expected_url else []) + ([] if connection else ["email_connection"])))
+        now = datetime.now(timezone.utc)
+        return OutlookWebhookStatusResponse(
+            configured=False,
+            status="missing_configuration",
+            missing_fields=mf,
+            expected_notification_url=expected_url,
+            expected_resource=expected_resource,
+            expected_change_type=expected_change,
+            total_subscriptions=0,
+            last_checked_at=now.isoformat().replace("+00:00", "Z"),
+        )
+
+    outlook = await build_outlook_graph_client(
+        session,
+        context.organization_id,
+        mailbox=connection.mailbox,
+        email_connection_id=connection.id,
+    )
     try:
         subscription = await outlook.ensure_inbox_webhook_subscription()
+        await apply_graph_subscription_to_email_connection(session, connection.id, subscription)
+        await session.commit()
         subscriptions = await outlook.list_subscriptions()
     except RuntimeError as exc:
+        await session.rollback()
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     action = str(subscription.get("subscriptionAction") or "ensured")
     return _outlook_webhook_status_response(
         outlook=outlook,
         subscriptions=subscriptions,
+        expected_notification_url=expected_url,
+        expected_resource=expected_resource,
+        expected_change_type=expected_change,
         subscription_action=action,
     )
+
+
+@router.get("/freight/outlook/auto-sync/status", response_model=OutlookWebhookStatusResponse)
+async def freight_outlook_auto_sync_status(
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> OutlookWebhookStatusResponse:
+    """Return Outlook auto-sync subscription status."""
+    return await freight_outlook_webhook_status(session=session, context=context)
+
+
+@router.post("/freight/outlook/auto-sync/ensure", response_model=OutlookWebhookStatusResponse)
+async def freight_outlook_auto_sync_ensure(
+    session: AsyncSession = Depends(get_session),
+    context: CurrentUserContext = Depends(get_current_user_context),
+) -> OutlookWebhookStatusResponse:
+    """Create or renew the Outlook auto-sync subscription."""
+    return await freight_outlook_webhook_ensure(session=session, context=context)
 
 
 @router.post("/freight/outlook/webhook", response_model=OutlookWebhookResponse)
@@ -4874,20 +5608,16 @@ async def freight_outlook_webhook(
 
     async with async_session() as session:
         policy = _default_outlook_event_policy()
-        outlook = OutlookGraphClient()
 
         imported = 0
         skipped = 0
         ignored = 0
         manual_reviews = 0
         results: list[OutlookIngestResult] = []
+        touched_organization_ids: set[UUID] = set()
 
         notifications = request.value if request else []
         for notification in notifications:
-            client_state = settings.microsoft_webhook_client_state
-            if client_state and notification.clientState and notification.clientState != client_state:
-                ignored += 1
-                continue
             if notification.changeType and "created" not in notification.changeType.lower():
                 ignored += 1
                 continue
@@ -4897,6 +5627,30 @@ async def freight_outlook_webhook(
             if not message_id and notification.resource:
                 message_id = str(notification.resource).rstrip("/").split("/")[-1]
             if not message_id:
+                ignored += 1
+                continue
+
+            webhook_context = await _resolve_outlook_webhook_context(session, notification)
+            if webhook_context is None:
+                ignored += 1
+                continue
+            org_id, mailbox, email_connection_id = webhook_context
+            touched_organization_ids.add(org_id)
+            try:
+                outlook = await build_outlook_graph_client(
+                    session,
+                    org_id,
+                    mailbox=mailbox,
+                    email_connection_id=email_connection_id,
+                )
+            except RuntimeError:
+                ignored += 1
+                continue
+            resource_mailbox = mailbox_from_graph_resource(notification.resource)
+            # Graph webhook resources may use an Azure user id instead of the mailbox email
+            # (Users/{id}/Messages/{messageId}). When signed clientState has already resolved
+            # the EmailConnection, only compare resources that actually contain an email.
+            if resource_mailbox and "@" in resource_mailbox and resource_mailbox != outlook.mailbox.lower():
                 ignored += 1
                 continue
 
@@ -4910,6 +5664,8 @@ async def freight_outlook_webhook(
                 session,
                 mailbox_message=mailbox_message,
                 policy=policy,
+                organization_id=org_id,
+                mailbox=mailbox,
             )
             if result is None:
                 skipped += 1
@@ -4918,10 +5674,15 @@ async def freight_outlook_webhook(
             manual_reviews += 1 if result.manual_review_required else 0
             results.append(result)
 
-        expired = await evaluate_expired_quote_windows(session, policy=policy)
-        for item in expired:
-            if item.manual_review_required:
-                manual_reviews += 1
+        for org_id in touched_organization_ids:
+            expired = await evaluate_expired_quote_windows(
+                session,
+                policy=policy,
+                organization_id=org_id,
+            )
+            for item in expired:
+                if item.manual_review_required:
+                    manual_reviews += 1
 
         return OutlookWebhookResponse(
             accepted=True,

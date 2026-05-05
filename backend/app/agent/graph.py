@@ -27,8 +27,14 @@ from langgraph.graph import END, StateGraph
 
 from app.agent.llm import get_primary_llm
 from app.agent.prompts import SYSTEM_PROMPT
-from app.agent.runtime import reset_current_conversation_id, set_current_conversation_id
+from app.agent.runtime import (
+    reset_current_conversation_id,
+    reset_current_user_context,
+    set_current_conversation_id,
+    set_current_user_context,
+)
 from app.agent.state import AgentState
+from app.services.auth import CurrentUserContext
 from app.tools.registry import get_all_tools
 
 
@@ -142,6 +148,7 @@ async def run_agent(
     user_message: str,
     conversation_history: list | None = None,
     conversation_id=None,
+    user_context: CurrentUserContext | None = None,
 ) -> AgentState:
     """Run the agent to completion and return the final state."""
     messages = list(conversation_history or [])
@@ -152,18 +159,21 @@ async def run_agent(
         conversation_id=conversation_id,
     )
 
-    token = set_current_conversation_id(conversation_id)
+    conversation_token = set_current_conversation_id(conversation_id)
+    user_context_token = set_current_user_context(user_context)
     try:
         final_state = await agent_graph.ainvoke(initial_state)
         return final_state
     finally:
-        reset_current_conversation_id(token)
+        reset_current_user_context(user_context_token)
+        reset_current_conversation_id(conversation_token)
 
 
 async def run_agent_stream(
     user_message: str,
     conversation_history: list | None = None,
     conversation_id=None,
+    user_context: CurrentUserContext | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Run the agent with streaming — yields events as they happen."""
     messages = list(conversation_history or [])
@@ -174,7 +184,8 @@ async def run_agent_stream(
         conversation_id=conversation_id,
     )
 
-    token = set_current_conversation_id(conversation_id)
+    conversation_token = set_current_conversation_id(conversation_id)
+    user_context_token = set_current_user_context(user_context)
     try:
         try:
             async for event in agent_graph.astream_events(initial_state, version="v2"):
@@ -215,4 +226,5 @@ async def run_agent_stream(
             yield {"event": "error", "data": str(exc)}
             yield {"event": "done", "data": ""}
     finally:
-        reset_current_conversation_id(token)
+        reset_current_user_context(user_context_token)
+        reset_current_conversation_id(conversation_token)

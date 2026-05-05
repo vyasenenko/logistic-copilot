@@ -15,10 +15,14 @@ class FakeScalarSession:
             return self.scalar_results.pop(0)
         return None
 
+    async def get(self, _model, _ident):
+        return None
+
 
 def _shipment(thread_id=None):
     return Shipment(
         id=uuid4(),
+        organization_id=uuid4(),
         email_thread_id=thread_id or uuid4(),
         status="waiting_bids",
     )
@@ -48,7 +52,10 @@ async def test_deliver_carrier_thread_email_replies_when_carrier_anchor_exists(m
         async def send_mail(self, **kwargs):
             calls.append(("send", kwargs))
 
-    monkeypatch.setattr(freight_outreach, "OutlookGraphClient", FakeOutlook)
+    async def _fake_build(_session, _shipment):
+        return FakeOutlook()
+
+    monkeypatch.setattr(freight_outreach, "build_outlook_graph_client_for_shipment", _fake_build)
     thread_id = uuid4()
     shipment = _shipment(thread_id)
     session = FakeScalarSession([_carrier_message(thread_id=thread_id)])
@@ -89,7 +96,10 @@ async def test_deliver_carrier_thread_email_falls_back_before_carrier_reply(monk
         async def send_mail(self, **kwargs):
             calls.append(("send", kwargs))
 
-    monkeypatch.setattr(freight_outreach, "OutlookGraphClient", FakeOutlook)
+    async def _fake_build(_session, _shipment):
+        return FakeOutlook()
+
+    monkeypatch.setattr(freight_outreach, "build_outlook_graph_client_for_shipment", _fake_build)
     shipment = _shipment()
     session = FakeScalarSession([None])
 
@@ -129,7 +139,10 @@ async def test_deliver_carrier_thread_email_dry_run_reports_reply_without_sendin
         async def send_mail(self, **kwargs):
             calls.append(("send", kwargs))
 
-    monkeypatch.setattr(freight_outreach, "OutlookGraphClient", FakeOutlook)
+    async def _fake_build(_session, _shipment):
+        return FakeOutlook()
+
+    monkeypatch.setattr(freight_outreach, "build_outlook_graph_client_for_shipment", _fake_build)
     thread_id = uuid4()
     shipment = _shipment(thread_id)
     session = FakeScalarSession([_carrier_message(thread_id=thread_id)])

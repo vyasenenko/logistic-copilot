@@ -22,6 +22,7 @@ import json
 import time
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from fastapi import WebSocket
 
@@ -36,31 +37,44 @@ class FreightRealtimeHub:
     """Keeps active WebSocket connections and broadcasts JSON envelopes."""
 
     def __init__(self, *, overview_stale_min_interval_s: float = 2.0) -> None:
-        self._connections: set[WebSocket] = set()
+        self._connections: dict[UUID, set[WebSocket]] = {}
+        self._socket_organizations: dict[WebSocket, UUID] = {}
         self._lock = asyncio.Lock()
         self._overview_stale_min_interval_s = overview_stale_min_interval_s
-        self._last_overview_stale_mono: float = 0.0
+        self._last_overview_stale_mono: dict[UUID, float] = {}
 
     @property
     def connection_count(self) -> int:
-        return len(self._connections)
+        return sum(len(connections) for connections in self._connections.values())
 
-    async def register(self, websocket: WebSocket) -> None:
+    async def register(self, websocket: WebSocket, *, organization_id: UUID) -> None:
         async with self._lock:
-            self._connections.add(websocket)
+            self._connections.setdefault(organization_id, set()).add(websocket)
+            self._socket_organizations[websocket] = organization_id
 
     async def unregister(self, websocket: WebSocket) -> None:
         async with self._lock:
-            self._connections.discard(websocket)
+            organization_id = self._socket_organizations.pop(websocket, None)
+            if organization_id is None:
+                return
+            connections = self._connections.get(organization_id)
+            if connections is None:
+                return
+            connections.discard(websocket)
+            if not connections:
+                self._connections.pop(organization_id, None)
+                self._last_overview_stale_mono.pop(organization_id, None)
 
     def _now_ts(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    async def publish(self, envelope: dict[str, Any]) -> None:
-        """Send JSON to all subscribers; drop broken sockets."""
+    async def publish(self, envelope: dict[str, Any], *, organization_id: UUID | None) -> None:
+        """Send JSON to subscribers in one organization; drop broken sockets."""
+        if organization_id is None:
+            return
         text = json.dumps(envelope, default=str)
         async with self._lock:
-            targets = tuple(self._connections)
+            targets = tuple(self._connections.get(organization_id, ()))
         dead: list[WebSocket] = []
         for ws in targets:
             try:
@@ -70,9 +84,10 @@ class FreightRealtimeHub:
         if dead:
             async with self._lock:
                 for ws in dead:
-                    self._connections.discard(ws)
+                    self._connections.get(organization_id, set()).discard(ws)
+                    self._socket_organizations.pop(ws, None)
 
-    async def publish_workflow_event_record(self, record: WorkflowEventRecord) -> None:
+    async def publish_workflow_event_record(self, record: WorkflowEventRecord, *, organization_id: UUID | None) -> None:
         """Broadcast one workflow event payload (no overview signal)."""
         await self.publish(
             {
@@ -81,40 +96,56 @@ class FreightRealtimeHub:
                 "ts": self._now_ts(),
                 "shipment_id": record.shipment_id,
                 "event": record.model_dump(mode="json"),
-            }
+            },
+            organization_id=organization_id,
         )
 
     async def notify_workflow_event(self, event: Any) -> None:
         """Broadcast a persisted WorkflowEvent ORM row and throttle overview_stale."""
-        await self.publish_workflow_event_record(workflow_event_to_record(event))
-        await self.publish_overview_stale_throttled(reason="workflow_event")
+        organization_id = getattr(event, "organization_id", None)
+        await self.publish_workflow_event_record(workflow_event_to_record(event), organization_id=organization_id)
+        await self.publish_overview_stale_throttled(reason="workflow_event", organization_id=organization_id)
 
     async def notify_workflow_events(self, events: list[Any]) -> None:
         """Multiple events from the same transaction; one overview_stale signal."""
+        touched_organizations: set[UUID] = set()
         for ev in events:
-            await self.publish_workflow_event_record(workflow_event_to_record(ev))
-        if events:
-            await self.publish_overview_stale_throttled(reason="workflow_event")
+            organization_id = getattr(ev, "organization_id", None)
+            await self.publish_workflow_event_record(workflow_event_to_record(ev), organization_id=organization_id)
+            if organization_id is not None:
+                touched_organizations.add(organization_id)
+        for organization_id in touched_organizations:
+            await self.publish_overview_stale_throttled(reason="workflow_event", organization_id=organization_id)
 
-    async def publish_overview_stale_throttled(self, *, reason: str | None = None) -> None:
+    async def publish_overview_stale_throttled(
+        self,
+        *,
+        organization_id: UUID | None,
+        reason: str | None = None,
+    ) -> None:
         """Signal clients to refetch overview/review queues (rate-limited)."""
+        if organization_id is None:
+            return
         now = time.monotonic()
         async with self._lock:
-            if now - self._last_overview_stale_mono < self._overview_stale_min_interval_s:
+            last_sent = self._last_overview_stale_mono.get(organization_id, 0.0)
+            if now - last_sent < self._overview_stale_min_interval_s:
                 return
-            self._last_overview_stale_mono = now
+            self._last_overview_stale_mono[organization_id] = now
         await self.publish(
             {
                 "v": PROTOCOL_VERSION,
                 "type": "overview_stale",
                 "ts": self._now_ts(),
                 "reason": reason,
-            }
+            },
+            organization_id=organization_id,
         )
 
     async def publish_shipment_updated(
         self,
         *,
+        organization_id: UUID | None,
         shipment_id: str,
         fields: list[str] | None = None,
     ) -> None:
@@ -126,9 +157,10 @@ class FreightRealtimeHub:
                 "ts": self._now_ts(),
                 "shipment_id": shipment_id,
                 "fields": fields or [],
-            }
+            },
+            organization_id=organization_id,
         )
-        await self.publish_overview_stale_throttled(reason="shipment_updated")
+        await self.publish_overview_stale_throttled(reason="shipment_updated", organization_id=organization_id)
 
 
 freight_realtime_hub = FreightRealtimeHub()

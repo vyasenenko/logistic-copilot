@@ -175,6 +175,245 @@ class HealthResponse(BaseModel):
     version: str = "0.1.0"
 
 
+class AccessRequestCreate(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    company_name: str = Field(..., min_length=1, max_length=255)
+    turnstile_token: str | None = None
+    payload: dict = Field(default_factory=dict)
+
+
+class AccessRequestRecord(BaseModel):
+    id: str
+    email: str
+    company_name: str
+    domain: str | None = None
+    status: str
+    review_notes: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AccessRequestApproveRequest(BaseModel):
+    organization_name: str | None = Field(None, max_length=255)
+    role: str = Field("owner", max_length=50)
+    review_notes: str | None = Field(None, max_length=500)
+
+
+class InviteCreateRequest(BaseModel):
+    organization_id: str
+    email: str = Field(..., min_length=3, max_length=320)
+    role: str = Field("member", max_length=50)
+
+
+class InviteCreateResponse(BaseModel):
+    id: str
+    organization_id: str
+    email: str
+    role: str
+    expires_at: datetime
+    invite_token: str
+
+
+class OrganizationMemberRecord(BaseModel):
+    id: str
+    user_id: str
+    organization_id: str
+    email: str
+    name: str | None = None
+    role: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class OrganizationMemberRoleUpdate(BaseModel):
+    role: str = Field(..., min_length=1, max_length=50)
+
+
+class OrganizationInviteRecord(BaseModel):
+    id: str
+    organization_id: str
+    email: str
+    role: str
+    status: str
+    expires_at: datetime
+    accepted_at: datetime | None = None
+    created_at: datetime
+
+
+class InviteAcceptRequest(BaseModel):
+    token: str = Field(..., min_length=16)
+    name: str | None = Field(None, max_length=255)
+    password: str = Field(..., min_length=10, max_length=200)
+    turnstile_token: str | None = None
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=200)
+    turnstile_token: str | None = None
+
+
+class AuthSessionResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+    user_id: str
+    organization_id: str
+    role: str
+    permissions: list[str] = Field(default_factory=list)
+    email: str
+
+
+class ExtensionAuthorizeRequest(BaseModel):
+    redirect_uri: str = Field(..., min_length=8, max_length=1000)
+    state: str = Field(..., min_length=8, max_length=500)
+
+
+class ExtensionAuthorizeResponse(BaseModel):
+    redirect_url: str
+    expires_at: datetime
+
+
+class ExtensionTokenRequest(BaseModel):
+    code: str = Field(..., min_length=16, max_length=500)
+    state: str = Field(..., min_length=8, max_length=500)
+
+
+class CurrentUserResponse(BaseModel):
+    user_id: str
+    organization_id: str
+    role: str
+    permissions: list[str] = Field(default_factory=list)
+    email: str
+
+
+class OrganizationRecord(BaseModel):
+    id: str
+    name: str
+    primary_domain: str | None = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminOrganizationRecord(OrganizationRecord):
+    members_count: int = 0
+    email_connections_count: int = 0
+    shipments_count: int = 0
+    active_shipments_count: int = 0
+    workflow_events_count: int = 0
+
+
+class AdminOverviewResponse(BaseModel):
+    organizations_count: int = 0
+    users_count: int = 0
+    pending_access_requests_count: int = 0
+    pending_invites_count: int = 0
+    active_email_connections_count: int = 0
+    shipments_count: int = 0
+    workflow_events_count: int = 0
+
+
+class AdminCreateOrganizationInviteRequest(BaseModel):
+    organization_name: str = Field(..., min_length=1, max_length=255)
+    organization_domain: str = Field(..., min_length=3, max_length=255)
+    owner_email: str = Field(..., min_length=3, max_length=320)
+    owner_name: str | None = Field(None, max_length=255)
+    role: str = Field("owner", max_length=50)
+    mailbox: str | None = Field(None, max_length=320)
+
+
+class AdminInviteRecord(BaseModel):
+    id: str
+    organization_id: str
+    organization_name: str | None = None
+    email: str
+    role: str
+    status: str
+    expires_at: datetime
+    accepted_at: datetime | None = None
+    created_at: datetime
+
+
+class EmailConnectionRecord(BaseModel):
+    id: str
+    user_id: str
+    organization_id: str
+    provider: str
+    mailbox: str
+    status: str
+    visibility_mode: str = "private"
+    graph_subscription_id: str | None = None
+    subscription_expires_at: datetime | None = None
+    auto_sync_enabled: bool = False
+    metadata: dict = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class EmailConnectionCreateRequest(BaseModel):
+    provider: str = Field("outlook", max_length=50)
+    mailbox: str = Field(..., min_length=3, max_length=320)
+    metadata: dict = Field(default_factory=dict)
+
+
+class EmailConnectionUpdateRequest(BaseModel):
+    visibility_mode: str | None = Field(None, max_length=50)
+
+
+class OrganizationOutlookCredentialsRecord(BaseModel):
+    tenant_id: str | None = None
+    client_id: str | None = None
+    mailbox: str | None = None
+    client_secret_configured: bool = False
+    graph_subscription_id: str | None = None
+    subscription_expires_at: datetime | None = None
+
+
+class OrganizationOutlookCredentialsUpdate(BaseModel):
+    tenant_id: str = Field(..., min_length=1, max_length=128)
+    client_id: str = Field(..., min_length=1, max_length=128)
+    mailbox: str | None = Field(None, max_length=320)
+    client_secret: str = Field("", max_length=2048)
+
+
+class OrganizationTmsIntegrationRecord(BaseModel):
+    tms_system: str = "generic"
+    base_url: str | None = None
+    api_key_configured: bool = False
+    inbound_token_configured: bool = False
+    status: str = "inactive"
+    metadata: dict = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class OrganizationTmsIntegrationUpdate(BaseModel):
+    tms_system: str = Field("generic", max_length=100)
+    base_url: str | None = Field(None, max_length=500)
+    api_key: str = Field("", max_length=2048)
+    status: str = Field("inactive", max_length=50)
+    metadata: dict = Field(default_factory=dict)
+
+
+class OrganizationTmsInboundTokenRotateResponse(BaseModel):
+    inbound_token: str
+    token_type: str = "bearer"
+    integration: OrganizationTmsIntegrationRecord
+
+
+class OutlookUserSyncStatusResponse(BaseModel):
+    mailbox: str
+    organization_domain: str | None = None
+    connection: EmailConnectionRecord | None = None
+    microsoft_configured: bool = False
+    webhook_public_url_configured: bool = False
+    can_enable: bool = False
+    status: str = "not_configured"
+    message: str | None = None
+
+
 class MarginPolicy(BaseModel):
     percent: float = Field(..., ge=0)
     floor_amount: float = Field(0, ge=0)
@@ -222,6 +461,18 @@ class CarrierRecord(BaseModel):
     updated_at: datetime
 
 
+class ClientListPage(BaseModel):
+    items: list[ClientRecord]
+    has_more: bool
+    next_offset: int
+
+
+class CarrierListPage(BaseModel):
+    items: list[CarrierRecord]
+    has_more: bool
+    next_offset: int
+
+
 class FraudDenylistEntryRecord(BaseModel):
     id: str
     scope: FraudDenylistScope
@@ -265,6 +516,9 @@ class ShipmentRecord(BaseModel):
     id: str
     client_id: str | None = None
     email_thread_id: str | None = None
+    source_mailbox: str | None = None
+    source_mailbox_owner_user_id: str | None = None
+    source_mailbox_visibility_mode: str | None = None
     status: str
     quote_token: str | None = None
     origin: str | None = None
@@ -342,6 +596,12 @@ class ShipmentRecord(BaseModel):
     archived_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class ShipmentArchivePage(BaseModel):
+    items: list[ShipmentRecord]
+    has_more: bool
+    next_offset: int
 
 
 class WorkflowEventRecord(BaseModel):
@@ -744,6 +1004,11 @@ class EmailTriageRecord(BaseModel):
     email_message_id: str
     thread_id: str
     shipment_id: str | None = None
+    mailbox: str | None = None
+    mailbox_owner_user_id: str | None = None
+    visibility_mode: str = "metadata_only"
+    can_view_body: bool = False
+    can_take_action: bool = False
     classification: EmailTriageClassification
     confidence: float = 0
     reason: str | None = None
@@ -757,6 +1022,12 @@ class EmailTriageRecord(BaseModel):
     received_at: datetime | None = None
     payload: dict = Field(default_factory=dict)
     created_at: datetime
+
+
+class EmailTriageQueuePage(BaseModel):
+    items: list[EmailTriageRecord]
+    has_more: bool
+    next_offset: int
 
 
 class EmailTriageActionRequest(BaseModel):

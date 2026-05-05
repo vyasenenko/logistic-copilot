@@ -658,10 +658,11 @@ async def test_outlook_webhook_returns_validation_token():
 
 
 @pytest.mark.asyncio
-async def test_outlook_webhook_fetches_message_and_runs_agent_loop(monkeypatch):
+async def test_outlook_webhook_fetches_message_for_signed_connection_with_graph_user_id_resource(monkeypatch):
     shipment = Shipment(id=uuid4(), status=ShipmentStage.RECEIVED.value)
     session = object()
     mailbox_message = object()
+    org_id = uuid4()
 
     class _FakeSessionContext:
         async def __aenter__(self):
@@ -670,14 +671,29 @@ async def test_outlook_webhook_fetches_message_and_runs_agent_loop(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-    async def _get_message(self, message_id):
-        assert message_id == "msg-123"
-        return mailbox_message
+    class _FakeOutlook:
+        mailbox = "ops@example.com"
 
-    async def _process_message(_session, *, mailbox_message, policy, create_client_if_missing=True):
+        async def get_message(self, message_id):
+            assert message_id == "msg-123"
+            return mailbox_message
+
+    expected_email_connection_id = uuid4()
+
+    async def _fake_resolve(_session, _notification):
+        return org_id, "ops@example.com", expected_email_connection_id
+
+    async def _fake_build(_session, oid, *, mailbox=None, email_connection_id=None):
+        assert oid == org_id
+        assert mailbox == "ops@example.com"
+        assert email_connection_id == expected_email_connection_id
+        return _FakeOutlook()
+
+    async def _process_message(_session, *, mailbox_message, policy, organization_id, mailbox, create_client_if_missing=True):
         assert _session is session
         assert mailbox_message is not None
         assert policy.auto_acknowledgement is True
+        assert organization_id == org_id
         return OutlookIngestResult(
             thread_id=str(uuid4()),
             email_message_id=str(uuid4()),
@@ -690,7 +706,8 @@ async def test_outlook_webhook_fetches_message_and_runs_agent_loop(monkeypatch):
     async def _expired(_session, *, policy):
         return []
 
-    monkeypatch.setattr(freight.OutlookGraphClient, "get_message", _get_message)
+    monkeypatch.setattr(freight, "_resolve_outlook_webhook_context", _fake_resolve)
+    monkeypatch.setattr(freight, "build_outlook_graph_client", _fake_build)
     monkeypatch.setattr(freight, "_process_outlook_mailbox_message", _process_message)
     monkeypatch.setattr(freight, "evaluate_expired_quote_windows", _expired)
     monkeypatch.setattr(freight, "async_session", lambda: _FakeSessionContext())
@@ -701,7 +718,9 @@ async def test_outlook_webhook_fetches_message_and_runs_agent_loop(monkeypatch):
                 "value": [
                     {
                         "changeType": "created",
+                        "resource": "Users/64d34868-97b1-48b3-a294-7d6aadc9d200/Messages/msg-123",
                         "resourceData": {"id": "msg-123"},
+                        "clientState": "signed-state",
                     }
                 ]
             }

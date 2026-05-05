@@ -47,6 +47,7 @@ async def test_process_outlook_message_blocks_automation_for_high_risk_sender(mo
         session,
         mailbox_message=object(),
         policy=freight.AutomationPolicy(),
+        organization_id=uuid4(),
     )
 
     assert result is not None
@@ -91,6 +92,7 @@ async def test_process_outlook_message_keeps_automation_for_low_risk_sender(monk
         session,
         mailbox_message=object(),
         policy=freight.AutomationPolicy(),
+        organization_id=uuid4(),
     )
 
     assert result is not None
@@ -133,6 +135,7 @@ async def test_process_outlook_message_triage_skip_does_not_run_orchestrator(mon
         session,
         mailbox_message=object(),
         policy=freight.AutomationPolicy(),
+        organization_id=uuid4(),
     )
 
     assert result is not None

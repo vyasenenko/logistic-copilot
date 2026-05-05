@@ -1,4 +1,5 @@
 const STORAGE_CURRENT_PAGE_CONTEXT = 'current_page_context';
+const STORAGE_AUTH_TOKEN = 'auth_token';
 
 async function storePageContext(snapshot) {
   const payload = {
@@ -178,7 +179,41 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   }
 });
 
+async function clearExtensionAuthToken() {
+  await chrome.storage.local.remove([STORAGE_AUTH_TOKEN]);
+}
+
+chrome.runtime.onMessageExternal.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'EXTENSION_SESSION_LOGOUT') return false;
+  (async () => {
+    try {
+      await clearExtensionAuthToken();
+      sendResponse({ ok: true });
+    } catch (error) {
+      sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  })();
+  return true;
+});
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'WEB_DASHBOARD_LOGOUT') {
+    (async () => {
+      try {
+        await clearExtensionAuthToken();
+        sendResponse({ ok: true });
+      } catch (error) {
+        sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
+    return true;
+  }
   if (message?.type === 'CAPTURE_CURRENT_PAGE') {
     captureActiveTabPageContext()
       .then((payload) => sendResponse({ ok: true, payload }))

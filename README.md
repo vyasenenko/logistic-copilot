@@ -125,14 +125,19 @@ PostgreSQL в кластере **не** поднимается: managed Postgres
 
 Образы по умолчанию — **Docker Hub** `issist/logistic-copilot-backend` и `issist/logistic-copilot-frontend` (тег в `k8s/app.yaml`). Перед `apply` заполните плейсхолдеры в ConfigMap (Spaces, Azure, TMS) и все секреты в `k8s/secrets.yaml` из вашего `.env`.
 
+Цели `make k8s-buildx-frontend` / `k8s-buildx-all` подхватывают из **корневого `.env`** (или файла `K8S_BUILD_ENV=...`) ключи `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_TURNSTILE_*` (site key, theme по умолчанию light, язык, size), при необходимости `TAG`, `PLATFORM`, `DOCKER_REGISTRY`. Значения из командной строки `make VAR=...` имеют приоритет. Для релиза с локальным `.env` на `http://localhost:8000` задайте прод-URL: `NEXT_PUBLIC_API_URL=https://api... make k8s-buildx-frontend`.
+
 ```bash
 # 1. Кластер DOKS + kubectl context
 
 # 2. Собрать и запушить образы (подставьте свой тег)
 docker build -t issist/logistic-copilot-backend:TAG ./backend
-docker build -t issist/logistic-copilot-frontend:TAG ./frontend
+docker build --build-arg NEXT_PUBLIC_API_URL=https://api.logisticopilot.com \
+  --build-arg NEXT_PUBLIC_TURNSTILE_SITE_KEY=YOUR_CLOUDFLARE_SITE_KEY \
+  -t issist/logistic-copilot-frontend:TAG ./frontend
 docker push issist/logistic-copilot-backend:TAG
 docker push issist/logistic-copilot-frontend:TAG
+# С `AUTH_REQUIRE_TURNSTILE=true` site key обязателен в frontend-сборке; иначе виджет не появится. Удобнее: `NEXT_PUBLIC_TURNSTILE_SITE_KEY=... make k8s-buildx-frontend`.
 # Обновите image: в k8s/app.yaml на тот же TAG (или используйте :latest).
 
 # 3. Применить манифесты

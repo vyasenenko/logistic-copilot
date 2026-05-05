@@ -18,11 +18,14 @@ FREIGHT_RE = re.compile(
 )
 ROUTE_RE = re.compile(r"\b[A-Z][a-zA-Z .'-]+,\s*[A-Z]{2}\b.*\b[A-Z][a-zA-Z .'-]+,\s*[A-Z]{2}\b")
 STATUS_RE = re.compile(r"\b(status|eta|delivered|picked up|in transit|pod|bol|appointment)\b", re.IGNORECASE)
-BID_RE = re.compile(r"\$\s*\d+|\b\d+(?:\.\d+)?\s*(?:all in|usd|dollars?)\b", re.IGNORECASE)
+BID_RE = re.compile(
+    r"\$\s*\d+|\b\d+(?:\.\d+)?\s*\$|\b\d+(?:\.\d+)?\s*(?:all in|usd|dollars?)\b",
+    re.IGNORECASE,
+)
 NEWSLETTER_RE = re.compile(r"\b(unsubscribe|newsletter|marketing|webinar|promotion|sale|digest)\b", re.IGNORECASE)
 
 
-def classify_email_triage(
+def classify_email_triage_heuristic(
     *,
     subject: str,
     body_preview: str,
@@ -32,7 +35,7 @@ def classify_email_triage(
     fraud_reasons: list[str] | None = None,
     fraud_risk_level: str | None = None,
 ) -> EmailTriageResult:
-    """Classify whether an email should create/link a shipment or stay in triage."""
+    """Rule-based triage (sync). Used as fallback and when LLM is unavailable."""
     text = f"{subject or ''}\n{body_preview or ''}"
     lowered = text.lower()
     reasons = set(fraud_reasons or [])
@@ -126,4 +129,26 @@ def classify_email_triage(
         reason="No shipment, carrier, route, or quote signal detected.",
         recommended_action="mark_not_shipment",
         signals={"sender_email": sender_email},
+    )
+
+
+def classify_email_triage(
+    *,
+    subject: str,
+    body_preview: str,
+    sender_email: str,
+    quote_token: str | None = None,
+    existing_shipment_linked: bool = False,
+    fraud_reasons: list[str] | None = None,
+    fraud_risk_level: str | None = None,
+) -> EmailTriageResult:
+    """Backward-compatible alias for heuristic-only triage (tests, tooling)."""
+    return classify_email_triage_heuristic(
+        subject=subject,
+        body_preview=body_preview,
+        sender_email=sender_email,
+        quote_token=quote_token,
+        existing_shipment_linked=existing_shipment_linked,
+        fraud_reasons=fraud_reasons,
+        fraud_risk_level=fraud_risk_level,
     )

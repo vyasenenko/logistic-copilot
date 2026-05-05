@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from app.services.audio_transcription import transcribe_audio_bytes
+from app.services.auth import CurrentUserContext, get_current_user_context
 
 router = APIRouter()
 
@@ -26,8 +27,10 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     language: str | None = Form(default=None),
     prompt: str | None = Form(default=None),
+    context: CurrentUserContext = Depends(get_current_user_context),
 ):
     """Transcribe user audio into plain text."""
+    _ = context
     content_type = (file.content_type or "").lower().strip()
     if content_type not in ALLOWED_AUDIO_TYPES:
         raise HTTPException(

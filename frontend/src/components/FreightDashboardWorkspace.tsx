@@ -1,26 +1,36 @@
 "use client";
 
-import { startTransition, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  startTransition,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { createPortal } from "react-dom";
 
 import { useFreightSocket } from "@/hooks/useFreightSocket";
 import { DateTimePickerField } from "@/components/DateTimePickerField";
 import { DashboardLogo } from "@/components/DashboardLogo";
+import { OrganizationDrawer } from "@/components/OrganizationDrawer";
 import {
   AlertTriangle,
   Archive,
   ArrowRight,
   Bell,
-  Building2,
   Calendar,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
-  ChevronUp,
   ChevronRight,
   CircleDollarSign,
   ClipboardCheck,
   Clock3,
+  Inbox,
   Loader2,
   LucideIcon,
   Mail,
@@ -38,8 +48,14 @@ import {
   Users,
   X,
 } from "lucide-react";
+import { PUBLIC_API_URL as API_URL } from "@/constants/publicApi";
+import { showToast } from "@/lib/toast-store";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+function reportDashboardError(message: string | null | undefined) {
+  const trimmed = (message ?? "").trim();
+  if (trimmed) showToast(trimmed, { tone: "error", durationMs: 9000 });
+}
+
 const OUTLOOK_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 type DashboardTab = "shipments" | "triage" | "status_ops" | "clients" | "carriers" | "archive";
@@ -122,6 +138,14 @@ interface CarrierRecord {
   updated_at: string;
 }
 
+interface CurrentUserResponse {
+  user_id: string;
+  organization_id: string;
+  role: string;
+  permissions: string[];
+  email: string;
+}
+
 interface FraudDenylistEntryRecord {
   id: string;
   scope: FraudBlockScope;
@@ -137,6 +161,9 @@ interface ShipmentRecord {
   id: string;
   client_id: string | null;
   email_thread_id: string | null;
+  source_mailbox: string | null;
+  source_mailbox_owner_user_id: string | null;
+  source_mailbox_visibility_mode: string | null;
   status: string;
   quote_token: string | null;
   origin: string | null;
@@ -292,6 +319,11 @@ interface EmailTriageItem {
   email_message_id: string;
   thread_id: string;
   shipment_id: string | null;
+  mailbox?: string | null;
+  mailbox_owner_user_id?: string | null;
+  visibility_mode?: string;
+  can_view_body?: boolean;
+  can_take_action?: boolean;
   classification: string;
   confidence: number;
   reason: string | null;
@@ -306,6 +338,39 @@ interface EmailTriageItem {
   payload: Record<string, unknown>;
   created_at: string;
 }
+
+interface EmailTriageQueuePage {
+  items: EmailTriageItem[];
+  has_more: boolean;
+  next_offset: number;
+}
+
+const TRIAGE_PAGE_SIZE = 25;
+
+interface ShipmentArchivePage {
+  items: ShipmentRecord[];
+  has_more: boolean;
+  next_offset: number;
+}
+
+const ARCHIVE_PAGE_SIZE = 25;
+
+interface ClientListPage {
+  items: ClientRecord[];
+  has_more: boolean;
+  next_offset: number;
+}
+
+interface CarrierListPage {
+  items: CarrierRecord[];
+  has_more: boolean;
+  next_offset: number;
+}
+
+const CUSTOMERS_TAB_PAGE_SIZE = 25;
+const CARRIERS_TAB_PAGE_SIZE = 25;
+const PARTY_DIRECTORY_PAGE_LIMIT = 100;
+const PARTY_DIRECTORY_MAX_ROWS = 5000;
 
 interface OutlookIngestResult {
   intent: string | null;
@@ -557,6 +622,14 @@ interface ArchiveDialogState {
   fraudBlockScope?: FraudBlockScope;
 }
 
+interface TriageActionDialogState {
+  action: EmailTriageAction;
+  itemId: string;
+  subject: string;
+  sender: string;
+  shipmentId?: string | null;
+}
+
 const ARCHIVE_REASON_OPTIONS: Array<{ value: ArchiveReasonCode | "all"; label: string; helper: string }> = [
   { value: "duplicate", label: "Duplicate", helper: "Same request already exists." },
   { value: "cancelled", label: "Cancelled", helper: "Customer or operator cancelled it." },
@@ -611,21 +684,96 @@ const SHIPMENT_STATUS_STYLES: Record<string, string> = {
   booked: "bg-lime-400/15 text-lime-200 border-lime-300/20",
 };
 
+function formatApiErrorBody(body: string, status: number): string {
+  const trimmed = body.trim();
+  if (!trimmed) return `Request failed: ${status}`;
+  try {
+    const parsed = JSON.parse(trimmed) as { detail?: unknown };
+    if (typeof parsed.detail === "string") return parsed.detail;
+    if (Array.isArray(parsed.detail)) {
+      return parsed.detail
+        .map((item: unknown) => {
+          if (item && typeof item === "object" && "msg" in item && typeof (item as { msg: unknown }).msg === "string") {
+            return (item as { msg: string }).msg;
+          }
+          return JSON.stringify(item);
+        })
+        .join("; ");
+    }
+  } catch {
+    // Response body is not JSON; show as-is.
+  }
+  return trimmed;
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const authToken =
+    typeof window !== "undefined"
+      ? window.localStorage.getItem("logistic_copilot_auth_token")
+      : null;
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       ...(init?.headers || {}),
     },
   });
 
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `Request failed: ${response.status}`);
+    if (response.status === 401 || response.status === 403) {
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem("logistic_copilot_auth_token");
+        window.location.assign("/");
+      }
+    }
+    const raw = await response.text();
+    throw new Error(formatApiErrorBody(raw, response.status));
   }
 
   return response.json() as Promise<T>;
+}
+
+async function collectAllClientRecords(): Promise<ClientRecord[]> {
+  const merged: ClientRecord[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  while (merged.length < PARTY_DIRECTORY_MAX_ROWS) {
+    const params = new URLSearchParams();
+    params.set("limit", String(PARTY_DIRECTORY_PAGE_LIMIT));
+    params.set("offset", String(offset));
+    const page = await fetchJson<ClientListPage>(`/api/freight/clients?${params.toString()}`);
+    for (const row of page.items) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        merged.push(row);
+      }
+    }
+    if (!page.has_more) break;
+    offset = page.next_offset;
+  }
+  return merged;
+}
+
+async function collectAllCarrierRecords(): Promise<CarrierRecord[]> {
+  const merged: CarrierRecord[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  while (merged.length < PARTY_DIRECTORY_MAX_ROWS) {
+    const params = new URLSearchParams();
+    params.set("limit", String(PARTY_DIRECTORY_PAGE_LIMIT));
+    params.set("offset", String(offset));
+    const page = await fetchJson<CarrierListPage>(`/api/freight/carriers?${params.toString()}`);
+    for (const row of page.items) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        merged.push(row);
+      }
+    }
+    if (!page.has_more) break;
+    offset = page.next_offset;
+  }
+  return merged;
 }
 
 function readCachedOutlookStatus(cacheKey: string) {
@@ -789,6 +937,102 @@ function triageClassificationClasses(value: string | null | undefined) {
   if (value === "freight_quote_request") return "border-emerald-300/24 bg-emerald-300/12 text-emerald-50";
   if (value === "carrier_reply" || value === "status_or_ops") return "border-cyan-300/24 bg-cyan-300/12 text-cyan-50";
   return "border-white/10 bg-white/5 text-slate-300";
+}
+
+/** Muted text accent for triage list rows (no pill chrome). */
+function triageClassificationTextClass(value: string | null | undefined) {
+  if (value === "fraud_or_phishing") return "text-rose-200/85";
+  if (value === "needs_operator_triage") return "text-amber-200/80";
+  if (value === "freight_quote_request") return "text-emerald-200/80";
+  if (value === "carrier_reply" || value === "status_or_ops") return "text-cyan-200/80";
+  return "text-slate-400";
+}
+
+function emailVisibilityLabel(value: string | null | undefined) {
+  if (value === "shared_ops") return "Shared";
+  if (value === "metadata_only") return "Metadata only";
+  return "Private";
+}
+
+function emailVisibilityClasses(value: string | null | undefined) {
+  if (value === "shared_ops") return "border-cyan-300/20 bg-cyan-300/10 text-cyan-100";
+  if (value === "metadata_only") return "border-amber-300/20 bg-amber-300/10 text-amber-100";
+  return "border-slate-300/16 bg-white/[0.06] text-slate-200";
+}
+
+function hasPermission(user: CurrentUserResponse | null, permission: string) {
+  return Boolean(user?.permissions.includes("*") || user?.permissions.includes(permission));
+}
+
+function mailboxSourceMeta(mailbox: string | null | undefined, currentUserEmail: string | null | undefined) {
+  if (!mailbox) return null;
+  const normalizedMailbox = mailbox.trim().toLowerCase();
+  const normalizedUser = (currentUserEmail || "").trim().toLowerCase();
+  const isMine = Boolean(normalizedMailbox && normalizedMailbox === normalizedUser);
+  return {
+    caption: isMine ? "My inbox" : "Shared ops inbox",
+    address: mailbox.trim(),
+  };
+}
+
+function mailboxSourceLabel(mailbox: string | null | undefined, currentUserEmail: string | null | undefined) {
+  const meta = mailboxSourceMeta(mailbox, currentUserEmail);
+  if (!meta) return null;
+  return `${meta.caption}: ${meta.address}`;
+}
+
+/** Shipments whose intake mailbox belongs to the signed-in user (address match or mailbox owner id). */
+function shipmentMatchesMyMailbox(
+  shipment: ShipmentRecord,
+  userEmail: string | null | undefined,
+  userId: string | null | undefined,
+): boolean {
+  const normalizedUser = (userEmail || "").trim().toLowerCase();
+  const mailbox = (shipment.source_mailbox || "").trim().toLowerCase();
+  if (normalizedUser && mailbox && mailbox === normalizedUser) {
+    return true;
+  }
+  const uid = (userId || "").trim();
+  if (uid && shipment.source_mailbox_owner_user_id && shipment.source_mailbox_owner_user_id === uid) {
+    return true;
+  }
+  return false;
+}
+
+function triageActionDialogCopy(action: EmailTriageAction) {
+  const copy: Record<EmailTriageAction, { title: string; description: string; confirmLabel: string; tone: "primary" | "danger" }> = {
+    create_shipment: {
+      title: "Create shipment from this email?",
+      description: "This will turn the selected triage email into an active shipment visible to the organization.",
+      confirmLabel: "Create shipment",
+      tone: "primary",
+    },
+    mark_not_shipment: {
+      title: "Mark this email as not a shipment?",
+      description: "This will suppress the source thread so future syncs do not recreate a shipment from it.",
+      confirmLabel: "Mark not shipment",
+      tone: "primary",
+    },
+    mark_fraud_email: {
+      title: "Block this sender email?",
+      description: "Future messages from this exact email address will be treated as fraud/spam and kept out of automation.",
+      confirmLabel: "Block email",
+      tone: "danger",
+    },
+    mark_fraud_domain: {
+      title: "Block this sender domain?",
+      description: "This is a broad action. Future messages from the sender domain will be treated as fraud/spam.",
+      confirmLabel: "Block domain",
+      tone: "danger",
+    },
+    link_to_existing_shipment: {
+      title: "Link this email to an existing shipment?",
+      description: "This will attach the triage email thread to the selected shipment and resolve the triage item.",
+      confirmLabel: "Link shipment",
+      tone: "primary",
+    },
+  };
+  return copy[action];
 }
 
 function formatCurrency(value: number | null | undefined, options?: { compact?: boolean }) {
@@ -1207,7 +1451,7 @@ function ShipmentStatusPill({ status }: { status: string }) {
 export function FreightDashboardWorkspace() {
   const BOARD_FILTER_STORAGE_KEY = "logistic-copilot-board-filter";
   const BOARD_MONTH_STORAGE_KEY = "logistic-copilot-board-month";
-  const BOARD_CONTROLS_STORAGE_KEY = "logistic-copilot-board-controls-expanded";
+  const BOARD_MAILBOX_SCOPE_STORAGE_KEY = "logistic-copilot-board-mailbox-scope";
   const OUTLOOK_STATUS_STORAGE_KEY = "logistic-copilot-outlook-webhook-status";
   const [tab, setTab] = useState<DashboardTab>("shipments");
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("overview");
@@ -1215,9 +1459,9 @@ export function FreightDashboardWorkspace() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMobileTab, setDrawerMobileTab] = useState<DrawerMobileTab>("details");
   const [activeBoardFilter, setActiveBoardFilter] = useState<"all" | "today" | "attention">("all");
+  const [boardMailboxScope, setBoardMailboxScope] = useState<"org" | "mine">("org");
   const [shipmentSearch, setShipmentSearch] = useState("");
   const [selectedBoardMonth, setSelectedBoardMonth] = useState(currentMonthValue());
-  const [boardControlsExpanded, setBoardControlsExpanded] = useState(false);
   const [monthPickerOpen, setMonthPickerOpen] = useState(false);
   const [monthPickerYear, setMonthPickerYear] = useState(() => Number(currentMonthValue().slice(0, 4)));
   const [overview, setOverview] = useState<OverviewResponse>(EMPTY_OVERVIEW);
@@ -1228,8 +1472,27 @@ export function FreightDashboardWorkspace() {
   const [financialSummaryLoading, setFinancialSummaryLoading] = useState(false);
   const [archivedShipments, setArchivedShipments] = useState<ShipmentRecord[]>([]);
   const [archiveSearch, setArchiveSearch] = useState("");
+  const [archiveSearchDebounced, setArchiveSearchDebounced] = useState("");
   const [archiveReasonFilter, setArchiveReasonFilter] = useState<ArchiveReasonCode | "all">("all");
   const [archiveMonth, setArchiveMonth] = useState(currentMonthValue());
+  const [archiveHasMore, setArchiveHasMore] = useState(false);
+  const [archiveNextOffset, setArchiveNextOffset] = useState(0);
+  const [archiveListLoading, setArchiveListLoading] = useState(false);
+  const [archiveLoadingMore, setArchiveLoadingMore] = useState(false);
+  const [customersTabSearch, setCustomersTabSearch] = useState("");
+  const [customersTabSearchDebounced, setCustomersTabSearchDebounced] = useState("");
+  const [customersTabList, setCustomersTabList] = useState<ClientRecord[]>([]);
+  const [customersTabHasMore, setCustomersTabHasMore] = useState(false);
+  const [customersTabNextOffset, setCustomersTabNextOffset] = useState(0);
+  const [customersTabListLoading, setCustomersTabListLoading] = useState(false);
+  const [customersTabLoadingMore, setCustomersTabLoadingMore] = useState(false);
+  const [carriersTabSearch, setCarriersTabSearch] = useState("");
+  const [carriersTabSearchDebounced, setCarriersTabSearchDebounced] = useState("");
+  const [carriersTabList, setCarriersTabList] = useState<CarrierRecord[]>([]);
+  const [carriersTabHasMore, setCarriersTabHasMore] = useState(false);
+  const [carriersTabNextOffset, setCarriersTabNextOffset] = useState(0);
+  const [carriersTabListLoading, setCarriersTabListLoading] = useState(false);
+  const [carriersTabLoadingMore, setCarriersTabLoadingMore] = useState(false);
   const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
   const [statusQueue, setStatusQueue] = useState<StatusQueueItem[]>([]);
   const [emailTriageQueue, setEmailTriageQueue] = useState<EmailTriageItem[]>([]);
@@ -1239,13 +1502,12 @@ export function FreightDashboardWorkspace() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [backgroundRefreshing, setBackgroundRefreshing] = useState(false);
   const [submitting, setSubmitting] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [lastSyncSummary, setLastSyncSummary] = useState<OutlookSyncResponse | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<CurrentUserResponse | null>(null);
   const [webhookStatus, setWebhookStatus] = useState<OutlookWebhookStatusResponse | null>(null);
   const [outlookStatusLoading, setOutlookStatusLoading] = useState(false);
-  const [syncLimit, setSyncLimit] = useState(10);
-  const [syncMenuOpen, setSyncMenuOpen] = useState(false);
+  const [organizationDrawerOpen, setOrganizationDrawerOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
   const [notificationLoading, setNotificationLoading] = useState(false);
@@ -1255,6 +1517,14 @@ export function FreightDashboardWorkspace() {
   const [selectedShipmentId, setSelectedShipmentId] = useState<string | null>(null);
   const [selectedStatusTaskId, setSelectedStatusTaskId] = useState<string | null>(null);
   const [selectedTriageItemId, setSelectedTriageItemId] = useState<string | null>(null);
+  const [triageSearchInput, setTriageSearchInput] = useState("");
+  const [triageSearchDebounced, setTriageSearchDebounced] = useState("");
+  /** When false, API omits triage rows with AI confidence ≥ 85% (server-side). */
+  const [triageIncludeHighConfidence, setTriageIncludeHighConfidence] = useState(false);
+  const [emailTriageHasMore, setEmailTriageHasMore] = useState(false);
+  const [emailTriageNextOffset, setEmailTriageNextOffset] = useState(0);
+  const [emailTriageListLoading, setEmailTriageListLoading] = useState(false);
+  const [emailTriageLoadingMore, setEmailTriageLoadingMore] = useState(false);
   const [triageLinkShipmentId, setTriageLinkShipmentId] = useState("");
   const [partyDrawer, setPartyDrawer] = useState<PartyDrawerState>(null);
   const [clientEditor, setClientEditor] = useState({ name: "", email: "", is_active: true, default_margin_percent: "15", default_margin_floor: "0" });
@@ -1277,6 +1547,7 @@ export function FreightDashboardWorkspace() {
   const [activeThreadTab, setActiveThreadTab] = useState<ThreadTab>("timeline");
   const [contextMenu, setContextMenu] = useState<{ shipmentId: string; x: number; y: number } | null>(null);
   const [archiveDialog, setArchiveDialog] = useState<ArchiveDialogState | null>(null);
+  const [triageActionDialog, setTriageActionDialog] = useState<TriageActionDialogState | null>(null);
   const [archiveReasonCode, setArchiveReasonCode] = useState<ArchiveReasonCode>("parsed_error");
   const [archiveReasonNote, setArchiveReasonNote] = useState("invalid shipment from non-delivery email");
   const [threadLoading, setThreadLoading] = useState(false);
@@ -1293,13 +1564,24 @@ export function FreightDashboardWorkspace() {
   const [senderCarrierId, setSenderCarrierId] = useState("");
   const [senderContactName, setSenderContactName] = useState("");
   const drawerScrollRef = useRef<HTMLDivElement | null>(null);
+  /** Avoid overwriting localStorage with default "org" before hydrate-from-storage runs. */
+  const skipMailboxScopePersistRef = useRef(true);
   const monthPickerRef = useRef<HTMLDivElement | null>(null);
   const overviewRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const notificationTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const resolvingQuoteTokenRef = useRef<string | null>(null);
   const editFieldRefs = useRef<Partial<Record<EditFocusTarget, HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null>>>({});
+  const triageDetailPanelRef = useRef<HTMLDivElement | null>(null);
+  const triageScrollPendingRef = useRef(false);
+  const emailTriageLoadMoreLockedRef = useRef(false);
+  const archiveLoadMoreLockedRef = useRef(false);
+  const customersTabLoadMoreLockedRef = useRef(false);
+  const carriersTabLoadMoreLockedRef = useRef(false);
   const shipmentsRef = useRef<ShipmentRecord[]>([]);
   const archivedShipmentsRef = useRef<ShipmentRecord[]>([]);
+  const canUseEmailTriage = hasPermission(currentUser, "freight:write");
+  const isViewerRole = (currentUser?.role || "").trim().toLowerCase() === "viewer";
+  const effectiveBoardMailboxScope: "org" | "mine" = isViewerRole ? "org" : boardMailboxScope;
   const [shipmentCreateForm, setShipmentCreateForm] = useState({
     client_id: "",
     origin: "Chicago, IL",
@@ -1319,6 +1601,305 @@ export function FreightDashboardWorkspace() {
     eta_text: "Tomorrow pickup / next-day delivery",
     raw_email: "Best rate we can do is 1000 all in.",
   });
+
+  const fetchEmailTriageFirstPage = useCallback(async () => {
+    if (!canUseEmailTriage) {
+      setEmailTriageQueue([]);
+      setEmailTriageHasMore(false);
+      setEmailTriageNextOffset(0);
+      setSelectedTriageItemId(null);
+      return;
+    }
+    setEmailTriageListLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(TRIAGE_PAGE_SIZE));
+      params.set("offset", "0");
+      if (triageSearchDebounced) {
+        params.set("q", triageSearchDebounced);
+      }
+      if (triageIncludeHighConfidence) {
+        params.set("include_high_confidence", "true");
+      }
+      const page = await fetchJson<EmailTriageQueuePage>(`/api/freight/email-triage?${params.toString()}`);
+      setEmailTriageQueue(page.items);
+      setEmailTriageHasMore(page.has_more);
+      setEmailTriageNextOffset(page.next_offset);
+      setSelectedTriageItemId((current) =>
+        current && page.items.some((item) => item.id === current) ? current : page.items[0]?.id || null,
+      );
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load email triage.");
+    } finally {
+      setEmailTriageListLoading(false);
+    }
+  }, [canUseEmailTriage, triageSearchDebounced, triageIncludeHighConfidence]);
+
+  const loadMoreEmailTriageQueue = useCallback(async () => {
+    if (!canUseEmailTriage || !emailTriageHasMore || emailTriageListLoading || emailTriageLoadingMore) {
+      return;
+    }
+    if (emailTriageLoadMoreLockedRef.current) return;
+    emailTriageLoadMoreLockedRef.current = true;
+    setEmailTriageLoadingMore(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(TRIAGE_PAGE_SIZE));
+      params.set("offset", String(emailTriageNextOffset));
+      if (triageSearchDebounced) {
+        params.set("q", triageSearchDebounced);
+      }
+      if (triageIncludeHighConfidence) {
+        params.set("include_high_confidence", "true");
+      }
+      const page = await fetchJson<EmailTriageQueuePage>(`/api/freight/email-triage?${params.toString()}`);
+      setEmailTriageQueue((prev) => {
+        const seen = new Set(prev.map((row) => row.id));
+        const merged = [...prev];
+        for (const row of page.items) {
+          if (!seen.has(row.id)) {
+            seen.add(row.id);
+            merged.push(row);
+          }
+        }
+        return merged;
+      });
+      setEmailTriageHasMore(page.has_more);
+      setEmailTriageNextOffset(page.next_offset);
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load more triage emails.");
+    } finally {
+      emailTriageLoadMoreLockedRef.current = false;
+      setEmailTriageLoadingMore(false);
+    }
+  }, [
+    canUseEmailTriage,
+    emailTriageHasMore,
+    emailTriageListLoading,
+    emailTriageLoadingMore,
+    emailTriageNextOffset,
+    triageSearchDebounced,
+    triageIncludeHighConfidence,
+  ]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => setTriageSearchDebounced(triageSearchInput.trim()), 400);
+    return () => window.clearTimeout(handle);
+  }, [triageSearchInput]);
+
+  useEffect(() => {
+    if (!canUseEmailTriage || tab !== "triage") return;
+    void fetchEmailTriageFirstPage();
+  }, [tab, triageSearchDebounced, triageIncludeHighConfidence, canUseEmailTriage, fetchEmailTriageFirstPage]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => setArchiveSearchDebounced(archiveSearch.trim()), 400);
+    return () => window.clearTimeout(handle);
+  }, [archiveSearch]);
+
+  const fetchArchiveFirstPage = useCallback(async () => {
+    setArchiveListLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("month", archiveMonth);
+      params.set("limit", String(ARCHIVE_PAGE_SIZE));
+      params.set("offset", "0");
+      if (archiveSearchDebounced) {
+        params.set("query", archiveSearchDebounced);
+      }
+      if (archiveReasonFilter !== "all") {
+        params.set("reason_code", archiveReasonFilter);
+      }
+      const page = await fetchJson<ShipmentArchivePage>(`/api/freight/shipments/archive?${params.toString()}`);
+      setArchivedShipments(page.items);
+      setArchiveHasMore(page.has_more);
+      setArchiveNextOffset(page.next_offset);
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load archived shipments.");
+    } finally {
+      setArchiveListLoading(false);
+    }
+  }, [archiveMonth, archiveReasonFilter, archiveSearchDebounced]);
+
+  const loadMoreArchivedShipments = useCallback(async () => {
+    if (!archiveHasMore || archiveListLoading || archiveLoadingMore || archiveLoadMoreLockedRef.current) {
+      return;
+    }
+    archiveLoadMoreLockedRef.current = true;
+    setArchiveLoadingMore(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("month", archiveMonth);
+      params.set("limit", String(ARCHIVE_PAGE_SIZE));
+      params.set("offset", String(archiveNextOffset));
+      if (archiveSearchDebounced) {
+        params.set("query", archiveSearchDebounced);
+      }
+      if (archiveReasonFilter !== "all") {
+        params.set("reason_code", archiveReasonFilter);
+      }
+      const page = await fetchJson<ShipmentArchivePage>(`/api/freight/shipments/archive?${params.toString()}`);
+      setArchivedShipments((prev) => {
+        const seen = new Set(prev.map((row) => row.id));
+        const merged = [...prev];
+        for (const row of page.items) {
+          if (!seen.has(row.id)) {
+            seen.add(row.id);
+            merged.push(row);
+          }
+        }
+        return merged;
+      });
+      setArchiveHasMore(page.has_more);
+      setArchiveNextOffset(page.next_offset);
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load more archived shipments.");
+    } finally {
+      archiveLoadMoreLockedRef.current = false;
+      setArchiveLoadingMore(false);
+    }
+  }, [archiveHasMore, archiveListLoading, archiveLoadingMore, archiveMonth, archiveNextOffset, archiveReasonFilter, archiveSearchDebounced]);
+
+  useEffect(() => {
+    if (initialLoading || tab !== "archive") {
+      return;
+    }
+    void fetchArchiveFirstPage();
+  }, [initialLoading, tab, archiveMonth, archiveReasonFilter, archiveSearchDebounced, fetchArchiveFirstPage]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => setCustomersTabSearchDebounced(customersTabSearch.trim()), 400);
+    return () => window.clearTimeout(handle);
+  }, [customersTabSearch]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => setCarriersTabSearchDebounced(carriersTabSearch.trim()), 400);
+    return () => window.clearTimeout(handle);
+  }, [carriersTabSearch]);
+
+  const fetchCustomersTabFirstPage = useCallback(async () => {
+    setCustomersTabListLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(CUSTOMERS_TAB_PAGE_SIZE));
+      params.set("offset", "0");
+      if (customersTabSearchDebounced) {
+        params.set("q", customersTabSearchDebounced);
+      }
+      const page = await fetchJson<ClientListPage>(`/api/freight/clients?${params.toString()}`);
+      setCustomersTabList(page.items);
+      setCustomersTabHasMore(page.has_more);
+      setCustomersTabNextOffset(page.next_offset);
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load customers.");
+    } finally {
+      setCustomersTabListLoading(false);
+    }
+  }, [customersTabSearchDebounced]);
+
+  const loadMoreCustomersTab = useCallback(async () => {
+    if (!customersTabHasMore || customersTabListLoading || customersTabLoadingMore || customersTabLoadMoreLockedRef.current) {
+      return;
+    }
+    customersTabLoadMoreLockedRef.current = true;
+    setCustomersTabLoadingMore(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(CUSTOMERS_TAB_PAGE_SIZE));
+      params.set("offset", String(customersTabNextOffset));
+      if (customersTabSearchDebounced) {
+        params.set("q", customersTabSearchDebounced);
+      }
+      const page = await fetchJson<ClientListPage>(`/api/freight/clients?${params.toString()}`);
+      setCustomersTabList((prev) => {
+        const seen = new Set(prev.map((row) => row.id));
+        const merged = [...prev];
+        for (const row of page.items) {
+          if (!seen.has(row.id)) {
+            seen.add(row.id);
+            merged.push(row);
+          }
+        }
+        return merged;
+      });
+      setCustomersTabHasMore(page.has_more);
+      setCustomersTabNextOffset(page.next_offset);
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load more customers.");
+    } finally {
+      customersTabLoadMoreLockedRef.current = false;
+      setCustomersTabLoadingMore(false);
+    }
+  }, [customersTabHasMore, customersTabListLoading, customersTabLoadingMore, customersTabNextOffset, customersTabSearchDebounced]);
+
+  const fetchCarriersTabFirstPage = useCallback(async () => {
+    setCarriersTabListLoading(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(CARRIERS_TAB_PAGE_SIZE));
+      params.set("offset", "0");
+      if (carriersTabSearchDebounced) {
+        params.set("q", carriersTabSearchDebounced);
+      }
+      const page = await fetchJson<CarrierListPage>(`/api/freight/carriers?${params.toString()}`);
+      setCarriersTabList(page.items);
+      setCarriersTabHasMore(page.has_more);
+      setCarriersTabNextOffset(page.next_offset);
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load carriers.");
+    } finally {
+      setCarriersTabListLoading(false);
+    }
+  }, [carriersTabSearchDebounced]);
+
+  const loadMoreCarriersTab = useCallback(async () => {
+    if (!carriersTabHasMore || carriersTabListLoading || carriersTabLoadingMore || carriersTabLoadMoreLockedRef.current) {
+      return;
+    }
+    carriersTabLoadMoreLockedRef.current = true;
+    setCarriersTabLoadingMore(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(CARRIERS_TAB_PAGE_SIZE));
+      params.set("offset", String(carriersTabNextOffset));
+      if (carriersTabSearchDebounced) {
+        params.set("q", carriersTabSearchDebounced);
+      }
+      const page = await fetchJson<CarrierListPage>(`/api/freight/carriers?${params.toString()}`);
+      setCarriersTabList((prev) => {
+        const seen = new Set(prev.map((row) => row.id));
+        const merged = [...prev];
+        for (const row of page.items) {
+          if (!seen.has(row.id)) {
+            seen.add(row.id);
+            merged.push(row);
+          }
+        }
+        return merged;
+      });
+      setCarriersTabHasMore(page.has_more);
+      setCarriersTabNextOffset(page.next_offset);
+    } catch (loadError) {
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load more carriers.");
+    } finally {
+      carriersTabLoadMoreLockedRef.current = false;
+      setCarriersTabLoadingMore(false);
+    }
+  }, [carriersTabHasMore, carriersTabListLoading, carriersTabLoadingMore, carriersTabNextOffset, carriersTabSearchDebounced]);
+
+  useEffect(() => {
+    if (initialLoading || tab !== "clients") {
+      return;
+    }
+    void fetchCustomersTabFirstPage();
+  }, [initialLoading, tab, customersTabSearchDebounced, fetchCustomersTabFirstPage]);
+
+  useEffect(() => {
+    if (initialLoading || tab !== "carriers") {
+      return;
+    }
+    void fetchCarriersTabFirstPage();
+  }, [initialLoading, tab, carriersTabSearchDebounced, fetchCarriersTabFirstPage]);
 
   const selectedShipment = useMemo(
     () =>
@@ -1472,6 +2053,9 @@ export function FreightDashboardWorkspace() {
           return false;
         }
       }
+      if (effectiveBoardMailboxScope === "mine" && !shipmentMatchesMyMailbox(shipment, userEmail, currentUserId)) {
+        return false;
+      }
       if (!query) return true;
       const searchHaystack = [
         formatRoute(shipment),
@@ -1491,7 +2075,44 @@ export function FreightDashboardWorkspace() {
       return filtered;
     }
     return [...filtered].sort((first, second) => shipmentActivityTimestamp(second) - shipmentActivityTimestamp(first));
-  }, [shipments, activeBoardFilter, shipmentSearch]);
+  }, [shipments, activeBoardFilter, shipmentSearch, effectiveBoardMailboxScope, userEmail, currentUserId]);
+
+  const mailboxMineEligibleCount = useMemo(() => {
+    const today = localDateKey(new Date().toISOString());
+    return shipments.filter((shipment) => {
+      if (activeBoardFilter === "attention" && !shipmentNeedsAttention(shipment)) {
+        return false;
+      }
+      if (activeBoardFilter === "today") {
+        if (localDateKey(shipment.created_at) !== today && localDateKey(shipment.updated_at) !== today) {
+          return false;
+        }
+      }
+      return shipmentMatchesMyMailbox(shipment, userEmail, currentUserId);
+    }).length;
+  }, [shipments, activeBoardFilter, userEmail, currentUserId]);
+
+  useLayoutEffect(() => {
+    if (!triageScrollPendingRef.current) return;
+    if (tab !== "triage") {
+      triageScrollPendingRef.current = false;
+      return;
+    }
+    triageScrollPendingRef.current = false;
+    if (typeof window === "undefined" || !window.matchMedia("(max-width: 1279px)").matches) return;
+    triageDetailPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [selectedTriageItemId, tab]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (currentQuoteParam()) return;
+    setSelectedShipmentId((current) => {
+      if (!current) return current;
+      if (boardShipments.some((s) => s.id === current)) return current;
+      return boardShipments[0]?.id ?? null;
+    });
+  }, [boardShipments]);
+
   const groupedShipmentsByStatus = useMemo(() => {
     const groups: Record<string, ShipmentRecord[]> = {
       parsing: [],
@@ -1642,7 +2263,7 @@ export function FreightDashboardWorkspace() {
       setNotificationOffset(response.offset + response.items.length);
       setNotificationTotal(response.total);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Failed to load notifications.");
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load notifications.");
     } finally {
       setNotificationLoading(false);
     }
@@ -1695,7 +2316,7 @@ export function FreightDashboardWorkspace() {
       setDrawerMode("overview");
       setQuoteParam(shipment.quote_token || normalized, options?.replaceUrl ? "replace" : "push");
     } catch {
-      setNotice(`Shipment ${normalized} was not found.`);
+      showToast(`Shipment ${normalized} was not found.`, { tone: "error" });
       setQuoteParam(null, "replace");
     } finally {
       resolvingQuoteTokenRef.current = null;
@@ -1743,12 +2364,6 @@ export function FreightDashboardWorkspace() {
     setSelectedStatusTaskId((current) => current && statusQueueData.some((item) => item.task_id === current) ? current : statusQueueData[0]?.task_id || null);
   }
 
-  async function refreshEmailTriageQueue() {
-    const triageData = await fetchJson<EmailTriageItem[]>("/api/freight/email-triage");
-    setEmailTriageQueue(triageData);
-    setSelectedTriageItemId((current) => current && triageData.some((item) => item.id === current) ? current : triageData[0]?.id || null);
-  }
-
   async function refreshPartyDenylist(email: string) {
     const normalized = email.trim().toLowerCase();
     if (!normalized) {
@@ -1767,20 +2382,6 @@ export function FreightDashboardWorkspace() {
       if (currentQuoteParam() && current) return current;
       return current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null;
     });
-  }
-
-  async function refreshArchivedShipments() {
-    const params = new URLSearchParams();
-    params.set("month", archiveMonth);
-    params.set("limit", "200");
-    if (archiveSearch.trim()) {
-      params.set("query", archiveSearch.trim());
-    }
-    if (archiveReasonFilter !== "all") {
-      params.set("reason_code", archiveReasonFilter);
-    }
-    const archiveData = await fetchJson<ShipmentRecord[]>(`/api/freight/shipments/archive?${params.toString()}`);
-    setArchivedShipments(archiveData);
   }
 
   async function refreshSelectedShipment(shipmentId: string) {
@@ -1810,42 +2411,55 @@ export function FreightDashboardWorkspace() {
     } else {
       setBackgroundRefreshing(true);
     }
-    setError(null);
     try {
       const boardMonthFilter = activeBoardFilter === "today" ? null : selectedBoardMonth;
       const shipmentQuery = boardMonthFilter ? `?month=${encodeURIComponent(boardMonthFilter)}` : "";
-      const [overviewData, clientData, carrierData, shipmentData, reviewData, statusQueueData, triageData] = await Promise.all([
+      const meData = await fetchJson<CurrentUserResponse>("/api/auth/me");
+      const userCanUseEmailTriage = hasPermission(meData, "freight:write");
+      const [overviewData, shipmentData, reviewData, statusQueueData, clientData, carrierData] = await Promise.all([
         fetchJson<OverviewResponse>("/api/freight/overview"),
-        fetchJson<ClientRecord[]>("/api/freight/clients"),
-        fetchJson<CarrierRecord[]>("/api/freight/carriers"),
         fetchJson<ShipmentRecord[]>(`/api/freight/shipments${shipmentQuery}`),
         fetchJson<ReviewQueueItem[]>("/api/freight/reviews"),
         fetchJson<StatusQueueItem[]>("/api/freight/status-queue?include_resolved=true"),
-        fetchJson<EmailTriageItem[]>("/api/freight/email-triage"),
+        collectAllClientRecords(),
+        collectAllCarrierRecords(),
       ]);
 
       startTransition(() => {
+        setCurrentUser(meData);
+        setUserEmail(meData.email);
+        setCurrentUserId(meData.user_id);
         setOverview(overviewData);
         setClients(clientData);
         setCarriers(carrierData);
         setShipments(shipmentData);
         setReviewQueue(reviewData);
         setStatusQueue(statusQueueData);
-        setEmailTriageQueue(triageData);
+        if (!userCanUseEmailTriage) {
+          setEmailTriageQueue([]);
+          setEmailTriageHasMore(false);
+          setEmailTriageNextOffset(0);
+          setSelectedTriageItemId(null);
+        }
+        if (!userCanUseEmailTriage && tab === "triage") {
+          setTab("shipments");
+        }
         setSelectedShipmentId((current) => {
           if (currentQuoteParam() && current) return current;
           return current && shipmentData.some((item) => item.id === current) ? current : shipmentData[0]?.id || null;
         });
         setSelectedStatusTaskId((current) => current && statusQueueData.some((item) => item.task_id === current) ? current : statusQueueData[0]?.task_id || null);
-        setSelectedTriageItemId((current) => current && triageData.some((item) => item.id === current) ? current : triageData[0]?.id || null);
         if (!bidForm.carrier_id && carrierData[0]) {
           setBidForm((current) => ({ ...current, carrier_id: carrierData[0].id }));
         }
       });
+      if (userCanUseEmailTriage && tab === "triage") {
+        void fetchEmailTriageFirstPage();
+      }
       void refreshFinancialSummary(boardMonthFilter).catch(() => undefined);
       void loadWebhookStatus({ silent: true, allowCache: true }).catch(() => undefined);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Failed to load dashboard.");
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to load dashboard.");
     } finally {
       if (options?.initial) {
         setInitialLoading(false);
@@ -2041,7 +2655,7 @@ export function FreightDashboardWorkspace() {
       const boardMonthFilter = activeBoardFilter === "today" ? null : selectedBoardMonth;
       void Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue(), refreshShipmentList(boardMonthFilter)])
         .catch((loadError) => {
-          setError(loadError instanceof Error ? loadError.message : "Failed to refresh dashboard.");
+          reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to refresh dashboard.");
         })
         .finally(() => {
           setBackgroundRefreshing(false);
@@ -2069,6 +2683,29 @@ export function FreightDashboardWorkspace() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    const storedMailbox = window.localStorage.getItem(BOARD_MAILBOX_SCOPE_STORAGE_KEY);
+    if (storedMailbox === "mine" || storedMailbox === "org") {
+      setBoardMailboxScope(storedMailbox);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (skipMailboxScopePersistRef.current) {
+      skipMailboxScopePersistRef.current = false;
+      return;
+    }
+    if (isViewerRole) return;
+    window.localStorage.setItem(BOARD_MAILBOX_SCOPE_STORAGE_KEY, boardMailboxScope);
+  }, [boardMailboxScope, isViewerRole]);
+
+  useEffect(() => {
+    if (!isViewerRole) return;
+    setBoardMailboxScope("org");
+  }, [isViewerRole]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
     const storedMonth = window.localStorage.getItem(BOARD_MONTH_STORAGE_KEY);
     if (storedMonth && /^\d{4}-\d{2}$/.test(storedMonth)) {
       setSelectedBoardMonth(storedMonth);
@@ -2081,19 +2718,6 @@ export function FreightDashboardWorkspace() {
   }, [selectedBoardMonth]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    const storedControlsState = window.localStorage.getItem(BOARD_CONTROLS_STORAGE_KEY);
-    if (storedControlsState === "true") {
-      setBoardControlsExpanded(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem(BOARD_CONTROLS_STORAGE_KEY, String(boardControlsExpanded));
-  }, [boardControlsExpanded]);
-
-  useEffect(() => {
     setMonthPickerYear(Number(selectedBoardMonth.slice(0, 4)));
   }, [selectedBoardMonth]);
 
@@ -2103,19 +2727,10 @@ export function FreightDashboardWorkspace() {
     }
     const boardMonthFilter = activeBoardFilter === "today" ? null : selectedBoardMonth;
     void refreshShipmentList(boardMonthFilter).catch((loadError) => {
-      setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipments for selected month.");
+      reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to refresh shipments for selected month.");
     });
     void refreshFinancialSummary(boardMonthFilter).catch(() => undefined);
   }, [activeBoardFilter, selectedBoardMonth, initialLoading, tab]);
-
-  useEffect(() => {
-    if (initialLoading || tab !== "archive") {
-      return;
-    }
-    void refreshArchivedShipments().catch((loadError) => {
-      setError(loadError instanceof Error ? loadError.message : "Failed to refresh archived shipments.");
-    });
-  }, [archiveMonth, archiveReasonFilter, archiveSearch, initialLoading, tab]);
 
   useEffect(() => {
     if (initialLoading) return;
@@ -2183,11 +2798,11 @@ export function FreightDashboardWorkspace() {
     },
     onShipmentUpdated: (shipmentId) => {
       void refreshSelectedShipment(shipmentId).catch((loadError) => {
-        setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment.");
+        reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment.");
       });
       if (shipmentId === selectedShipmentId) {
         void refreshSelectedShipmentContext(shipmentId).catch((loadError) => {
-          setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment context.");
+          reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment context.");
         });
       }
     },
@@ -2206,12 +2821,12 @@ export function FreightDashboardWorkspace() {
         );
         if (refetchShipmentDetailTypes.has(event.event_type)) {
           void refreshSelectedShipmentContext(shipment_id).catch((loadError) => {
-            setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment context.");
+            reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment context.");
           });
         }
       }
       void refreshSelectedShipment(shipment_id).catch((loadError) => {
-        setError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment.");
+        reportDashboardError(loadError instanceof Error ? loadError.message : "Failed to refresh shipment.");
       });
       scheduleDashboardWideBackgroundRefresh();
     },
@@ -2296,7 +2911,12 @@ export function FreightDashboardWorkspace() {
   }, [selectedStatusTaskId, statusQueue]);
 
   useEffect(() => {
-    const close = () => setContextMenu(null);
+    const handleWindowClick = () => {
+      setContextMenu(null);
+    };
+    const closeContextMenuOnScroll = () => {
+      setContextMenu(null);
+    };
     const handleEsc = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setContextMenu(null);
@@ -2304,22 +2924,22 @@ export function FreightDashboardWorkspace() {
       }
     };
     const handlePointerDown = (event: MouseEvent) => {
-      if (!monthPickerRef.current) return;
-      if (!monthPickerRef.current.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (monthPickerRef.current && !monthPickerRef.current.contains(target)) {
         setMonthPickerOpen(false);
       }
     };
-    window.addEventListener("click", close);
-    window.addEventListener("contextmenu", close);
+    window.addEventListener("click", handleWindowClick);
+    window.addEventListener("contextmenu", handleWindowClick);
     window.addEventListener("keydown", handleEsc);
     window.addEventListener("mousedown", handlePointerDown);
-    window.addEventListener("scroll", close, true);
+    window.addEventListener("scroll", closeContextMenuOnScroll, true);
     return () => {
-      window.removeEventListener("click", close);
-      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("click", handleWindowClick);
+      window.removeEventListener("contextmenu", handleWindowClick);
       window.removeEventListener("keydown", handleEsc);
       window.removeEventListener("mousedown", handlePointerDown);
-      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("scroll", closeContextMenuOnScroll, true);
     };
   }, []);
 
@@ -2345,13 +2965,12 @@ export function FreightDashboardWorkspace() {
       return;
     }
     setSubmitting(action);
-    setError(null);
     try {
       const response = await fetchJson<ShipmentOperatorActionResponse>(`/api/freight/shipments/${targetShipmentId}/operator-action`, {
         method: "POST",
         body: JSON.stringify({ action, reason, suppress_source_thread: suppressSourceThread }),
       });
-      setNotice(response.message);
+      showToast(response.message);
       await Promise.all([
         refreshSelectedShipment(targetShipmentId),
         refreshOverview(),
@@ -2363,7 +2982,7 @@ export function FreightDashboardWorkspace() {
         await refreshSelectedShipmentContext(targetShipmentId);
       }
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to run action.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to run action.");
     } finally {
       setSubmitting(null);
     }
@@ -2398,7 +3017,6 @@ export function FreightDashboardWorkspace() {
   async function confirmArchiveShipment() {
     if (!archiveDialog) return;
     setSubmitting("archive_shipment");
-    setError(null);
     try {
       const response = await fetchJson<ShipmentOperatorActionResponse>(`/api/freight/shipments/${archiveDialog.shipmentId}/operator-action`, {
         method: "POST",
@@ -2410,15 +3028,15 @@ export function FreightDashboardWorkspace() {
           fraud_block_scope: archiveDialog.fraudBlockScope || null,
         }),
       });
-      setNotice(response.message);
+      showToast(response.message);
       setDrawerOpen(false);
       setContextMenu(null);
       setArchiveDialog(null);
       removeShipmentFromState(archiveDialog.shipmentId);
-      await refreshArchivedShipments();
+      await fetchArchiveFirstPage();
       await Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue()]);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to archive shipment.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to archive shipment.");
     } finally {
       setSubmitting(null);
     }
@@ -2427,7 +3045,6 @@ export function FreightDashboardWorkspace() {
   async function handleStatusQueueAction(action: StatusQueueAction) {
     if (!selectedStatusTask) return;
     setSubmitting(`status-${action}`);
-    setError(null);
     try {
       const response = await fetchJson<StatusQueueActionResponse>(`/api/freight/status-queue/${selectedStatusTask.task_id}/action`, {
         method: "POST",
@@ -2442,7 +3059,7 @@ export function FreightDashboardWorkspace() {
           notes: carrierStatusForm.notes || null,
         }),
       });
-      setNotice(response.message);
+      showToast(response.message);
       setSelectedShipmentId(response.shipment_id);
       await Promise.all([
         refreshSelectedShipment(response.shipment_id),
@@ -2451,16 +3068,30 @@ export function FreightDashboardWorkspace() {
       ]);
       await refreshSelectedShipmentContext(response.shipment_id);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to process status task.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to process status task.");
     } finally {
       setSubmitting(null);
     }
   }
 
+  function openTriageActionDialog(action: EmailTriageAction, item = selectedTriageItem) {
+    if (!item || !canUseEmailTriage) return;
+    setTriageActionDialog({
+      action,
+      itemId: item.id,
+      subject: item.subject || "No subject",
+      sender: item.sender || "Unknown sender",
+      shipmentId: action === "link_to_existing_shipment" ? triageLinkShipmentId || null : null,
+    });
+  }
+
   async function handleEmailTriageAction(action: EmailTriageAction, itemId = selectedTriageItem?.id) {
+    if (!canUseEmailTriage) {
+      reportDashboardError("Email triage is available only to operators.");
+      return;
+    }
     if (!itemId) return;
     setSubmitting(`triage-${action}`);
-    setError(null);
     try {
       const response = await fetchJson<EmailTriageItem>(`/api/freight/email-triage/${itemId}/action`, {
         method: "POST",
@@ -2471,13 +3102,8 @@ export function FreightDashboardWorkspace() {
         }),
       });
       const createdShipmentId = response.created_shipment_id || response.shipment_id;
-      setNotice(`Email triage resolved as ${triageClassificationLabel(response.resolved_action || action)}.`);
-      await Promise.all([
-        refreshEmailTriageQueue(),
-        refreshOverview(),
-        refreshShipmentList(),
-        refreshReviewQueue(),
-      ]);
+      showToast(`Email triage resolved as ${triageClassificationLabel(response.resolved_action || action)}.`);
+      await Promise.all([fetchEmailTriageFirstPage(), refreshOverview(), refreshShipmentList(), refreshReviewQueue()]);
       if (createdShipmentId) {
         setSelectedShipmentId(createdShipmentId);
         setTab("shipments");
@@ -2485,16 +3111,24 @@ export function FreightDashboardWorkspace() {
       }
       setTriageLinkShipmentId("");
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to resolve triage item.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to resolve triage item.");
     } finally {
       setSubmitting(null);
+      setTriageActionDialog(null);
     }
+  }
+
+  async function confirmTriageAction() {
+    if (!triageActionDialog) return;
+    if (triageActionDialog.action === "link_to_existing_shipment" && triageActionDialog.shipmentId) {
+      setTriageLinkShipmentId(triageActionDialog.shipmentId);
+    }
+    await handleEmailTriageAction(triageActionDialog.action, triageActionDialog.itemId);
   }
 
   async function persistShipmentEdits() {
     if (!selectedShipment) return false;
     setSubmitting("save_shipment");
-    setError(null);
     try {
       const updatedShipment = await fetchJson<ShipmentRecord>(`/api/freight/shipments/${selectedShipment.id}`, {
         method: "PATCH",
@@ -2516,7 +3150,7 @@ export function FreightDashboardWorkspace() {
         }),
       });
       mergeShipmentIntoState(updatedShipment);
-      setNotice("Shipment details saved.");
+      showToast("Shipment details saved.");
       await Promise.all([
         refreshOverview(),
         refreshReviewQueue(),
@@ -2526,7 +3160,7 @@ export function FreightDashboardWorkspace() {
       setDrawerMode("overview");
       return true;
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to save shipment.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to save shipment.");
       return false;
     } finally {
       setSubmitting(null);
@@ -2536,8 +3170,6 @@ export function FreightDashboardWorkspace() {
   async function runMagicFill(field: "ready_at_local") {
     if (!selectedShipment) return;
     setMagicFillingField(field);
-    setError(null);
-    setNotice(null);
     try {
       console.debug("[magic-fill] request", {
         shipmentId: selectedShipment.id,
@@ -2556,10 +3188,10 @@ export function FreightDashboardWorkspace() {
         setShipmentEditor(buildShipmentEditor(response.shipment));
         await refreshSelectedShipmentContext(response.shipment.id);
       }
-      setNotice(response.message);
+      showToast(response.message);
     } catch (actionError) {
       console.error("[magic-fill] failed", actionError);
-      setError(actionError instanceof Error ? actionError.message : "Magic fill failed.");
+      reportDashboardError(actionError instanceof Error ? actionError.message : "Magic fill failed.");
     } finally {
       setMagicFillingField(null);
     }
@@ -2613,10 +3245,10 @@ export function FreightDashboardWorkspace() {
       });
       mergeShipmentIntoState(createdShipment);
       setSelectedShipmentId(createdShipment.id);
-      setNotice("Shipment created.");
+      showToast("Shipment created.");
       await Promise.all([refreshOverview(), refreshReviewQueue(), refreshStatusQueue()]);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to create shipment.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to create shipment.");
     } finally {
       setSubmitting(null);
     }
@@ -2637,12 +3269,13 @@ export function FreightDashboardWorkspace() {
         }),
       });
       setClients((current) => [createdClient, ...current]);
-      setNotice("Client added.");
+      showToast("Client added.");
       setClientForm({ name: "", email: "", default_margin_percent: "15", default_margin_floor: "0" });
       openClientDrawer(createdClient);
+      void fetchCustomersTabFirstPage();
       await refreshOverview();
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to create client.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to create client.");
     } finally {
       setSubmitting(null);
     }
@@ -2665,12 +3298,13 @@ export function FreightDashboardWorkspace() {
         }),
       });
       setCarriers((current) => [createdCarrier, ...current]);
-      setNotice("Carrier added.");
+      showToast("Carrier added.");
       setCarrierForm({ name: "", email: "", rating: "0", regions: "midwest,northeast", equipment: "dry van" });
       openCarrierDrawer(createdCarrier);
+      void fetchCarriersTabFirstPage();
       await refreshOverview();
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to create carrier.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to create carrier.");
     } finally {
       setSubmitting(null);
     }
@@ -2679,7 +3313,6 @@ export function FreightDashboardWorkspace() {
   async function handleSaveClientDetails() {
     if (!selectedPartyClient) return;
     setSubmitting("save_client");
-    setError(null);
     try {
       const updatedClient = await fetchJson<ClientRecord>(`/api/freight/clients/${selectedPartyClient.id}`, {
         method: "PATCH",
@@ -2692,10 +3325,11 @@ export function FreightDashboardWorkspace() {
         }),
       });
       setClients((current) => current.map((client) => (client.id === updatedClient.id ? updatedClient : client)));
-      setNotice("Customer details saved.");
+      setCustomersTabList((current) => current.map((client) => (client.id === updatedClient.id ? updatedClient : client)));
+      showToast("Customer details saved.");
       await refreshPartyDenylist(updatedClient.email);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to save customer.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to save customer.");
     } finally {
       setSubmitting(null);
     }
@@ -2704,7 +3338,6 @@ export function FreightDashboardWorkspace() {
   async function handleSaveCarrierDetails() {
     if (!selectedPartyCarrier) return;
     setSubmitting("save_carrier");
-    setError(null);
     try {
       const updatedCarrier = await fetchJson<CarrierRecord>(`/api/freight/carriers/${selectedPartyCarrier.id}`, {
         method: "PATCH",
@@ -2719,10 +3352,11 @@ export function FreightDashboardWorkspace() {
         }),
       });
       setCarriers((current) => current.map((carrier) => (carrier.id === updatedCarrier.id ? updatedCarrier : carrier)));
-      setNotice("Carrier details saved.");
+      setCarriersTabList((current) => current.map((carrier) => (carrier.id === updatedCarrier.id ? updatedCarrier : carrier)));
+      showToast("Carrier details saved.");
       await refreshPartyDenylist(updatedCarrier.email);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to save carrier.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to save carrier.");
     } finally {
       setSubmitting(null);
     }
@@ -2732,7 +3366,6 @@ export function FreightDashboardWorkspace() {
     const value = scope === "sender_domain" ? selectedPartyDomain : selectedPartyEmail.trim().toLowerCase();
     if (!value) return;
     setSubmitting("party_denylist");
-    setError(null);
     try {
       await fetchJson<FraudDenylistEntryRecord>("/api/freight/fraud-denylist", {
         method: "POST",
@@ -2745,9 +3378,9 @@ export function FreightDashboardWorkspace() {
       });
       setPartyDenylistReason("");
       await refreshPartyDenylist(selectedPartyEmail);
-      setNotice("Fraud denylist updated.");
+      showToast("Fraud denylist updated.");
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to update fraud denylist.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to update fraud denylist.");
     } finally {
       setSubmitting(null);
     }
@@ -2755,7 +3388,6 @@ export function FreightDashboardWorkspace() {
 
   async function handleTogglePartyDenylistEntry(entry: FraudDenylistEntryRecord) {
     setSubmitting("party_denylist");
-    setError(null);
     try {
       await fetchJson<FraudDenylistEntryRecord>(`/api/freight/fraud-denylist/${entry.id}`, {
         method: "PATCH",
@@ -2765,9 +3397,9 @@ export function FreightDashboardWorkspace() {
         }),
       });
       await refreshPartyDenylist(selectedPartyEmail);
-      setNotice(entry.is_active ? "Fraud denylist entry disabled." : "Fraud denylist entry enabled.");
+      showToast(entry.is_active ? "Fraud denylist entry disabled." : "Fraud denylist entry enabled.");
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to update fraud denylist entry.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to update fraud denylist entry.");
     } finally {
       setSubmitting(null);
     }
@@ -2775,11 +3407,10 @@ export function FreightDashboardWorkspace() {
 
   async function handleVerifySenderIdentity() {
     if (!selectedShipment?.sender_email) {
-      setError("No inbound sender email is available for verification.");
+      reportDashboardError("No inbound sender email is available for verification.");
       return;
     }
     setSubmitting("verify_sender");
-    setError(null);
     try {
       let clientId = senderClientId || "";
       let carrierId = senderCarrierId || "";
@@ -2825,7 +3456,7 @@ export function FreightDashboardWorkspace() {
           carrier_id: senderIdentityRole === "carrier" ? carrierId : null,
         }),
       });
-      setNotice(response.message);
+      showToast(response.message);
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
@@ -2835,7 +3466,7 @@ export function FreightDashboardWorkspace() {
       ]);
       await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to verify sender identity.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to verify sender identity.");
     } finally {
       setSubmitting(null);
     }
@@ -2850,73 +3481,19 @@ export function FreightDashboardWorkspace() {
     }
     setOutlookStatusLoading(true);
     try {
-      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/status");
+      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/auto-sync/status");
       setWebhookStatus(response);
       writeCachedOutlookStatus(OUTLOOK_STATUS_STORAGE_KEY, response);
       if (!options?.silent) {
-        setNotice(`Outlook webhook check: ${webhookStatusLabel(response.status)}.`);
+        showToast(`Outlook auto-sync check: ${webhookStatusLabel(response.status)}.`, { tone: "info" });
       }
     } catch (statusError) {
       if (!options?.silent) {
         setWebhookStatus(null);
-        setError(statusError instanceof Error ? statusError.message : "Failed to check Outlook webhook.");
+        reportDashboardError(statusError instanceof Error ? statusError.message : "Failed to check Outlook auto-sync.");
       }
     } finally {
       setOutlookStatusLoading(false);
-    }
-  }
-
-  async function handleEnsureWebhook() {
-    setSubmitting("webhook");
-    setError(null);
-    try {
-      const response = await fetchJson<OutlookWebhookStatusResponse>("/api/freight/outlook/webhook/ensure", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      setWebhookStatus(response);
-      writeCachedOutlookStatus(OUTLOOK_STATUS_STORAGE_KEY, response);
-      setNotice(`Outlook webhook ${response.subscription_action || "checked"}: ${webhookStatusLabel(response.status)}.`);
-      appendNotification(createSystemNotification("Outlook webhook checked", `Webhook is ${webhookStatusLabel(response.status).toLowerCase()}.`));
-    } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to install Outlook webhook.");
-    } finally {
-      setSubmitting(null);
-    }
-  }
-
-  async function handleOutlookSync(limit = syncLimit) {
-    setSubmitting("sync");
-    setSyncMenuOpen(false);
-    try {
-      const response = await fetchJson<OutlookSyncResponse>("/api/freight/outlook/sync", {
-        method: "POST",
-        body: JSON.stringify({
-          limit,
-          auto_acknowledge_new_shipments: true,
-          acknowledgement_dry_run: false,
-          auto_prepare_outreach_for_new_shipments: true,
-          outreach_dry_run: false,
-          auto_send_customer_quotes: true,
-          customer_quote_dry_run: false,
-        }),
-      });
-      setLastSyncSummary(response);
-      setNotice(`Sync imported ${response.imported} messages and flagged ${response.manual_reviews} review items.`);
-      appendNotification(
-        createSystemNotification(
-          "Outlook sync completed",
-          `Imported ${response.imported} messages, parsed ${response.parsed_shipments} shipments, flagged ${response.manual_reviews} review items.`,
-        ),
-      );
-      await hardRefreshDashboard();
-      if (selectedShipmentId) {
-        await refreshSelectedShipmentContext(selectedShipmentId);
-      }
-    } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to sync Outlook.");
-    } finally {
-      setSubmitting(null);
     }
   }
 
@@ -2926,7 +3503,7 @@ export function FreightDashboardWorkspace() {
     try {
       const response = await fetchJson<EvaluationResponse>(`/api/freight/shipments/${selectedShipment.id}/evaluate`, { method: "POST" });
       setEvaluation(response);
-      setNotice(`Best bid selected at $${response.selected_amount.toFixed(2)}.`);
+      showToast(`Best bid selected at $${response.selected_amount.toFixed(2)}.`);
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
@@ -2934,7 +3511,7 @@ export function FreightDashboardWorkspace() {
       ]);
       await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to evaluate bids.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to evaluate bids.");
     } finally {
       setSubmitting(null);
     }
@@ -2949,9 +3526,9 @@ export function FreightDashboardWorkspace() {
         body: JSON.stringify({ bid_id: evaluation?.selected_bid_id || selectedWinningBid?.id || null, dry_run: true }),
       });
       setQuotePreview(response);
-      setNotice(`Customer quote preview ready at $${response.final_amount.toFixed(2)}.`);
+      showToast(`Customer quote preview ready at $${response.final_amount.toFixed(2)}.`);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to build quote preview.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to build quote preview.");
     } finally {
       setSubmitting(null);
     }
@@ -2966,7 +3543,7 @@ export function FreightDashboardWorkspace() {
         body: JSON.stringify({ bid_id: evaluation?.selected_bid_id || selectedWinningBid?.id || null, dry_run: false }),
       });
       setQuotePreview(response);
-      setNotice(`Customer quote sent at $${response.final_amount.toFixed(2)}.`);
+      showToast(`Customer quote sent at $${response.final_amount.toFixed(2)}.`);
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
@@ -2975,7 +3552,7 @@ export function FreightDashboardWorkspace() {
       await refreshSelectedShipmentContext(selectedShipment.id);
       await loadShipmentThread(selectedShipment.id, true);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to send customer quote.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to send customer quote.");
     } finally {
       setSubmitting(null);
     }
@@ -2990,9 +3567,9 @@ export function FreightDashboardWorkspace() {
         body: JSON.stringify({ dry_run: true, custom_message: statusReplyMessage || null }),
       });
       setStatusReplyPreview(response);
-      setNotice(`Status reply prepared for ${response.client_email}.`);
+      showToast(`Status reply prepared for ${response.client_email}.`);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to preview status reply.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to preview status reply.");
     } finally {
       setSubmitting(null);
     }
@@ -3007,9 +3584,9 @@ export function FreightDashboardWorkspace() {
         body: JSON.stringify({ bid_id: evaluation?.selected_bid_id || selectedWinningBid?.id || null, dry_run: true }),
       });
       setTmsPreview(response);
-      setNotice("TMS handoff preview ready.");
+      showToast("TMS handoff preview ready.");
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to preview TMS handoff.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to preview TMS handoff.");
     } finally {
       setSubmitting(null);
     }
@@ -3024,7 +3601,7 @@ export function FreightDashboardWorkspace() {
         body: JSON.stringify({ bid_id: evaluation?.selected_bid_id || selectedWinningBid?.id || null, dry_run: false }),
       });
       setBookingResult(response);
-      setNotice(`Shipment booked and confirmation sent to ${response.confirmation.client_email}.`);
+      showToast(`Shipment booked and confirmation sent to ${response.confirmation.client_email}.`);
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
@@ -3033,7 +3610,7 @@ export function FreightDashboardWorkspace() {
       ]);
       await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to book shipment.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to book shipment.");
     } finally {
       setSubmitting(null);
     }
@@ -3056,7 +3633,7 @@ export function FreightDashboardWorkspace() {
           subject: selectedShipment.quote_token ? `Re: Quote reply [${selectedShipment.quote_token}]` : "Carrier bid response",
         }),
       });
-      setNotice("Bid recorded.");
+      showToast("Bid recorded.");
       await Promise.all([
         refreshSelectedShipment(selectedShipment.id),
         refreshOverview(),
@@ -3064,7 +3641,7 @@ export function FreightDashboardWorkspace() {
       ]);
       await refreshSelectedShipmentContext(selectedShipment.id);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "Failed to intake bid.");
+      reportDashboardError(submitError instanceof Error ? submitError.message : "Failed to intake bid.");
     } finally {
       setSubmitting(null);
     }
@@ -3075,15 +3652,6 @@ export function FreightDashboardWorkspace() {
     { label: "Attention", value: shipments.filter((item) => shipmentNeedsAttention(item)).length, detail: "need operator" },
     { label: "Bids", value: overview.active_stages.waiting_bids || 0, detail: "waiting carriers" },
     { label: "Booked", value: overview.active_stages.booked || 0, detail: "moving loads" },
-  ];
-
-  const uniqueReviewShipmentCount = new Set(reviewQueue.map((item) => item.shipment_id)).size;
-  const attentionShipmentCount = shipments.filter((item) => shipmentNeedsAttention(item)).length;
-  const attentionItems = [
-    `${uniqueReviewShipmentCount} shipments in review`,
-    `${overview.status_metrics.stale_shipments} stale`,
-    `${overview.active_stages.waiting_bids || 0} waiting bids`,
-    `${attentionShipmentCount} awaiting operator`,
   ];
 
   const secondaryActions =
@@ -3379,6 +3947,18 @@ export function FreightDashboardWorkspace() {
                 <p className="mt-2 text-sm text-[var(--text-muted)]">
                   Customer {selectedShipment.client_id ? "linked" : "not linked"} • Sender {selectedShipment.sender_verification_required ? "needs verification" : selectedShipment.sender_known ? "known" : "not linked"} • Created {formatDate(selectedShipment.created_at)} • Confidence {formatConfidence(selectedShipment.ai_confidence)} • Last agent decision {selectedShipment.next_step_label || selectedShipment.ai_next_action || "pending"}
                 </p>
+                {selectedShipment.source_mailbox && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border border-sky-300/18 bg-sky-300/10 px-3 py-1 text-xs text-sky-100">
+                      {mailboxSourceLabel(selectedShipment.source_mailbox, userEmail)}
+                    </span>
+                    {selectedShipment.source_mailbox_visibility_mode && (
+                      <span className={`rounded-full border px-3 py-1 text-xs ${emailVisibilityClasses(selectedShipment.source_mailbox_visibility_mode)}`}>
+                        {emailVisibilityLabel(selectedShipment.source_mailbox_visibility_mode)}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 {editableMetricCard("Pallets", String(selectedShipment.pallets ?? "--"), () => enterEditMode("pallets"))}
@@ -4015,21 +4595,43 @@ export function FreightDashboardWorkspace() {
 
     return (
       <div
-        className={`relative flex min-h-0 w-full flex-col overflow-hidden rounded-[28px] border border-cyan-300/14 bg-[linear-gradient(135deg,rgba(7,15,25,0.94),rgba(11,23,37,0.9)_46%,rgba(17,34,52,0.92)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.13),transparent_28%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.11),transparent_24%)] backdrop-blur-xl ${
-          embedded ? "min-h-[420px] shadow-[0_20px_50px_rgba(0,0,0,0.24)]" : "h-full shadow-[-20px_22px_80px_rgba(0,0,0,0.32)]"
-        }`}
+        className={
+          embedded
+            ? "flex h-full min-h-0 w-full flex-col overflow-hidden rounded-[28px] border border-white/10 bg-white/[0.03] px-5 pb-5 pt-3.5"
+            : "relative flex h-full min-h-0 w-full flex-col overflow-hidden rounded-[28px] border border-cyan-300/14 bg-[linear-gradient(135deg,rgba(7,15,25,0.94),rgba(11,23,37,0.9)_46%,rgba(17,34,52,0.92)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.13),transparent_28%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.11),transparent_24%)] shadow-[-20px_22px_80px_rgba(0,0,0,0.32)] backdrop-blur-xl"
+        }
       >
-        <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(120,210,255,0.05)_18%,transparent_38%,transparent_62%,rgba(120,210,255,0.04)_82%,transparent)]" />
-        <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
-        <div className="pointer-events-none absolute inset-y-0 right-[24%] w-px bg-cyan-200/8" />
+        {!embedded ? (
+          <>
+            <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(120,210,255,0.05)_18%,transparent_38%,transparent_62%,rgba(120,210,255,0.04)_82%,transparent)]" />
+            <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
+            <div className="pointer-events-none absolute inset-y-0 right-[24%] w-px bg-cyan-200/8" />
+          </>
+        ) : null}
 
-        <div className="relative border-b border-cyan-200/10 px-4 py-4 sm:px-5">
+        <div
+          className={
+            embedded
+              ? "relative shrink-0 border-b border-white/10 pb-4"
+              : "relative border-b border-cyan-200/10 px-4 py-4 sm:px-5"
+          }
+        >
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <div className="inline-flex h-8 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[10px] uppercase tracking-[0.24em] text-cyan-100">
-                Thread context
-              </div>
-              <h3 className="mt-1 break-words text-lg font-semibold text-white">
+              {embedded ? (
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Thread context</p>
+              ) : (
+                <div className="inline-flex h-8 items-center gap-2 rounded-[10px] border border-cyan-200/16 bg-cyan-200/6 px-3 text-[10px] uppercase tracking-[0.24em] text-cyan-100">
+                  Thread context
+                </div>
+              )}
+              <h3
+                className={
+                  embedded
+                    ? "mt-1 break-words text-2xl font-semibold tracking-[-0.04em] text-white"
+                    : "mt-1 break-words text-lg font-semibold text-white"
+                }
+              >
                 {threadData?.thread_subject || formatRoute(selectedShipment)}
               </h3>
               <p className="mt-2 break-all text-sm text-[var(--text-muted)]">
@@ -4037,11 +4639,22 @@ export function FreightDashboardWorkspace() {
               </p>
             </div>
             <button
+              type="button"
               onClick={() => void loadShipmentThread(selectedShipment.id, true)}
               disabled={threadLoading}
-              className="action-button shrink-0 border border-cyan-200/16 bg-cyan-200/10 px-3 py-2 text-cyan-50 hover:bg-cyan-200/18 disabled:opacity-50"
+              aria-busy={threadLoading}
+              className={`inline-flex shrink-0 items-center gap-2 rounded-full border text-xs font-semibold tracking-wide transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 disabled:pointer-events-none disabled:opacity-40 ${
+                embedded
+                  ? "group border-white/14 bg-white/[0.07] px-3.5 py-2 text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.1)] hover:border-white/22 hover:bg-white/[0.11] focus-visible:outline-white/40"
+                  : "group border-cyan-200/22 bg-cyan-200/12 px-3 py-2 text-cyan-50 shadow-[inset_0_1px_0_rgba(165,243,252,0.12)] hover:border-cyan-200/35 hover:bg-cyan-200/18 focus-visible:outline-cyan-200/50"
+              }`}
             >
-              {threadLoading ? "Loading..." : "Refresh"}
+              <RefreshCcw
+                className={`h-3.5 w-3.5 shrink-0 transition duration-500 ease-out ${threadLoading ? "animate-spin" : "group-hover:-rotate-45"}`}
+                strokeWidth={2.25}
+                aria-hidden
+              />
+              {threadLoading ? (embedded ? "Updating…" : "Loading…") : "Refresh"}
             </button>
           </div>
           <div className="mt-4 flex flex-wrap gap-2">
@@ -4052,8 +4665,12 @@ export function FreightDashboardWorkspace() {
                 onClick={() => setActiveThreadTab(tab.key)}
                 className={`rounded-[10px] px-3 py-2 text-[10px] uppercase tracking-[0.18em] transition ${
                   activeThreadTab === tab.key
-                    ? "bg-cyan-100 text-slate-950"
-                    : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
+                    ? embedded
+                      ? "bg-white text-slate-950"
+                      : "bg-cyan-100 text-slate-950"
+                    : embedded
+                      ? "border border-white/10 bg-white/5 text-slate-300 hover:bg-white/10 hover:text-white"
+                      : "border border-cyan-200/10 bg-slate-950/22 text-slate-300 hover:bg-cyan-200/8 hover:text-white"
                 }`}
               >
                 {tab.label}
@@ -4062,7 +4679,13 @@ export function FreightDashboardWorkspace() {
           </div>
         </div>
 
-        <div className={`relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-4 sm:px-5 ${embedded ? "max-h-[calc(100dvh-13rem)]" : ""}`}>
+        <div
+          className={
+            embedded
+              ? "relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto pt-4"
+              : "relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-4 sm:px-5"
+          }
+        >
           {threadLoading && !threadData && (
             <div className="space-y-3">
               {[1, 2, 3].map((item) => (
@@ -4168,15 +4791,16 @@ export function FreightDashboardWorkspace() {
 
   return (
     <main className="min-h-screen px-4 py-5 text-[var(--text-main)] sm:px-6 lg:px-8">
+      <OrganizationDrawer open={organizationDrawerOpen} onClose={() => setOrganizationDrawerOpen(false)} />
       <div className="mx-auto max-w-[1540px] space-y-4">
         <section className="relative overflow-hidden rounded-[18px] border border-cyan-300/12 bg-[linear-gradient(135deg,rgba(7,15,25,0.96),rgba(11,23,37,0.92)_46%,rgba(17,34,52,0.94)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.14),transparent_26%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.12),transparent_24%)] px-4 py-4 shadow-[0_18px_60px_rgba(0,0,0,0.26)] sm:px-5">
           <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(90deg,transparent,rgba(120,210,255,0.05)_18%,transparent_38%,transparent_62%,rgba(120,210,255,0.04)_82%,transparent)]" />
           <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
           <div className="pointer-events-none absolute inset-y-0 right-[26%] w-px bg-cyan-200/8" />
 
-          <div className="relative grid gap-4 lg:grid-cols-[minmax(0,1fr),minmax(560px,1.02fr)] lg:items-center xl:grid-cols-[minmax(0,1fr),minmax(680px,1.12fr)]">
-            <div className="min-w-0 space-y-3">
-              <div className="flex flex-wrap items-center gap-3">
+          <div className="relative grid gap-3 sm:gap-4 lg:grid-cols-[minmax(0,1fr),minmax(260px,480px)] lg:items-start xl:grid-cols-[minmax(0,1fr),minmax(280px,520px)]">
+            <div className="min-w-0 max-w-xl space-y-2.5 self-start lg:max-w-lg xl:max-w-xl">
+              <div className="flex w-full flex-wrap items-center gap-2.5">
                 <div className="inline-flex items-center gap-2.5">
                   <DashboardLogo className="h-6 w-6 shrink-0 sm:h-7 sm:w-7" />
                   <span className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-100">
@@ -4187,43 +4811,42 @@ export function FreightDashboardWorkspace() {
                   Live operations board
                 </span>
               </div>
-              <div className="space-y-2">
-                <h1 className="text-xl font-semibold tracking-[-0.05em] text-white sm:text-[1.7rem]">
+              <div className="space-y-1.5">
+                <h1 className="text-lg font-semibold tracking-[-0.04em] text-white sm:text-xl">
                   Monitor active lanes. Surface blockers. Move faster.
                 </h1>
-                <p className="max-w-2xl text-sm leading-6 text-slate-300">
+                <p className="text-xs leading-snug text-slate-300 sm:text-sm sm:leading-relaxed">
                   A sharper command deck for today&apos;s shipments, operator decisions, and time-sensitive follow-up.
                 </p>
               </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-1.5 xl:grid-cols-6">
+            <div className="grid w-full max-w-[440px] shrink-0 grid-cols-3 grid-rows-2 gap-1 min-[1280px]:max-w-none min-[1280px]:grid-cols-6 min-[1280px]:grid-rows-1 min-[1280px]:gap-1.5 justify-self-start lg:justify-self-end">
                 {metrics.map((metric) => (
-                  <div key={metric.label} className="min-h-[68px] rounded-[13px] border border-cyan-200/10 bg-slate-950/26 px-2.5 py-2 backdrop-blur">
-                    <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/48">{metric.label}</p>
-                    <div className="mt-1 space-y-0.5">
-                      <span className="block text-[1.45rem] font-semibold leading-none text-white">{metric.value}</span>
-                      <span className="block text-[10px] leading-4 text-slate-300 break-words">{metric.detail}</span>
+                  <div key={metric.label} className="min-h-[58px] rounded-[11px] border border-cyan-200/10 bg-slate-950/26 px-2 py-1.5 backdrop-blur sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2">
+                    <p className="text-[9px] uppercase tracking-[0.2em] text-cyan-200/48 sm:text-[10px] sm:tracking-[0.22em]">{metric.label}</p>
+                    <div className="mt-0.5 space-y-0.5 sm:mt-1">
+                      <span className="block text-xl font-semibold leading-none text-white sm:text-[1.35rem]">{metric.value}</span>
+                      <span className="block text-[9px] leading-tight text-slate-300 sm:text-[10px] sm:leading-4">{metric.detail}</span>
                     </div>
                   </div>
                 ))}
                 <button
                   onClick={() => {
-                    setSyncMenuOpen(false);
                     setNotificationCenterOpen((open) => !open);
                   }}
-                  className="relative min-h-[68px] overflow-hidden rounded-[13px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] px-2.5 py-2 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-cyan-200/24 hover:bg-cyan-200/10"
+                  className="relative min-h-[58px] overflow-hidden rounded-[11px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] px-2 py-1.5 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-cyan-200/24 hover:bg-cyan-200/10 sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2"
                 >
-                  <span className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-[64px] font-black leading-none tracking-[-0.05em] text-cyan-100/[0.08]">
+                  <span className="pointer-events-none absolute right-0.5 top-1/2 -translate-y-1/2 text-[48px] font-black leading-none tracking-[-0.05em] text-cyan-100/[0.08] sm:right-1 sm:text-[56px] min-[1280px]:text-[64px]">
                     {unreadNotificationCount}
                   </span>
-                  <div className="relative z-[1] flex items-center justify-between gap-2">
-                    <div className="min-w-0 pr-4">
-                      <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Signals</p>
-                      <span className="mt-0.5 inline-flex items-center gap-1.5 text-[15px] font-semibold text-white">
-                        <Bell size={16} /> Alerts
+                  <div className="relative z-[1] flex items-center justify-between gap-1.5 sm:gap-2">
+                    <div className="min-w-0 pr-2 sm:pr-4">
+                      <p className="text-[9px] uppercase tracking-[0.2em] text-cyan-100/70 sm:text-[10px] sm:tracking-[0.22em]">Signals</p>
+                      <span className="mt-0.5 inline-flex items-center gap-1 text-[13px] font-semibold text-white sm:gap-1.5 sm:text-[15px]">
+                        <Bell size={14} className="shrink-0" /> Alerts
                       </span>
-                      <p className="mt-0.5 truncate text-[10px] text-cyan-100/70">
+                      <p className="mt-0.5 truncate text-[9px] text-cyan-100/70 sm:text-[10px]">
                         {notifications[0]?.title || "Email, shipment, bid, review"}
                       </p>
                     </div>
@@ -4233,23 +4856,22 @@ export function FreightDashboardWorkspace() {
                   <button
                     onClick={() => {
                       setNotificationCenterOpen(false);
-                      setSyncMenuOpen((open) => !open);
+                      setOrganizationDrawerOpen(true);
                     }}
                     disabled={submitting !== null && submitting !== "sync" && submitting !== "webhook"}
-                    className="min-h-[68px] w-full rounded-[13px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-2.5 py-2 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50"
+                    className="min-h-[58px] w-full rounded-[11px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-2 py-1.5 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50 sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2"
                   >
-                    <div className="flex h-full min-w-0 flex-col justify-between gap-1">
-                      <div className="flex min-w-0 items-center justify-between gap-2">
-                        <p className="min-w-0 truncate text-[10px] uppercase tracking-[0.22em] text-cyan-100/70">Outlook</p>
-                        <span className={`h-2 w-2 shrink-0 rounded-full ${outlookStatusLoading ? "animate-pulse bg-cyan-200" : webhookStatus?.status === "active" ? "bg-emerald-200" : webhookStatus?.status === "expiring_soon" ? "bg-amber-200" : "bg-rose-200"}`} />
+                    <div className="flex h-full min-w-0 flex-col justify-between gap-0.5 sm:gap-1">
+                      <div className="flex min-w-0 items-center justify-between gap-1.5 sm:gap-2">
+                        <p className="min-w-0 truncate text-[9px] uppercase tracking-[0.2em] text-cyan-100/70 sm:text-[10px] sm:tracking-[0.22em]">Organization</p>
+                        <span className={`h-1.5 w-1.5 shrink-0 rounded-full sm:h-2 sm:w-2 ${outlookStatusLoading ? "animate-pulse bg-cyan-200" : webhookStatus?.status === "active" ? "bg-emerald-200" : webhookStatus?.status === "expiring_soon" ? "bg-amber-200" : "bg-rose-200"}`} />
                       </div>
-                      <span className="flex min-w-0 items-center gap-1.5 text-[14px] font-semibold leading-5 text-white">
-                          {submitting === "sync" ? <Loader2 className="animate-spin" size={16} /> : <SlidersHorizontal size={16} />}
-                          <span className="min-w-0 truncate">Ops</span>
-                        <ChevronDown size={15} className="ml-auto shrink-0 text-cyan-100/80" />
+                      <span className="flex min-w-0 items-center gap-1 text-[13px] font-semibold leading-tight text-white sm:gap-1.5 sm:text-[14px] sm:leading-5">
+                          {submitting === "sync" ? <Loader2 className="shrink-0 animate-spin" size={14} /> : <SlidersHorizontal size={14} className="shrink-0" />}
+                          <span className="min-w-0 truncate">Mailbox</span>
                       </span>
-                      <p className="min-w-0 truncate text-[10px] leading-4 text-cyan-100/70">
-                        {syncLimit} mails · {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
+                      <p className="min-w-0 truncate text-[9px] leading-tight text-cyan-100/70 sm:text-[10px] sm:leading-4">
+                        Your inbox · {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
                       </p>
                     </div>
                   </button>
@@ -4259,13 +4881,10 @@ export function FreightDashboardWorkspace() {
 
         </section>
 
-        {error && <div className="glass-panel-strong border-red-400/20 px-5 py-4 text-sm text-red-100">{error}</div>}
-        {notice && <div className="glass-panel-strong border-cyan-400/20 px-5 py-4 text-sm text-cyan-100">{notice}</div>}
-
         <section className="glass-panel p-4">
           <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5">
             {[
-              { key: "triage", label: "Email triage", icon: Mail },
+              ...(canUseEmailTriage ? [{ key: "triage", label: "Email triage", icon: Mail }] : []),
               { key: "shipments", label: "Shipments", icon: Package2 },
               // Status Ops is hidden until the workflow purpose is clearer.
               // { key: "status_ops", label: "Status ops", icon: RadioTower },
@@ -4298,17 +4917,23 @@ export function FreightDashboardWorkspace() {
           <section className="space-y-4">
             <div className="glass-panel overflow-visible px-4 py-4">
               <div className="flex flex-col gap-4">
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Board controls</p>
-                    <p className="mt-1 text-sm text-slate-300">
-                      Search shipments, switch created month, and control the live board from one surface.
-                    </p>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4 lg:items-center">
+                  <div className="flex min-w-0 items-start gap-3">
+                    <span className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-[12px] border border-cyan-200/12 bg-cyan-200/8 text-cyan-100">
+                      <SlidersHorizontal size={18} />
+                    </span>
+                    <div className="min-w-0">
+                      <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Board controls</p>
+                      <p className="mt-1 text-sm text-slate-300">
+                        Search shipments, switch created month, and control the live board from one surface.
+                      </p>
+                    </div>
                   </div>
-                  <div className="flex flex-wrap gap-2 lg:ml-4 lg:justify-end">
+                  <div className="flex flex-wrap gap-2 sm:ml-auto sm:justify-end lg:ml-4">
                     {(["today", "attention", "all"] as const).map((filter) => (
                       <button
                         key={filter}
+                        type="button"
                         onClick={() => setActiveBoardFilter(filter)}
                         className={`rounded-[10px] px-3 py-2 text-[11px] uppercase tracking-[0.2em] transition ${
                           activeBoardFilter === filter
@@ -4322,152 +4947,133 @@ export function FreightDashboardWorkspace() {
                   </div>
                 </div>
 
-                {boardControlsExpanded ? (
-                  <>
-                    <div className="grid gap-3 xl:grid-cols-[minmax(340px,430px),minmax(280px,1fr)] xl:items-end">
-                      <div className="min-w-0">
-                        <span className="mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Month</span>
-                        <div ref={monthPickerRef} className="relative">
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => shiftBoardMonth(-1)}
-                              className="inline-flex h-[52px] w-[46px] shrink-0 items-center justify-center rounded-[16px] border border-cyan-200/10 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
-                              aria-label="Previous month"
-                            >
-                              <ChevronLeft size={18} />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setMonthPickerOpen((open) => !open)}
-                              className="flex h-[52px] min-w-[240px] flex-1 items-center justify-between gap-3 rounded-[16px] border border-cyan-200/12 bg-[linear-gradient(135deg,rgba(110,184,255,0.08),rgba(110,184,255,0.02))] px-4 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] transition hover:border-cyan-200/20 hover:bg-cyan-200/8"
-                            >
-                              <span className="flex min-w-0 items-center gap-3">
-                                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-[12px] border border-cyan-200/12 bg-cyan-200/8 text-cyan-100">
-                                  <Calendar size={16} />
-                                </span>
-                                <span className="min-w-0">
-                                  <span className="block text-[10px] uppercase tracking-[0.18em] text-cyan-200/55">Created month</span>
-                                  <span className="block truncate text-sm font-medium text-white">{formatMonthLabel(selectedBoardMonth)}</span>
-                                </span>
-                              </span>
-                              <span className="text-[11px] uppercase tracking-[0.16em] text-slate-400">{monthPickerOpen ? "Close" : "Choose"}</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => shiftBoardMonth(1)}
-                              className="inline-flex h-[52px] w-[46px] shrink-0 items-center justify-center rounded-[16px] border border-cyan-200/10 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
-                              aria-label="Next month"
-                            >
-                              <ChevronRight size={18} />
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-
-                      <label className="relative min-w-0">
-                        <span className="mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Search</span>
-                        <Search size={16} className="pointer-events-none absolute left-3 top-[calc(50%+12px)] -translate-y-1/2 text-[var(--text-muted)]" />
-                        <input
-                          className="field-input h-[52px] rounded-[16px] pl-10"
-                          value={shipmentSearch}
-                          onChange={(event) => setShipmentSearch(event.target.value)}
-                          placeholder="Search by route, city, token, notes..."
-                        />
-                      </label>
-                    </div>
-
-                    <div className="flex flex-wrap gap-2 border-t border-cyan-200/10 pt-4">
-                      <span className="rounded-[10px] border border-cyan-200/10 bg-slate-950/22 px-3 py-2 text-[11px] text-slate-300">
-                        {formatMonthLabel(selectedBoardMonth)}
-                      </span>
-                      <span className="rounded-[10px] border border-cyan-200/10 bg-slate-950/22 px-3 py-2 text-[11px] text-slate-300">
-                        Showing {boardShipments.length} shipments
-                      </span>
-                      {attentionItems.slice(0, 3).map((item) => (
-                        <span key={item} className="rounded-[10px] border border-cyan-200/10 bg-slate-950/20 px-3 py-2 text-[11px] text-slate-400">
-                          {item}
-                        </span>
-                      ))}
-                      <div className="ml-auto flex flex-wrap gap-2">
-                        {shipmentSearch.trim() ? (
-                          <button
-                            onClick={() => setShipmentSearch("")}
-                            className="rounded-[12px] border border-white/10 bg-slate-950/28 px-3.5 py-2 text-[11px] uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-200/14 hover:bg-cyan-200/8 hover:text-white"
-                          >
-                            Clear search
-                          </button>
-                        ) : null}
-                        <button
-                          onClick={() => void hardRefreshDashboard()}
-                          disabled={submitting !== null}
-                          className="inline-flex items-center gap-2 rounded-[14px] bg-white/[0.025] px-4 py-2.5 text-sm font-medium text-slate-400 transition hover:bg-white/[0.04] hover:text-slate-200 disabled:opacity-50"
-                        >
-                          <RefreshCcw size={16} /> {backgroundRefreshing ? "Refreshing..." : "Refresh board"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setBoardControlsExpanded(false)}
-                          className="inline-flex items-center gap-2 rounded-[12px] border border-cyan-200/10 bg-slate-950/24 px-3.5 py-2 text-[11px] uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-200/18 hover:bg-cyan-200/8 hover:text-white"
-                        >
-                          <ChevronUp size={14} /> Collapse controls
-                        </button>
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => setBoardControlsExpanded(true)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        setBoardControlsExpanded(true);
-                      }
-                    }}
-                    className="rounded-[20px] border border-cyan-200/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.008))] px-3 py-3 transition hover:border-cyan-200/18 hover:bg-cyan-200/6"
-                  >
-                    <div className="flex items-center gap-2">
-                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-                        <div ref={monthPickerRef}>
-                          <button
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              setMonthPickerOpen(true);
-                            }}
-                            className="inline-flex items-center gap-1.5 rounded-[11px] border border-cyan-200/12 bg-cyan-200/8 px-2.5 py-1.5 text-[10px] text-cyan-100 transition hover:border-cyan-200/22 hover:bg-cyan-200/14"
-                          >
-                            <Calendar size={14} /> {formatMonthLabel(selectedBoardMonth)}
-                          </button>
-                        </div>
-                        <span className="truncate rounded-[11px] border border-cyan-200/10 bg-slate-950/24 px-2.5 py-1.5 text-[10px] text-slate-300">
-                          {boardShipments.length} shipments visible
-                        </span>
-                        <span className="hidden truncate rounded-[11px] border border-cyan-200/10 bg-slate-950/20 px-2.5 py-1.5 text-[10px] text-slate-400 sm:inline-flex">
-                          {attentionShipmentCount} awaiting operator
-                        </span>
-                        {shipmentSearch.trim() ? (
-                          <span className="hidden truncate rounded-[11px] border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-[10px] text-slate-300 lg:inline-flex">
-                            Search: {shipmentSearch}
-                          </span>
-                        ) : null}
-                      </div>
+                <div
+                  className={`grid grid-cols-1 gap-4 sm:items-start sm:gap-x-4 sm:gap-y-4 xl:items-start xl:gap-x-5 xl:gap-y-0 ${
+                    isViewerRole
+                      ? "sm:grid-cols-1 xl:grid-cols-[minmax(280px,420px)_minmax(280px,1fr)]"
+                      : "sm:grid-cols-2 xl:grid-cols-[minmax(280px,420px)_minmax(240px,340px)_minmax(280px,1fr)]"
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <span className="mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Month</span>
+                    <div className="relative flex min-w-0 items-center gap-1.5 sm:gap-2">
                       <button
                         type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setBoardControlsExpanded(true);
-                        }}
-                        className="ml-auto inline-flex shrink-0 items-center gap-2 rounded-[12px] border border-cyan-200/12 bg-[linear-gradient(135deg,rgba(110,184,255,0.08),rgba(110,184,255,0.02))] px-3 py-2 text-[12px] font-medium text-white transition hover:border-cyan-200/22 hover:bg-cyan-200/8"
+                        onClick={() => shiftBoardMonth(-1)}
+                        className="inline-flex h-[52px] w-10 shrink-0 items-center justify-center rounded-[16px] border border-cyan-200/10 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white sm:w-[46px]"
+                        aria-label="Previous month"
                       >
-                        <ChevronDown size={16} />
-                        <span className="hidden sm:inline">Expand controls</span>
+                        <ChevronLeft size={18} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setMonthPickerOpen((open) => !open)}
+                        aria-expanded={monthPickerOpen}
+                        aria-haspopup="dialog"
+                        title={monthPickerOpen ? "Close month picker" : "Choose created month"}
+                        className="flex h-[52px] min-w-0 flex-1 items-center justify-between gap-1.5 rounded-[16px] border border-cyan-200/12 bg-[linear-gradient(135deg,rgba(110,184,255,0.08),rgba(110,184,255,0.02))] px-2.5 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] transition hover:border-cyan-200/20 hover:bg-cyan-200/8 sm:gap-2 sm:px-3"
+                      >
+                        <span className="flex min-w-0 flex-1 items-center gap-2 sm:gap-2.5">
+                          <Calendar size={17} className="shrink-0 text-cyan-200/70" aria-hidden />
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-[10px] uppercase tracking-[0.18em] text-cyan-200/55">Created month</span>
+                            <span className="block truncate text-sm font-medium text-white">{formatMonthLabel(selectedBoardMonth)}</span>
+                          </span>
+                        </span>
+                        <span className="shrink-0 whitespace-nowrap pl-1 text-[10px] uppercase tracking-[0.16em] text-slate-400 sm:hidden xl:inline xl:pl-2 xl:text-[11px]">
+                          {monthPickerOpen ? "Close" : "Choose"}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => shiftBoardMonth(1)}
+                        className="inline-flex h-[52px] w-10 shrink-0 items-center justify-center rounded-[16px] border border-cyan-200/10 bg-slate-950/24 text-slate-300 transition hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white sm:w-[46px]"
+                        aria-label="Next month"
+                      >
+                        <ChevronRight size={18} />
                       </button>
                     </div>
                   </div>
-                )}
+
+                  {!isViewerRole ? (
+                    <div className="min-w-0">
+                      <span className="mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Mailbox</span>
+                      <button
+                        type="button"
+                        aria-pressed={boardMailboxScope === "mine"}
+                        disabled={!userEmail}
+                        title={
+                          userEmail
+                            ? `${boardMailboxScope === "mine" ? "Showing" : "Include all"} · ${userEmail}`
+                            : "Loading account…"
+                        }
+                        onClick={() => setBoardMailboxScope((prev) => (prev === "mine" ? "org" : "mine"))}
+                        className={`flex h-[52px] w-full min-w-0 items-center gap-3 rounded-[16px] border px-3 text-left transition disabled:cursor-not-allowed disabled:opacity-45 ${
+                          boardMailboxScope === "mine"
+                            ? "border-cyan-200/18 bg-cyan-200/8 text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
+                            : "border-cyan-200/10 bg-slate-950/24 text-slate-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] hover:border-cyan-200/20 hover:bg-cyan-200/8 hover:text-white"
+                        }`}
+                      >
+                        <Inbox size={17} className="shrink-0 text-cyan-200/70" aria-hidden />
+                        <span className="min-w-0 flex-1 leading-tight">
+                          <span className="flex items-center gap-2">
+                            <span className="truncate text-sm font-semibold text-white">My mailbox only</span>
+                            <span className="shrink-0 rounded-[10px] border border-cyan-200/10 bg-slate-950/22 px-2 py-0.5 text-[11px] tabular-nums text-slate-300">
+                              {mailboxMineEligibleCount}
+                            </span>
+                          </span>
+                          <span className="mt-0.5 block truncate text-[10px] text-[var(--text-muted)]">
+                            {userEmail ? <span className="font-medium text-slate-400">{userEmail}</span> : "Loading mailbox…"}
+                          </span>
+                        </span>
+                        <span
+                          className={`relative ml-1 inline-flex h-8 w-[3.25rem] shrink-0 items-center rounded-full border p-[3px] transition ${
+                            boardMailboxScope === "mine"
+                              ? "justify-end border-emerald-400/35 bg-emerald-500/[0.22]"
+                              : "justify-start border border-white/14 bg-white/[0.08]"
+                          }`}
+                          aria-hidden
+                        >
+                          <span className="pointer-events-none size-[1.375rem] rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.28)] ring-1 ring-black/10" />
+                        </span>
+                      </button>
+                    </div>
+                  ) : null}
+
+                  <div className="min-w-0 sm:col-span-2 xl:col-span-1">
+                    <span className="mb-2 block text-[11px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Search</span>
+                    <div
+                      className={`flex h-[52px] items-center gap-2.5 rounded-[16px] border bg-slate-950/24 px-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-[border-color] sm:gap-3 ${
+                        shipmentSearch.trim()
+                          ? "border-white/22"
+                          : "border-cyan-200/10 focus-within:border-white/22"
+                      }`}
+                    >
+                      <Search size={17} className="shrink-0 text-cyan-200/65" aria-hidden />
+                      <input
+                        id="board-shipment-search-input"
+                        type="text"
+                        inputMode="search"
+                        autoComplete="off"
+                        aria-label="Search shipments"
+                        className="min-w-0 flex-1 bg-transparent text-sm font-medium text-white outline-none placeholder:font-normal placeholder:text-slate-500"
+                        value={shipmentSearch}
+                        onChange={(event) => setShipmentSearch(event.target.value)}
+                        placeholder="Route, city, token, notes…"
+                      />
+                      {shipmentSearch.trim() ? (
+                        <button
+                          type="button"
+                          aria-label="Clear search"
+                          onClick={() => setShipmentSearch("")}
+                          className="inline-flex shrink-0 rounded-[10px] p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
+                        >
+                          <X size={17} strokeWidth={2} />
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
             <div className="overflow-x-auto rounded-[32px] border border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(75,211,255,0.08),transparent_32%),linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01))] p-4">
@@ -4492,6 +5098,7 @@ export function FreightDashboardWorkspace() {
                           const isSelected = shipment.id === selectedShipmentId;
                           const fraudIndicators = shipmentFraudIndicators(shipment);
                           const blockingBadge = shipmentBlockingBadge(shipment);
+                          const mailboxMeta = mailboxSourceMeta(shipment.source_mailbox, userEmail);
                           return (
                             <div
                               key={shipment.id}
@@ -4514,6 +5121,14 @@ export function FreightDashboardWorkspace() {
                                   }}
                                   className="w-full text-left"
                                 >
+                                  {mailboxMeta ? (
+                                    <div className="-mx-3 -mt-2 mb-2 border-b border-white/[0.08] bg-black/25 px-3 py-2">
+                                      <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-sky-200/55">{mailboxMeta.caption}</p>
+                                      <p className="mt-1 truncate text-[12px] font-medium leading-snug text-white" title={mailboxMeta.address}>
+                                        {mailboxMeta.address}
+                                      </p>
+                                    </div>
+                                  ) : null}
                                   <div className="flex min-w-0 flex-wrap items-center gap-1.5">
                                     {fraudIndicators.length > 0 && (
                                       <div className="flex items-center gap-1">
@@ -4684,66 +5299,171 @@ export function FreightDashboardWorkspace() {
           </section>
         )}
 
-        {!initialLoading && tab === "triage" && (
-          <section className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
-            <div className="glass-panel p-4">
-              <div className="mb-4 flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Email triage</p>
-                  <p className="mt-1 text-lg font-medium text-white">Emails that did not become shipments</p>
-                  <p className="mt-1 text-sm text-slate-300">Fraud, noise, and uncertain freight stay here until an operator resolves them.</p>
-                </div>
-                <button
-                  onClick={() => void refreshEmailTriageQueue()}
-                  disabled={submitting !== null}
-                  className="inline-flex items-center gap-2 rounded-[14px] border border-cyan-200/12 bg-cyan-200/8 px-3 py-2 text-xs font-medium text-cyan-50 transition hover:bg-cyan-200/14 disabled:opacity-50"
-                >
-                  <RefreshCcw size={14} /> Refresh
-                </button>
+        {!initialLoading && canUseEmailTriage && tab === "triage" && (
+          <section className="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,420px),minmax(0,1fr)]">
+            <div className="glass-panel flex min-h-0 min-w-0 flex-col overflow-hidden p-4">
+              <div className="mb-4 min-w-0">
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Email triage</p>
+                <p className="mt-1 text-lg font-medium text-white">Emails that did not become shipments</p>
+                <p className="mt-1 text-sm text-slate-300">Fraud, noise, and uncertain freight stay here until an operator resolves them.</p>
               </div>
-              <div className="space-y-2">
-                {emailTriageQueue.length === 0 ? (
-                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-4 text-sm text-[var(--text-muted)]">
-                    No active triage emails right now.
+              <div className="mb-3 shrink-0">
+                <span className="mb-1.5 block text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">Search</span>
+                <div
+                  className={`flex h-11 items-center gap-2 rounded-[14px] border bg-slate-950/24 px-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-[border-color] ${
+                    triageSearchInput.trim() ? "border-white/22" : "border-cyan-200/10 focus-within:border-white/22"
+                  }`}
+                >
+                  <Search size={15} className="shrink-0 text-cyan-200/65" aria-hidden />
+                  <input
+                    type="text"
+                    inputMode="search"
+                    autoComplete="off"
+                    aria-label="Search triage emails"
+                    className="min-w-0 flex-1 bg-transparent text-sm font-medium text-white outline-none placeholder:font-normal placeholder:text-slate-500"
+                    value={triageSearchInput}
+                    onChange={(event) => setTriageSearchInput(event.target.value)}
+                    placeholder="Subject, sender, mailbox, classification…"
+                  />
+                  {triageSearchInput.trim() ? (
+                    <button
+                      type="button"
+                      aria-label="Clear search"
+                      onClick={() => setTriageSearchInput("")}
+                      className="inline-flex shrink-0 rounded-[10px] p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
+                    >
+                      <X size={16} strokeWidth={2} />
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+              <label className="mb-3 flex cursor-pointer items-center gap-2.5 rounded-[12px] border border-white/10 bg-slate-950/25 px-3 py-2.5 text-left text-sm text-slate-200 transition hover:border-white/16 hover:bg-slate-950/35">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 shrink-0 rounded border-white/20 bg-slate-950/60 text-cyan-400 focus:ring-cyan-400/40"
+                  checked={triageIncludeHighConfidence}
+                  onChange={(event) => setTriageIncludeHighConfidence(event.target.checked)}
+                />
+                <span className="min-w-0 leading-snug">
+                  <span className="font-medium text-white">Show high-confidence</span>
+                  <span className="mt-0.5 block text-[11px] text-slate-400">Include items with AI confidence ≥ 85% (hidden by default).</span>
+                </span>
+              </label>
+              <div
+                className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain pr-0.5 [-webkit-overflow-scrolling:touch] max-h-[min(58dvh,26rem)] xl:max-h-[min(72vh,34rem)]"
+                onScroll={(event) => {
+                  const el = event.currentTarget;
+                  if (el.scrollHeight - el.scrollTop - el.clientHeight > 140) return;
+                  void loadMoreEmailTriageQueue();
+                }}
+              >
+                {emailTriageListLoading && emailTriageQueue.length === 0 ? (
+                  <div className="flex items-center justify-center gap-2 rounded-[22px] border border-dashed border-white/10 bg-white/5 py-10 text-sm text-[var(--text-muted)]">
+                    <Loader2 className="animate-spin text-cyan-200/80" size={18} aria-hidden />
+                    Loading triage…
                   </div>
                 ) : null}
-                {emailTriageQueue.map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => setSelectedTriageItemId(item.id)}
-                    className={`w-full rounded-2xl border p-4 text-left transition ${item.id === selectedTriageItem?.id ? "border-cyan-300/40 bg-cyan-300/10" : "border-white/10 bg-white/5 hover:bg-white/10"}`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <p className="truncate text-sm font-medium text-white">{item.subject || "No subject"}</p>
-                        <p className="mt-1 truncate text-xs text-[var(--text-muted)]">{item.sender || "Unknown sender"}</p>
-                      </div>
-                      <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] ${triageClassificationClasses(item.classification)}`}>
-                        {formatConfidence(item.confidence)}
-                      </span>
-                    </div>
-                    <p className="mt-2 line-clamp-2 text-sm text-slate-300">{item.reason || item.body_preview || "No triage reason."}</p>
-                    <p className="mt-2 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                      {triageClassificationLabel(item.classification)}
-                    </p>
-                  </button>
-                ))}
+                {!emailTriageListLoading && emailTriageQueue.length === 0 && !triageSearchDebounced ? (
+                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                    <p>No active triage emails in this view right now.</p>
+                    {!triageIncludeHighConfidence ? (
+                      <p className="mt-2 text-xs leading-relaxed text-slate-400">
+                        Rows with AI confidence ≥ 85% are excluded by default. Turn on &ldquo;Show high-confidence&rdquo; above to list them.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+                {!emailTriageListLoading && emailTriageQueue.length === 0 && triageSearchDebounced ? (
+                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-4 text-sm text-[var(--text-muted)]">
+                    No emails match this search. Try another keyword or clear the field.
+                  </div>
+                ) : null}
+                {emailTriageQueue.map((item) => {
+                  const triageMailboxMeta = mailboxSourceMeta(item.mailbox, userEmail);
+                  const isTriageSelected = item.id === selectedTriageItem?.id;
+                  const classificationTitle = triageClassificationLabel(item.classification);
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => {
+                        triageScrollPendingRef.current = true;
+                        setSelectedTriageItemId(item.id);
+                      }}
+                      className={`group relative w-full overflow-hidden rounded-[18px] border px-3 py-2.5 text-left transition ${
+                        isTriageSelected
+                          ? "border-cyan-300/40 bg-cyan-300/10 shadow-[0_0_0_1px_rgba(134,239,255,0.08)]"
+                          : "border-white/10 bg-white/[0.05] hover:border-white/18 hover:bg-white/[0.07]"
+                      }`}
+                    >
+                      <p
+                        className="truncate text-[11px] leading-snug text-slate-500"
+                        title={
+                          triageMailboxMeta ? `${triageMailboxMeta.caption} · ${triageMailboxMeta.address}` : "Mailbox not recorded"
+                        }
+                      >
+                        {triageMailboxMeta ? (
+                          <>
+                            <span className="text-slate-500">{triageMailboxMeta.caption}</span>
+                            <span className="text-slate-600"> · </span>
+                            <span className="text-slate-400">{triageMailboxMeta.address}</span>
+                          </>
+                        ) : (
+                          <span className="text-slate-500">Mailbox not recorded</span>
+                        )}
+                      </p>
+                      <p className="mt-1 flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5 text-[10px] leading-snug text-slate-500">
+                        <span>{emailVisibilityLabel(item.visibility_mode)}</span>
+                        <span className="text-slate-600" aria-hidden>
+                          ·
+                        </span>
+                        <span className={`min-w-0 truncate font-medium capitalize ${triageClassificationTextClass(item.classification)}`} title={classificationTitle}>
+                          {classificationTitle}
+                        </span>
+                        <span className="text-slate-600" aria-hidden>
+                          ·
+                        </span>
+                        <span className="shrink-0 tabular-nums text-slate-500" title="AI confidence">
+                          {formatConfidence(item.confidence)}
+                        </span>
+                      </p>
+                      <p className="mt-2 line-clamp-2 text-[13px] font-medium leading-snug text-white">{item.subject || "No subject"}</p>
+                      <p className="mt-1 truncate text-[11px] text-slate-500">{item.sender || "Unknown sender"}</p>
+                      <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-slate-500">{item.reason || item.body_preview || "No triage reason."}</p>
+                    </button>
+                  );
+                })}
+                {emailTriageLoadingMore ? (
+                  <div className="flex items-center justify-center gap-2 py-3 text-xs text-[var(--text-muted)]">
+                    <Loader2 className="animate-spin text-cyan-200/70" size={15} aria-hidden />
+                    Loading more…
+                  </div>
+                ) : null}
               </div>
             </div>
 
-            <div className="glass-panel p-5">
+            <div ref={triageDetailPanelRef} className="glass-panel min-w-0 overflow-hidden p-4 sm:p-5">
               {!selectedTriageItem ? (
                 <div className="text-sm text-[var(--text-muted)]">Choose a triage email to review it.</div>
               ) : (
                 <div className="space-y-5">
-                  <div className="flex items-start justify-between gap-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
                     <div className="min-w-0">
                       <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Selected email</p>
-                      <h2 className="mt-1 text-2xl font-semibold text-white">{selectedTriageItem.subject || "No subject"}</h2>
+                      <h2 className="mt-1 break-words text-xl font-semibold text-white sm:text-2xl">{selectedTriageItem.subject || "No subject"}</h2>
                       <p className="mt-2 text-sm text-slate-300">{selectedTriageItem.sender || "Unknown sender"} · {formatAge(selectedTriageItem.received_at || selectedTriageItem.created_at)}</p>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        {selectedTriageItem.mailbox && (
+                          <span className="rounded-full border border-sky-300/18 bg-sky-300/10 px-3 py-1 text-xs text-sky-100">
+                            {mailboxSourceLabel(selectedTriageItem.mailbox, userEmail) || `Received by ${selectedTriageItem.mailbox}`}
+                          </span>
+                        )}
+                        <span className={`rounded-full border px-3 py-1 text-xs ${emailVisibilityClasses(selectedTriageItem.visibility_mode)}`}>
+                          {emailVisibilityLabel(selectedTriageItem.visibility_mode)}
+                        </span>
+                      </div>
                     </div>
-                    <span className={`rounded-full border px-3 py-1.5 text-xs capitalize ${triageClassificationClasses(selectedTriageItem.classification)}`}>
+                    <span className={`w-fit shrink-0 rounded-full border px-3 py-1.5 text-xs capitalize ${triageClassificationClasses(selectedTriageItem.classification)}`}>
                       {triageClassificationLabel(selectedTriageItem.classification)}
                     </span>
                   </div>
@@ -4765,22 +5485,29 @@ export function FreightDashboardWorkspace() {
 
                   <div className="rounded-[22px] border border-white/10 bg-slate-950/22 p-4">
                     <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Email preview</p>
-                    <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-slate-300">{selectedTriageItem.body_preview || "No preview available."}</p>
+                    {selectedTriageItem.can_view_body ? (
+                      <p className="mt-3 break-words whitespace-pre-wrap text-sm leading-6 text-slate-300">{selectedTriageItem.body_preview || "No preview available."}</p>
+                    ) : (
+                      <p className="mt-3 rounded-2xl border border-amber-300/16 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50">
+                        Email body is private for this mailbox. Ask the mailbox owner to share triage access if team review is needed.
+                      </p>
+                    )}
                   </div>
 
+                  {selectedTriageItem.can_take_action ? (
                   <div className="rounded-[22px] border border-cyan-200/12 bg-cyan-200/[0.04] p-4">
                     <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/70">Operator actions</p>
                     <div className="mt-3 grid gap-2 md:grid-cols-2">
-                      <button onClick={() => void handleEmailTriageAction("create_shipment")} disabled={submitting !== null} className="action-button bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">
+                      <button onClick={() => openTriageActionDialog("create_shipment")} disabled={submitting !== null} className="action-button bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">
                         Create shipment
                       </button>
-                      <button onClick={() => void handleEmailTriageAction("mark_not_shipment")} disabled={submitting !== null} className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">
+                      <button onClick={() => openTriageActionDialog("mark_not_shipment")} disabled={submitting !== null} className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">
                         Not a shipment
                       </button>
-                      <button onClick={() => void handleEmailTriageAction("mark_fraud_email")} disabled={submitting !== null} className="action-button bg-rose-300/15 text-rose-100 hover:bg-rose-300/20 disabled:opacity-50">
+                      <button onClick={() => openTriageActionDialog("mark_fraud_email")} disabled={submitting !== null} className="action-button bg-rose-300/15 text-rose-100 hover:bg-rose-300/20 disabled:opacity-50">
                         Block email
                       </button>
-                      <button onClick={() => void handleEmailTriageAction("mark_fraud_domain")} disabled={submitting !== null} className="action-button bg-rose-300/10 text-rose-100 hover:bg-rose-300/18 disabled:opacity-50">
+                      <button onClick={() => openTriageActionDialog("mark_fraud_domain")} disabled={submitting !== null} className="action-button bg-rose-300/10 text-rose-100 hover:bg-rose-300/18 disabled:opacity-50">
                         Block domain
                       </button>
                     </div>
@@ -4793,11 +5520,19 @@ export function FreightDashboardWorkspace() {
                           </option>
                         ))}
                       </select>
-                      <button onClick={() => void handleEmailTriageAction("link_to_existing_shipment")} disabled={submitting !== null || !triageLinkShipmentId} className="action-button shrink-0 bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">
+                      <button onClick={() => openTriageActionDialog("link_to_existing_shipment")} disabled={submitting !== null || !triageLinkShipmentId} className="action-button shrink-0 bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">
                         Link
                       </button>
                     </div>
                   </div>
+                  ) : (
+                    <div className="rounded-[22px] border border-white/10 bg-white/[0.04] p-4">
+                      <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Operator actions</p>
+                      <p className="mt-2 text-sm leading-6 text-slate-300">
+                        Actions are disabled because this mailbox has not shared raw email triage access with your account.
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -4805,19 +5540,19 @@ export function FreightDashboardWorkspace() {
         )}
 
         {!initialLoading && tab === "status_ops" && (
-          <section className="grid gap-4 xl:grid-cols-[380px,minmax(0,1fr)]">
-            <div className="glass-panel p-4">
-              <div className="mb-4 flex items-center justify-between">
-                <div>
+          <section className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,380px),minmax(0,1fr)]">
+            <div className="glass-panel flex min-h-0 min-w-0 flex-col overflow-hidden p-4">
+              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0">
                   <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Status queue</p>
                   <p className="mt-1 text-lg font-medium text-white">Separate customer and carrier reviews</p>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex shrink-0 gap-2">
                   <button onClick={() => setStatusQueueScope("active")} className={`rounded-[14px] px-3 py-2.5 text-xs uppercase tracking-[0.18em] ${statusQueueScope === "active" ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)]"}`}>Active</button>
                   <button onClick={() => setStatusQueueScope("resolved")} className={`rounded-[14px] px-3 py-2.5 text-xs uppercase tracking-[0.18em] ${statusQueueScope === "resolved" ? "bg-white text-slate-950" : "bg-white/5 text-[var(--text-muted)]"}`}>Resolved</button>
                 </div>
               </div>
-              <div className="space-y-2">
+              <div className="max-h-[min(58dvh,26rem)] min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain pr-0.5 [-webkit-overflow-scrolling:touch] xl:max-h-none xl:flex-none xl:overflow-visible">
                 {filteredStatusQueue.map((task) => (
                   <button
                     key={task.task_id}
@@ -4828,27 +5563,27 @@ export function FreightDashboardWorkspace() {
                     className={`w-full rounded-2xl border p-4 text-left transition ${task.task_id === selectedStatusTaskId ? "border-cyan-300/40 bg-cyan-300/10" : "border-white/10 bg-white/5 hover:bg-white/10"}`}
                   >
                     <div className="flex items-start justify-between gap-3">
-                      <div>
+                      <div className="min-w-0">
                         <p className="text-white">{task.task_type.replaceAll("_", " ")}</p>
                         <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">{task.task_state.replaceAll("_", " ")}</p>
                       </div>
-                      <span className={`rounded-full border px-3 py-1 text-xs ${reviewPriorityClasses(task.priority)}`}>{task.priority}</span>
+                      <span className={`shrink-0 rounded-full border px-3 py-1 text-xs ${reviewPriorityClasses(task.priority)}`}>{task.priority}</span>
                     </div>
-                    <p className="mt-2 text-sm text-[var(--text-muted)]">{task.reason}</p>
+                    <p className="mt-2 break-words text-sm text-[var(--text-muted)]">{task.reason}</p>
                   </button>
                 ))}
               </div>
             </div>
 
-            <div className="glass-panel p-5">
+            <div className="glass-panel min-w-0 overflow-hidden p-4 sm:p-5">
               {!selectedStatusTask ? (
                 <div className="text-sm text-[var(--text-muted)]">Choose a status task to review it.</div>
               ) : (
                 <div className="space-y-4">
-                  <div>
+                  <div className="min-w-0">
                     <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Selected task</p>
-                    <h2 className="mt-1 text-2xl font-semibold text-white">{selectedStatusTask.task_type.replaceAll("_", " ")}</h2>
-                    <p className="mt-2 text-sm text-[var(--text-muted)]">{selectedStatusTask.reason}</p>
+                    <h2 className="mt-1 break-words text-xl font-semibold text-white sm:text-2xl">{selectedStatusTask.task_type.replaceAll("_", " ")}</h2>
+                    <p className="mt-2 break-words text-sm text-[var(--text-muted)]">{selectedStatusTask.reason}</p>
                   </div>
                   {selectedStatusTask.task_type === "status_reply" ? (
                     <div className="space-y-3">
@@ -5041,120 +5776,6 @@ export function FreightDashboardWorkspace() {
           </div>
         </aside>
 
-        <div
-          className={`fixed inset-0 z-[88] bg-slate-950/30 backdrop-blur-[2px] transition ${
-            syncMenuOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
-          }`}
-          onClick={() => setSyncMenuOpen(false)}
-        />
-        <aside
-          className={`fixed right-6 top-6 z-[89] flex h-[min(82vh,760px)] w-[min(390px,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-[28px] border border-cyan-200/14 bg-[linear-gradient(180deg,rgba(12,20,31,0.97),rgba(9,15,25,0.96))] shadow-[0_28px_120px_rgba(2,8,23,0.56)] backdrop-blur transition-all duration-300 ${
-            syncMenuOpen ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-4 opacity-0"
-          }`}
-        >
-          <div className="border-b border-cyan-200/10 px-5 py-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-[10px] uppercase tracking-[0.22em] text-cyan-200/52">Outlook operations</p>
-                <h3 className="mt-1 text-lg font-semibold text-white">Inbox sync and webhook</h3>
-                <p className="mt-1 text-sm text-slate-300">Run manual syncs and verify the current env subscription without leaving the dashboard.</p>
-              </div>
-              <button
-                onClick={() => setSyncMenuOpen(false)}
-                className="rounded-full p-2 text-slate-400 transition hover:bg-white/8 hover:text-white"
-                aria-label="Close Outlook operations"
-              >
-                <X size={16} />
-              </button>
-            </div>
-            <div className="mt-4 flex flex-wrap items-center gap-2">
-              <span className="rounded-full border border-cyan-200/12 bg-cyan-200/8 px-3 py-1 text-xs text-cyan-50">
-                {syncLimit} messages
-              </span>
-              <span className={`rounded-full border px-3 py-1 text-xs ${webhookStatusClasses(webhookStatus?.status)}`}>
-                Webhook {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
-              </span>
-            </div>
-          </div>
-          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
-            <section className="min-w-0 overflow-hidden rounded-[22px] border border-white/10 bg-white/[0.035] p-4">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-cyan-200/52">Inbox sync</p>
-                  <h4 className="mt-1 text-base font-semibold text-white">Pull recent messages</h4>
-                  <p className="mt-1 text-sm leading-6 text-slate-300">Choose how many recent Outlook messages should be ingested.</p>
-                </div>
-                <Mail className="mt-1 shrink-0 text-cyan-100/80" size={18} />
-              </div>
-              <div className="mt-4 grid grid-cols-4 gap-2">
-                {[5, 10, 25, 50].map((limit) => (
-                  <button
-                    key={limit}
-                    onClick={() => setSyncLimit(limit)}
-                    className={`rounded-[14px] px-2.5 py-2 text-sm transition ${syncLimit === limit ? "bg-white text-slate-950" : "bg-white/5 text-slate-300 hover:bg-white/10 hover:text-white"}`}
-                  >
-                    {limit}
-                  </button>
-                ))}
-              </div>
-              <button
-                onClick={() => void handleOutlookSync(syncLimit)}
-                disabled={submitting === "sync"}
-                className="mt-4 flex w-full items-center justify-center gap-2 rounded-[16px] bg-cyan-300/15 px-4 py-3 font-medium text-cyan-100 transition hover:bg-cyan-300/20 disabled:opacity-60"
-              >
-                {submitting === "sync" ? <Loader2 className="animate-spin" size={16} /> : <RefreshCcw size={16} />} Sync inbox
-              </button>
-            </section>
-
-            <section className={`min-w-0 overflow-hidden rounded-[22px] border p-4 ${webhookStatusClasses(webhookStatus?.status)}`}>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-[10px] uppercase tracking-[0.2em] opacity-70">Webhook status</p>
-                  <h4 className="mt-1 flex items-center gap-2 text-base font-semibold text-white">
-                    {outlookStatusLoading && <Loader2 className="animate-spin" size={15} />}
-                    {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
-                  </h4>
-                </div>
-                <ShieldCheck className="mt-1 shrink-0" size={18} />
-              </div>
-              <div className="mt-3 min-w-0 space-y-2 text-xs opacity-85">
-                <p className="break-all [overflow-wrap:anywhere]">{webhookStatus?.expected_notification_url || "Webhook URL is not configured"}</p>
-                <p className="break-all [overflow-wrap:anywhere]">{webhookStatus?.expected_resource || "Resource is not configured"}</p>
-                {webhookStatus?.expires_at && <p>Expires {formatDate(webhookStatus.expires_at)}</p>}
-                <p>{webhookStatus?.matching_count ?? 0} matching / {webhookStatus?.total_subscriptions ?? 0} total subscriptions</p>
-              </div>
-              <div className="mt-4 grid grid-cols-2 gap-2">
-                <button
-                  onClick={() => void loadWebhookStatus()}
-                  disabled={outlookStatusLoading}
-                  className="flex items-center justify-center gap-2 rounded-[16px] bg-white/5 px-3 py-2.5 text-sm text-white transition hover:bg-white/10"
-                >
-                  {outlookStatusLoading ? <Loader2 className="animate-spin" size={16} /> : <RadioTower size={16} />} Check
-                </button>
-                <button
-                  onClick={() => void handleEnsureWebhook()}
-                  disabled={submitting === "webhook"}
-                  className="flex items-center justify-center gap-2 rounded-[16px] bg-white px-3 py-2.5 text-sm font-medium text-slate-950 transition hover:bg-cyan-50 disabled:opacity-60"
-                >
-                  {submitting === "webhook" ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />} Ensure
-                </button>
-              </div>
-            </section>
-
-            {lastSyncSummary && (
-              <section className="rounded-[22px] border border-cyan-200/12 bg-cyan-200/[0.05] p-4">
-                <p className="text-[10px] uppercase tracking-[0.2em] text-cyan-200/52">Last sync</p>
-                <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
-                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Imported: {lastSyncSummary.imported}</div>
-                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Skipped: {lastSyncSummary.skipped}</div>
-                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Parsed: {lastSyncSummary.parsed_shipments}</div>
-                  <div className="rounded-[14px] bg-slate-950/28 p-3 text-white">Reviews: {lastSyncSummary.manual_reviews}</div>
-                </div>
-              </section>
-            )}
-          </div>
-        </aside>
-
         {monthPickerOpen && typeof document !== "undefined"
           ? createPortal(
               <div className="fixed inset-0 z-[170] flex items-center justify-center bg-slate-950/58 px-4 backdrop-blur-[6px]" onClick={() => setMonthPickerOpen(false)}>
@@ -5233,94 +5854,179 @@ export function FreightDashboardWorkspace() {
           : null}
 
         {!initialLoading && tab === "archive" && (
-          <section className="glass-panel p-5">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Archive</p>
-                <h2 className="mt-1 text-2xl font-semibold tracking-[-0.04em] text-white">Ignored shipments</h2>
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
-                  View-only archive for duplicates, cancelled loads, parsing errors, fraud/spam, tests, and non-delivery bounces.
-                </p>
-              </div>
-              <button
-                onClick={() => void refreshArchivedShipments()}
-                disabled={submitting !== null}
-                className="action-button bg-white/8 text-white hover:bg-white/12 disabled:opacity-50"
-              >
-                <RefreshCcw size={15} /> Refresh archive
-              </button>
+          <section className="glass-panel flex max-h-[min(92dvh,52rem)] min-h-0 flex-col overflow-hidden p-5 xl:max-h-[min(88vh,56rem)]">
+            <div className="shrink-0">
+              <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Archive</p>
+              <h2 className="mt-1 text-2xl font-semibold tracking-[-0.04em] text-white">Ignored shipments</h2>
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-300">
+                View-only archive for duplicates, cancelled loads, parsing errors, fraud/spam, tests, and non-delivery bounces.
+              </p>
             </div>
-            <div className="mt-5 grid gap-3 lg:grid-cols-[minmax(0,1fr),220px,180px]">
-              <label className="block">
+            <div className="mt-5 shrink-0 grid gap-3 lg:grid-cols-[minmax(0,1fr),220px,180px]">
+              <label className="block min-w-0">
                 <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Search archive</span>
-                <div className="relative">
-                  <Search className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-500" size={16} />
+                <div
+                  className={`relative flex h-11 items-center gap-2 rounded-[14px] border bg-slate-950/24 pl-10 pr-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-[border-color] ${
+                    archiveSearch.trim() ? "border-white/22" : "border-cyan-200/10 focus-within:border-white/22"
+                  }`}
+                >
+                  <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-cyan-200/65" size={15} aria-hidden />
                   <input
-                    className="field-input pl-11"
+                    type="text"
+                    inputMode="search"
+                    autoComplete="off"
+                    aria-label="Search archived shipments"
+                    className="min-w-0 flex-1 bg-transparent py-2 text-sm font-medium text-white outline-none placeholder:font-normal placeholder:text-slate-500"
                     value={archiveSearch}
                     onChange={(event) => setArchiveSearch(event.target.value)}
-                    placeholder="Route, token, thread, reason..."
+                    placeholder="Route, token, thread, notes…"
                   />
+                  {archiveSearch.trim() ? (
+                    <button
+                      type="button"
+                      aria-label="Clear search"
+                      onClick={() => setArchiveSearch("")}
+                      className="inline-flex shrink-0 rounded-[10px] p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
+                    >
+                      <X size={16} strokeWidth={2} />
+                    </button>
+                  ) : null}
                 </div>
               </label>
-              <label className="block">
+              <label className="block min-w-0">
                 <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Reason</span>
                 <select className="field-input" value={archiveReasonFilter} onChange={(event) => setArchiveReasonFilter(event.target.value as ArchiveReasonCode | "all")}>
                   <option value="all">All reasons</option>
                   {ARCHIVE_REASON_OPTIONS.map((reason) => (
-                    <option key={reason.value} value={reason.value}>{reason.label}</option>
+                    <option key={reason.value} value={reason.value}>
+                      {reason.label}
+                    </option>
                   ))}
                 </select>
               </label>
-              <label className="block">
+              <label className="block min-w-0">
                 <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Archive month</span>
                 <input className="field-input" type="month" value={archiveMonth} onChange={(event) => setArchiveMonth(event.target.value)} />
               </label>
             </div>
-            <div className="mt-5 grid gap-3 xl:grid-cols-2">
-              {archivedShipments.length === 0 && (
-                <div className="rounded-[24px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">
+            <div
+              className="mt-5 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain px-2 pt-3 pb-3 [-webkit-overflow-scrolling:touch] max-h-[min(58dvh,26rem)] xl:max-h-[min(62vh,36rem)]"
+              onScroll={(event) => {
+                const el = event.currentTarget;
+                if (el.scrollHeight - el.scrollTop - el.clientHeight > 140) return;
+                void loadMoreArchivedShipments();
+              }}
+            >
+              {archiveListLoading && archivedShipments.length === 0 ? (
+                <div className="flex items-center justify-center gap-2 rounded-[22px] border border-dashed border-white/10 bg-white/5 py-12 text-sm text-[var(--text-muted)]">
+                  <Loader2 className="animate-spin text-cyan-200/80" size={18} aria-hidden />
+                  Loading archive…
+                </div>
+              ) : null}
+              {!archiveListLoading && archivedShipments.length === 0 && !archiveSearchDebounced ? (
+                <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">
                   No archived shipments match these filters.
                 </div>
-              )}
-              {archivedShipments.map((shipment) => (
-                <button
-                  key={shipment.id}
-                  onClick={() => {
-                    setSelectedShipmentId(shipment.id);
-                    setDrawerOpen(true);
-                    setDrawerMode("overview");
-                    setQuoteParam(null);
-                  }}
-                  className="rounded-[24px] border border-white/10 bg-white/[0.04] p-4 text-left transition hover:border-amber-300/24 hover:bg-amber-300/[0.06]"
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-full border border-amber-300/20 bg-amber-300/12 px-3 py-1 text-xs text-amber-100">
-                      {archiveReasonLabel(shipment.archive_reason_code)}
-                    </span>
-                    <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-[var(--text-muted)]">
-                      {shipment.status.replaceAll("_", " ")}
-                    </span>
-                    <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-[var(--text-muted)]">
-                      {shipment.quote_token || "No token"}
-                    </span>
-                  </div>
-                  <h3 className="mt-3 text-lg font-semibold text-white">{formatRoute(shipment)}</h3>
-                  <div className="mt-3 grid gap-2 text-sm text-slate-300 sm:grid-cols-2">
-                    <p>Archived: {formatDate(shipment.archived_at)}</p>
-                    <p>Created: {formatDate(shipment.created_at)}</p>
-                    <p className="sm:col-span-2">Reason: {shipment.archive_reason_note || shipment.archived_reason || "No note"}</p>
-                    <p className="break-all sm:col-span-2">Thread: {shipment.email_thread_id || "No linked thread"}</p>
-                  </div>
-                </button>
-              ))}
+              ) : null}
+              {!archiveListLoading && archivedShipments.length === 0 && archiveSearchDebounced ? (
+                <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">
+                  No archived shipments match this search. Try another keyword or clear the field.
+                </div>
+              ) : null}
+              {archivedShipments.length > 0 ? (
+                <div className="grid auto-rows-fr grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  {archivedShipments.map((shipment) => {
+                    const fraudIndicators = shipmentFraudIndicators(shipment);
+                    const blockingBadge = shipmentBlockingBadge(shipment);
+                    const mailboxMeta = mailboxSourceMeta(shipment.source_mailbox, userEmail);
+                    const note = shipment.archive_reason_note || shipment.archived_reason || "No note";
+                    return (
+                      <button
+                        key={shipment.id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedShipmentId(shipment.id);
+                          setDrawerOpen(true);
+                          setDrawerMode("overview");
+                          setQuoteParam(null);
+                        }}
+                        className="group relative flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden rounded-[18px] border border-white/10 bg-white/[0.05] px-3 pt-2 pb-2 text-left transition hover:-translate-y-0.5 hover:border-white/20 hover:bg-white/[0.08]"
+                      >
+                        {mailboxMeta ? (
+                          <div className="-mx-3 -mt-2 mb-2 border-b border-white/[0.08] bg-black/25 px-3 py-2">
+                            <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-sky-200/55">{mailboxMeta.caption}</p>
+                            <p className="mt-1 truncate text-[12px] font-medium leading-snug text-white" title={mailboxMeta.address}>
+                              {mailboxMeta.address}
+                            </p>
+                          </div>
+                        ) : null}
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                          {fraudIndicators.length > 0 && (
+                            <div className="flex items-center gap-1">
+                              {fraudIndicators.map((indicator) => {
+                                const Icon = indicator.icon;
+                                return (
+                                  <span
+                                    key={indicator.key}
+                                    title={indicator.title}
+                                    className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${indicator.className}`}
+                                  >
+                                    <Icon size={11} />
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
+                          <span className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-full border border-amber-300/20 bg-amber-300/12 px-2 text-[9px] font-medium uppercase tracking-[0.1em] text-amber-100">
+                            {archiveReasonLabel(shipment.archive_reason_code)}
+                          </span>
+                          <ShipmentStatusPill status={shipment.status} />
+                          {blockingBadge && (
+                            <span className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-full bg-amber-300/10 px-2 text-[9px] font-medium uppercase tracking-[0.1em] text-amber-100">
+                              {blockingBadge}
+                            </span>
+                          )}
+                          <span
+                            title="AI confidence"
+                            className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-full border border-cyan-200/14 bg-cyan-300/10 px-2 text-[9px] font-medium uppercase tracking-[0.1em] text-cyan-100"
+                          >
+                            {formatConfidence(shipment.ai_confidence)}
+                          </span>
+                          <span className="inline-flex h-5 max-w-full shrink-0 items-center whitespace-nowrap rounded-full border border-white/10 bg-white/5 px-2 text-[9px] font-medium tracking-[0.06em] text-slate-300">
+                            <span className="truncate">Archived {formatDate(shipment.archived_at)}</span>
+                          </span>
+                        </div>
+                        <p className="mt-1.5 line-clamp-2 text-[14px] font-medium leading-snug text-white">{formatRoute(shipment)}</p>
+                        <div className="mt-1.5 grid grid-cols-[minmax(0,1.25fr)_minmax(0,0.95fr)] gap-x-2 gap-y-1 text-[10px] leading-4 text-[var(--text-muted)]">
+                          <p className="min-w-0 whitespace-normal">
+                            {formatShipmentSchedule(shipment.ready_at_display, shipment.ready_at_local || null, shipment.ready_at) || "TBD"}
+                          </p>
+                          <p className="min-w-0 text-right whitespace-normal">Weight: {shipment.weight_lb ?? "--"} lb</p>
+                          <p className="min-w-0 whitespace-normal">Token: {shipment.quote_token || "--"}</p>
+                          <p className="min-w-0 text-right whitespace-normal">Pallets: {shipment.pallets ?? "--"}</p>
+                        </div>
+                        <p className="mt-1.5 line-clamp-2 text-[11px] leading-relaxed text-slate-400" title={note}>
+                          {note}
+                        </p>
+                        <p className="mt-auto pt-1.5 text-[10px] text-slate-500">Created {formatDate(shipment.created_at)}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+              {archiveLoadingMore ? (
+                <div className="flex items-center justify-center gap-2 py-3 text-xs text-[var(--text-muted)]">
+                  <Loader2 className="animate-spin text-cyan-200/70" size={14} aria-hidden />
+                  Loading more…
+                </div>
+              ) : null}
             </div>
           </section>
         )}
 
         {!initialLoading && tab === "clients" && (
-          <section className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
-            <form className="glass-panel p-5 space-y-3" onSubmit={handleCreateClient}>
+          <section className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,420px),minmax(0,1fr)]">
+            <form className="glass-panel min-w-0 space-y-3 p-4 sm:p-5" onSubmit={handleCreateClient}>
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">New customer</p>
               <input className="field-input" value={clientForm.name} onChange={(event) => setClientForm((current) => ({ ...current, name: event.target.value }))} placeholder="Customer name" />
               <input className="field-input" value={clientForm.email} onChange={(event) => setClientForm((current) => ({ ...current, email: event.target.value }))} placeholder="Customer email" />
@@ -5330,33 +6036,99 @@ export function FreightDashboardWorkspace() {
               </div>
               <button className="action-button bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110" disabled={submitting !== null}>Add customer</button>
             </form>
-            <div className="glass-panel p-5 space-y-3">
-              {clients.map((client) => (
-                <button
-                  key={client.id}
-                  type="button"
-                  onClick={() => openClientDrawer(client)}
-                  className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-cyan-200/20 hover:bg-white/8"
+            <div className="glass-panel flex min-h-0 min-w-0 flex-col overflow-hidden p-4 sm:p-5 xl:max-h-[min(88vh,56rem)]">
+              <div className="shrink-0">
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Directory</p>
+                <h2 className="mt-1 text-xl font-semibold tracking-[-0.03em] text-white">Customers</h2>
+                <p className="mt-1 max-w-xl text-sm text-slate-400">Search by name or email. Scroll to load more.</p>
+              </div>
+              <label className="mt-4 block min-w-0 shrink-0">
+                <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Search</span>
+                <div
+                  className={`relative flex h-11 items-center gap-2 rounded-[14px] border bg-slate-950/24 pl-10 pr-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-[border-color] ${
+                    customersTabSearch.trim() ? "border-white/22" : "border-cyan-200/10 focus-within:border-white/22"
+                  }`}
                 >
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-white">{client.name}</p>
-                      <p className="text-sm text-[var(--text-muted)]">{client.email}</p>
-                    </div>
-                    <div className="flex flex-wrap justify-end gap-2">
-                      {!client.is_active && <span className="rounded-full bg-amber-300/12 px-3 py-1 text-xs text-amber-100">Inactive</span>}
-                      <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">{client.default_margin_percent}%</span>
-                    </div>
+                  <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-cyan-200/65" size={15} aria-hidden />
+                  <input
+                    type="text"
+                    inputMode="search"
+                    autoComplete="off"
+                    aria-label="Search customers"
+                    className="min-w-0 flex-1 bg-transparent py-2 text-sm font-medium text-white outline-none placeholder:font-normal placeholder:text-slate-500"
+                    value={customersTabSearch}
+                    onChange={(event) => setCustomersTabSearch(event.target.value)}
+                    placeholder="Name or email…"
+                  />
+                  {customersTabSearch.trim() ? (
+                    <button
+                      type="button"
+                      aria-label="Clear search"
+                      onClick={() => setCustomersTabSearch("")}
+                      className="inline-flex shrink-0 rounded-[10px] p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
+                    >
+                      <X size={16} strokeWidth={2} />
+                    </button>
+                  ) : null}
+                </div>
+              </label>
+              <div
+                className="mt-4 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain px-0.5 pt-1 pb-2 [-webkit-overflow-scrolling:touch] max-h-[min(58dvh,26rem)] xl:max-h-[min(62vh,36rem)]"
+                onScroll={(event) => {
+                  const el = event.currentTarget;
+                  if (el.scrollHeight - el.scrollTop - el.clientHeight > 140) return;
+                  void loadMoreCustomersTab();
+                }}
+              >
+                {customersTabListLoading && customersTabList.length === 0 ? (
+                  <div className="flex items-center justify-center gap-2 rounded-[22px] border border-dashed border-white/10 bg-white/5 py-12 text-sm text-[var(--text-muted)]">
+                    <Loader2 className="animate-spin text-cyan-200/80" size={18} aria-hidden />
+                    Loading customers…
                   </div>
-                </button>
-              ))}
+                ) : null}
+                {!customersTabListLoading && customersTabList.length === 0 && !customersTabSearchDebounced ? (
+                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">No customers yet.</div>
+                ) : null}
+                {!customersTabListLoading && customersTabList.length === 0 && customersTabSearchDebounced ? (
+                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">No matches for this search.</div>
+                ) : null}
+                {customersTabList.length > 0 ? (
+                  <div className="flex flex-col gap-3">
+                    {customersTabList.map((client) => (
+                      <button
+                        key={client.id}
+                        type="button"
+                        onClick={() => openClientDrawer(client)}
+                        className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-cyan-200/20 hover:bg-white/8"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0 text-left">
+                            <p className="truncate text-white">{client.name}</p>
+                            <p className="truncate text-sm text-[var(--text-muted)]">{client.email}</p>
+                          </div>
+                          <div className="flex flex-wrap justify-end gap-2">
+                            {!client.is_active && <span className="rounded-full bg-amber-300/12 px-3 py-1 text-xs text-amber-100">Inactive</span>}
+                            <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">{client.default_margin_percent}%</span>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {customersTabLoadingMore ? (
+                  <div className="flex items-center justify-center gap-2 py-3 text-xs text-[var(--text-muted)]">
+                    <Loader2 className="animate-spin text-cyan-200/70" size={14} aria-hidden />
+                    Loading more…
+                  </div>
+                ) : null}
+              </div>
             </div>
           </section>
         )}
 
         {!initialLoading && tab === "carriers" && (
-          <section className="grid gap-4 xl:grid-cols-[420px,minmax(0,1fr)]">
-            <form className="glass-panel p-5 space-y-3" onSubmit={handleCreateCarrier}>
+          <section className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,420px),minmax(0,1fr)]">
+            <form className="glass-panel min-w-0 space-y-3 p-4 sm:p-5" onSubmit={handleCreateCarrier}>
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">New carrier</p>
               <input className="field-input" value={carrierForm.name} onChange={(event) => setCarrierForm((current) => ({ ...current, name: event.target.value }))} placeholder="Carrier name" />
               <input className="field-input" value={carrierForm.email} onChange={(event) => setCarrierForm((current) => ({ ...current, email: event.target.value }))} placeholder="Carrier email" />
@@ -5365,26 +6137,97 @@ export function FreightDashboardWorkspace() {
               <input className="field-input" value={carrierForm.equipment} onChange={(event) => setCarrierForm((current) => ({ ...current, equipment: event.target.value }))} placeholder="Equipment" />
               <button className="action-button bg-[var(--accent-cyan)] text-slate-950 hover:brightness-110" disabled={submitting !== null}>Add carrier</button>
             </form>
-            <div className="glass-panel p-5 space-y-3">
-              {carriers.map((carrier) => (
-                <button
-                  key={carrier.id}
-                  type="button"
-                  onClick={() => openCarrierDrawer(carrier)}
-                  className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-cyan-200/20 hover:bg-white/8"
+            <div className="glass-panel flex min-h-0 min-w-0 flex-col overflow-hidden p-4 sm:p-5 xl:max-h-[min(88vh,56rem)]">
+              <div className="shrink-0">
+                <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Directory</p>
+                <h2 className="mt-1 text-xl font-semibold tracking-[-0.03em] text-white">Carriers</h2>
+                <p className="mt-1 max-w-xl text-sm text-slate-400">Search by name, email, regions, or equipment. Scroll to load more.</p>
+              </div>
+              <label className="mt-4 block min-w-0 shrink-0">
+                <span className="mb-2 block text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Search</span>
+                <div
+                  className={`relative flex h-11 items-center gap-2 rounded-[14px] border bg-slate-950/24 pl-10 pr-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.02)] transition-[border-color] ${
+                    carriersTabSearch.trim() ? "border-white/22" : "border-cyan-200/10 focus-within:border-white/22"
+                  }`}
                 >
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-white">{carrier.name}</p>
-                      <p className="text-sm text-[var(--text-muted)]">{carrier.email}</p>
-                    </div>
-                    <div className="flex flex-wrap justify-end gap-2">
-                      {!carrier.is_active && <span className="rounded-full bg-amber-300/12 px-3 py-1 text-xs text-amber-100">Inactive</span>}
-                      <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">Rating {carrier.rating}</span>
-                    </div>
+                  <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-cyan-200/65" size={15} aria-hidden />
+                  <input
+                    type="text"
+                    inputMode="search"
+                    autoComplete="off"
+                    aria-label="Search carriers"
+                    className="min-w-0 flex-1 bg-transparent py-2 text-sm font-medium text-white outline-none placeholder:font-normal placeholder:text-slate-500"
+                    value={carriersTabSearch}
+                    onChange={(event) => setCarriersTabSearch(event.target.value)}
+                    placeholder="Name, email, region, equipment…"
+                  />
+                  {carriersTabSearch.trim() ? (
+                    <button
+                      type="button"
+                      aria-label="Clear search"
+                      onClick={() => setCarriersTabSearch("")}
+                      className="inline-flex shrink-0 rounded-[10px] p-1.5 text-slate-400 transition hover:bg-white/10 hover:text-white"
+                    >
+                      <X size={16} strokeWidth={2} />
+                    </button>
+                  ) : null}
+                </div>
+              </label>
+              <div
+                className="mt-4 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain px-0.5 pt-1 pb-2 [-webkit-overflow-scrolling:touch] max-h-[min(58dvh,26rem)] xl:max-h-[min(62vh,36rem)]"
+                onScroll={(event) => {
+                  const el = event.currentTarget;
+                  if (el.scrollHeight - el.scrollTop - el.clientHeight > 140) return;
+                  void loadMoreCarriersTab();
+                }}
+              >
+                {carriersTabListLoading && carriersTabList.length === 0 ? (
+                  <div className="flex items-center justify-center gap-2 rounded-[22px] border border-dashed border-white/10 bg-white/5 py-12 text-sm text-[var(--text-muted)]">
+                    <Loader2 className="animate-spin text-cyan-200/80" size={18} aria-hidden />
+                    Loading carriers…
                   </div>
-                </button>
-              ))}
+                ) : null}
+                {!carriersTabListLoading && carriersTabList.length === 0 && !carriersTabSearchDebounced ? (
+                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">No carriers yet.</div>
+                ) : null}
+                {!carriersTabListLoading && carriersTabList.length === 0 && carriersTabSearchDebounced ? (
+                  <div className="rounded-[22px] border border-dashed border-white/10 bg-white/5 p-6 text-sm text-[var(--text-muted)]">No matches for this search.</div>
+                ) : null}
+                {carriersTabList.length > 0 ? (
+                  <div className="flex flex-col gap-3">
+                    {carriersTabList.map((carrier) => (
+                      <button
+                        key={carrier.id}
+                        type="button"
+                        onClick={() => openCarrierDrawer(carrier)}
+                        className="w-full rounded-2xl border border-white/10 bg-white/5 p-4 text-left transition hover:border-cyan-200/20 hover:bg-white/8"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0 text-left">
+                            <p className="truncate text-white">{carrier.name}</p>
+                            <p className="truncate text-sm text-[var(--text-muted)]">{carrier.email}</p>
+                            {(carrier.regions?.length || carrier.equipment?.length) ? (
+                              <p className="mt-1 line-clamp-2 text-[11px] text-slate-500">
+                                {[...(carrier.regions || []), ...(carrier.equipment || [])].join(" · ") || null}
+                              </p>
+                            ) : null}
+                          </div>
+                          <div className="flex flex-wrap justify-end gap-2">
+                            {!carrier.is_active && <span className="rounded-full bg-amber-300/12 px-3 py-1 text-xs text-amber-100">Inactive</span>}
+                            <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">Rating {carrier.rating}</span>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {carriersTabLoadingMore ? (
+                  <div className="flex items-center justify-center gap-2 py-3 text-xs text-[var(--text-muted)]">
+                    <Loader2 className="animate-spin text-cyan-200/70" size={14} aria-hidden />
+                    Loading more…
+                  </div>
+                ) : null}
+              </div>
             </div>
           </section>
         )}
@@ -5667,66 +6510,73 @@ export function FreightDashboardWorkspace() {
               }`}
             >
               <div className="flex h-full flex-col">
-                <div className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-2.5">
-                  <div className="min-w-0">
-                    <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Shipment workspace</p>
-                    <p className="mt-0.5 text-lg font-medium text-white">{selectedShipment ? formatRoute(selectedShipment) : "No shipment selected"}</p>
-                    <div className="mt-2 flex flex-wrap items-center gap-2">
-                      {selectedShipment?.quote_token && (
-                        <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
-                          {selectedShipment.quote_token}
-                        </span>
+                <div className="shrink-0 border-b border-white/10">
+                  <div className="flex items-start justify-between gap-3 px-5 py-2.5">
+                    <div className="min-w-0">
+                      <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Shipment workspace</p>
+                      <p className="mt-0.5 text-lg font-medium text-white">{selectedShipment ? formatRoute(selectedShipment) : "No shipment selected"}</p>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        {selectedShipment?.quote_token && (
+                          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                            {selectedShipment.quote_token}
+                          </span>
+                        )}
+                        {selectedShipment && <ShipmentStatusPill status={selectedShipment.status} />}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {drawerMode !== "edit" && !selectedShipment?.is_archived && (
+                        <button
+                          onClick={() => enterEditMode()}
+                          disabled={!selectedShipment}
+                          className="action-button bg-white/10 px-3 py-1.5 text-sm text-white hover:bg-white/15 disabled:opacity-50"
+                        >
+                          Edit shipment
+                        </button>
                       )}
-                      {selectedShipment && <ShipmentStatusPill status={selectedShipment.status} />}
+                      <button
+                        onClick={closeDrawer}
+                        className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white transition hover:bg-white/10"
+                      >
+                        Close
+                      </button>
                     </div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {drawerMode !== "edit" && !selectedShipment?.is_archived && (
-                      <button
-                        onClick={() => enterEditMode()}
-                        disabled={!selectedShipment}
-                        className="action-button bg-white/10 px-3 py-1.5 text-sm text-white hover:bg-white/15 disabled:opacity-50"
-                      >
-                        Edit shipment
-                      </button>
-                    )}
-                    <button
-                      onClick={closeDrawer}
-                      className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white transition hover:bg-white/10"
-                    >
-                      Close
-                    </button>
-                  </div>
+                  {selectedShipment ? (
+                    <div className="flex gap-2 border-t border-white/[0.06] bg-black/15 px-5 py-2 xl:hidden">
+                      {([
+                        { key: "details", label: "Details" },
+                        { key: "thread", label: "Thread" },
+                      ] as const).map((tab) => (
+                        <button
+                          key={tab.key}
+                          type="button"
+                          onClick={() => setDrawerMobileTab(tab.key)}
+                          className={`flex flex-1 items-center justify-between gap-2 rounded-[14px] px-3 py-2 text-xs uppercase tracking-[0.18em] transition ${
+                            drawerMobileTab === tab.key
+                              ? "bg-white text-slate-950"
+                              : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"
+                          }`}
+                        >
+                          <span>{tab.label}</span>
+                          <ArrowRight size={14} className="shrink-0" />
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
                 <div ref={drawerScrollRef} className="flex-1 overflow-y-auto px-5 pb-5 pt-4">
                   {!selectedShipment ? (
                     renderShipmentWorkspace()
                   ) : (
                     <>
-                      <div className="mb-4 flex gap-2 xl:hidden">
-                        {([
-                          { key: "details", label: "Details" },
-                          { key: "thread", label: "Thread" },
-                        ] as const).map((tab) => (
-                          <button
-                            key={tab.key}
-                            type="button"
-                            onClick={() => setDrawerMobileTab(tab.key)}
-                            className={`flex flex-1 items-center justify-between gap-2 rounded-[14px] px-3 py-2.5 text-xs uppercase tracking-[0.18em] transition ${
-                              drawerMobileTab === tab.key
-                                ? "bg-white text-slate-950"
-                                : "bg-white/5 text-[var(--text-muted)] hover:bg-white/10 hover:text-white"
-                            }`}
-                          >
-                            <span>{tab.label}</span>
-                            <ArrowRight size={14} className="shrink-0" />
-                          </button>
-                        ))}
-                      </div>
-
                       <div className="xl:hidden">
-                        {drawerMobileTab === "details" ? renderShipmentWorkspace() : (
-                          <div className="pb-2">{renderThreadPanel({ embedded: true })}</div>
+                        {drawerMobileTab === "details" ? (
+                          renderShipmentWorkspace()
+                        ) : (
+                          <div className="flex h-[calc(100dvh-12rem)] min-h-0 max-h-[min(720px,85dvh)] w-full min-w-0 flex-col pb-2">
+                            {renderThreadPanel({ embedded: true })}
+                          </div>
                         )}
                       </div>
 
@@ -5740,6 +6590,69 @@ export function FreightDashboardWorkspace() {
             </aside>
           </>
         )}
+
+        <div
+          className={`fixed inset-0 z-[65] flex items-center justify-center bg-slate-950/55 px-4 backdrop-blur-sm transition ${
+            triageActionDialog ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+          }`}
+          onClick={() => setTriageActionDialog(null)}
+        >
+          <div
+            className="w-full max-w-[520px] rounded-[30px] border border-cyan-200/16 bg-[linear-gradient(180deg,rgba(15,22,33,0.98),rgba(9,16,25,0.98))] p-6 shadow-[0_32px_100px_rgba(0,0,0,0.45)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {triageActionDialog ? (
+              (() => {
+                const copy = triageActionDialogCopy(triageActionDialog.action);
+                const isDanger = copy.tone === "danger";
+                return (
+                  <div className="flex items-start gap-4">
+                    <div className={`rounded-full p-3 ${isDanger ? "bg-rose-300/12 text-rose-100" : "bg-cyan-300/12 text-cyan-100"}`}>
+                      <AlertTriangle size={18} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className={`text-xs uppercase tracking-[0.18em] ${isDanger ? "text-rose-200/75" : "text-cyan-200/75"}`}>
+                        Confirm email triage action
+                      </p>
+                      <h3 className="mt-2 text-2xl font-semibold tracking-[-0.04em] text-white">{copy.title}</h3>
+                      <p className="mt-3 text-sm leading-6 text-slate-300">{copy.description}</p>
+                      <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4 text-sm leading-6 text-slate-300">
+                        <p><span className="text-slate-500">From:</span> <span className="text-white">{triageActionDialog.sender}</span></p>
+                        <p className="mt-1"><span className="text-slate-500">Subject:</span> <span className="text-white">{triageActionDialog.subject}</span></p>
+                        {triageActionDialog.action === "link_to_existing_shipment" && (
+                          <p className="mt-1"><span className="text-slate-500">Shipment:</span> <span className="text-white">{triageActionDialog.shipmentId}</span></p>
+                        )}
+                      </div>
+                      {isDanger && (
+                        <div className="mt-4 rounded-2xl border border-rose-300/25 bg-rose-300/10 p-4 text-sm leading-6 text-rose-50">
+                          This action affects future synced emails. Use it only when the sender is truly spam, fraud, or irrelevant automation noise.
+                        </div>
+                      )}
+                      <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                        <button
+                          onClick={() => setTriageActionDialog(null)}
+                          disabled={submitting !== null}
+                          className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={() => void confirmTriageAction()}
+                          disabled={submitting !== null}
+                          className={`action-button disabled:opacity-50 ${
+                            isDanger ? "bg-rose-300 text-slate-950 hover:brightness-105" : "bg-cyan-300 text-slate-950 hover:brightness-105"
+                          }`}
+                        >
+                          {submitting === `triage-${triageActionDialog.action}` ? "Working..." : copy.confirmLabel}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()
+            ) : null}
+          </div>
+        </div>
       </div>
     </main>
   );

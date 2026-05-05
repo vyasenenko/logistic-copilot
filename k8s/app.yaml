@@ -8,6 +8,12 @@ metadata:
   namespace: ai-agent
 spec:
   replicas: 1
+  # Single-node / tight CPU: avoid a second pod during rollout (default maxSurge needs spare CPU).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: backend
@@ -68,6 +74,11 @@ metadata:
   namespace: ai-agent
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: frontend
@@ -87,6 +98,7 @@ spec:
           env:
             - name: NEXT_PUBLIC_API_URL
               value: "https://api.logisticopilot.com"
+            # Turnstile site key is inlined at Next.js build; set via Dockerfile --build-arg, not here.
           resources:
             requests:
               memory: "256Mi"

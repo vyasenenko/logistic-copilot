@@ -14,54 +14,100 @@ _webhook_renewal_task: asyncio.Task | None = None
 _quote_window_task: asyncio.Task | None = None
 
 
-async def _ensure_outlook_webhook_subscription(reason: str) -> None:
-    from app.services.outlook import OutlookGraphClient
+async def _ensure_outlook_webhook_for_connection(reason: str, email_connection_id) -> None:
+    """Create or renew Graph webhook subscription for one active mailbox connection."""
+    from datetime import datetime, timedelta, timezone
 
-    outlook = OutlookGraphClient()
-    if not outlook.webhook_is_configured():
+    from app.memory.database import EmailConnection, async_session
+    from app.services.outlook_organization import (
+        apply_graph_subscription_to_email_connection,
+        build_outlook_graph_client,
+    )
+
+    if not (settings.microsoft_webhook_public_base_url or "").strip():
+        return
+
+    async with async_session() as session:
+        connection = await session.get(EmailConnection, email_connection_id)
+        if connection is None or connection.status != "active":
+            return
+        if connection.subscription_expires_at:
+            renew_before = datetime.now(timezone.utc) + timedelta(
+                minutes=max(15, settings.microsoft_webhook_renewal_buffer_minutes)
+            )
+            if connection.subscription_expires_at > renew_before:
+                return
+        try:
+            outlook = await build_outlook_graph_client(
+                session,
+                connection.organization_id,
+                mailbox=connection.mailbox,
+                email_connection_id=connection.id,
+            )
+        except RuntimeError:
+            return
+        if not outlook.webhook_is_configured():
+            return
+        logger.info("Ensuring Outlook webhook for mailbox %s (%s)", connection.mailbox, reason)
+        try:
+            subscription = await outlook.ensure_inbox_webhook_subscription()
+            await apply_graph_subscription_to_email_connection(session, connection.id, subscription)
+            await session.commit()
+            logger.info(
+                "Outlook webhook mailbox=%s %s: id=%s expires=%s",
+                connection.mailbox,
+                subscription.get("subscriptionAction", "ensured"),
+                subscription.get("id"),
+                subscription.get("expirationDateTime"),
+            )
+        except Exception:
+            await session.rollback()
+            logger.exception(
+                "Failed to ensure Outlook webhook for mailbox connection %s (%s).", email_connection_id, reason
+            )
+
+
+async def _ensure_all_organization_outlook_webhooks(reason: str) -> None:
+    from sqlalchemy import select
+
+    from app.memory.database import EmailConnection, async_session
+
+    if not (settings.microsoft_webhook_public_base_url or "").strip():
         logger.info(
-            "Skipping Outlook webhook subscription bootstrap; webhook is not fully configured "
-            "(public_base_url=%r mailbox=%r resource=%r).",
-            settings.microsoft_webhook_public_base_url,
-            settings.microsoft_mailbox,
-            settings.microsoft_webhook_effective_resource,
+            "Skipping Outlook webhook renewal (%s); microsoft_webhook_public_base_url is not set.", reason
         )
         return
 
-    logger.info(
-        "Ensuring Outlook webhook subscription (%s) "
-        "(notification_url=%r resource=%r change_type=%r).",
-        reason,
-        settings.microsoft_webhook_notification_url,
-        settings.microsoft_webhook_effective_resource,
-        settings.microsoft_webhook_change_type,
-    )
-    try:
-        subscription = await outlook.ensure_inbox_webhook_subscription()
-        logger.info(
-            "Outlook webhook subscription %s: id=%s expires=%s",
-            subscription.get("subscriptionAction", "ensured"),
-            subscription.get("id"),
-            subscription.get("expirationDateTime"),
+    async with async_session() as session:
+        result = await session.execute(
+            select(EmailConnection.id).where(
+                EmailConnection.provider == "outlook",
+                EmailConnection.status == "active",
+            )
         )
-    except Exception:
-        logger.exception("Failed to ensure Outlook webhook subscription (%s).", reason)
+        connection_ids = [row[0] for row in result.all()]
+
+    for connection_id in connection_ids:
+        try:
+            await _ensure_outlook_webhook_for_connection(reason, connection_id)
+        except Exception:
+            logger.exception("Outlook renewal iteration failed for email connection %s (%s)", connection_id, reason)
 
 
 async def _outlook_webhook_subscription_renewal_loop() -> None:
-    """Ensure the Outlook webhook on startup, then keep it renewed periodically."""
+    """Ensure Outlook webhooks per organization on startup, then renew periodically."""
     delay_seconds = max(0, settings.microsoft_webhook_startup_delay_seconds)
     if delay_seconds:
         logger.info("Outlook webhook bootstrap will run in %ss.", delay_seconds)
         await asyncio.sleep(delay_seconds)
 
-    await _ensure_outlook_webhook_subscription("startup")
+    await _ensure_all_organization_outlook_webhooks("startup")
 
     interval_seconds = max(3600, settings.microsoft_webhook_renew_interval_seconds)
     while True:
         logger.info("Next Outlook webhook renewal check will run in %ss.", interval_seconds)
         await asyncio.sleep(interval_seconds)
-        await _ensure_outlook_webhook_subscription("scheduled")
+        await _ensure_all_organization_outlook_webhooks("scheduled")
 
 
 async def _quote_window_evaluation_loop() -> None:
@@ -73,7 +119,7 @@ async def _quote_window_evaluation_loop() -> None:
     while True:
         try:
             async with async_session() as session:
-                decisions = await evaluate_expired_quote_windows(session)
+                decisions = await evaluate_expired_quote_windows(session, system_scope=True)
             if decisions:
                 logger.info("Quote window scheduler processed %d shipment(s).", len(decisions))
         except asyncio.CancelledError:
@@ -140,6 +186,7 @@ if settings.cors_allow_chrome_extensions:
 app.add_middleware(CORSMiddleware, **_cors_kw)
 
 # --- Routes ---
+from app.api.auth import router as auth_router  # noqa: E402
 from app.api.chat import router as chat_router  # noqa: E402
 from app.api.conversations import router as conversations_router  # noqa: E402
 from app.api.audio import router as audio_router  # noqa: E402
@@ -152,6 +199,7 @@ from app.api.events_ws import router as events_ws_router  # noqa: E402
 
 app.include_router(health_router, tags=["health"])
 app.include_router(events_ws_router, tags=["events"])
+app.include_router(auth_router, prefix="/api", tags=["auth"])
 app.include_router(chat_router, prefix="/api", tags=["chat"])
 app.include_router(audio_router, prefix="/api", tags=["audio"])
 app.include_router(conversations_router, prefix="/api", tags=["conversations"])

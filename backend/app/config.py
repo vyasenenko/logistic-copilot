@@ -70,6 +70,16 @@ class Settings(BaseSettings):
 
     # Security
     api_secret_key: str = "changeme_generate_a_random_key"
+    auth_require_turnstile: bool = False
+    turnstile_secret_key: str = ""
+    turnstile_verify_url: str = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+    auth_enforce: bool = True
+    bootstrap_owner_email: str = "vyasenenko@logisticopilot.com"
+    bootstrap_owner_password: str = ""
+    bootstrap_owner_name: str = "Vitalii Yasenenko"
+    bootstrap_organization_name: str = "Logistic Copilot"
+    bootstrap_organization_domain: str = "logisticopilot.com"
+    bootstrap_outlook_mailbox: str = ""
 
     # ElevenLabs
     elevenlabs_api_key: str = ""
@@ -82,11 +92,13 @@ class Settings(BaseSettings):
     s3_bucket: str = "agent-content"
     s3_public_url: str = "http://localhost:9000/agent-content"
 
-    # Microsoft Graph / Outlook
+    # Microsoft Graph / Outlook (tenant, client id, secret, mailbox live in DB per organization)
     microsoft_tenant_id: str = ""
     microsoft_client_id: str = ""
     microsoft_client_secret: str = ""
     microsoft_mailbox: str = ""
+    outlook_credentials_fernet_key: str = ""
+    outlook_webhook_state_secret: str = ""
     microsoft_graph_base_url: str = "https://graph.microsoft.com/v1.0"
     microsoft_webhook_client_state: str = ""
     microsoft_webhook_public_base_url: str = ""
@@ -115,6 +127,11 @@ class Settings(BaseSettings):
     document_min_ocr_confidence: float = 0.55
     document_min_field_confidence: float = 0.6
 
+    # Transactional email (Resend) — invite links use PUBLIC_APP_BASE_URL + /invite?token=
+    resend_api_key: str = ""
+    resend_from_email: str = ""
+    public_app_base_url: str = ""
+
     @property
     def postgres_url(self) -> str:
         # Quote user/password so @ : / # etc. do not break the URL (asyncpg gaierror on wrong "host")
@@ -128,33 +145,11 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.backend_cors_origins.split(",")]
 
     @property
-    def microsoft_token_url(self) -> str:
-        return (
-            "https://login.microsoftonline.com/"
-            f"{self.microsoft_tenant_id}/oauth2/v2.0/token"
-        )
-
-    @property
     def microsoft_webhook_notification_url(self) -> str:
         base = self.microsoft_webhook_public_base_url.rstrip("/")
         if not base:
             return ""
         return f"{base}/api/freight/outlook/webhook"
-
-    @property
-    def microsoft_webhook_effective_client_state(self) -> str:
-        return (
-            self.microsoft_webhook_client_state
-            or self.api_secret_key[:64]
-            or "logistic-copilot-outlook-webhook"
-        )
-
-    @property
-    def microsoft_webhook_effective_resource(self) -> str:
-        if self.microsoft_webhook_resource:
-            return self.microsoft_webhook_resource
-        mailbox = self.microsoft_mailbox.strip()
-        return f"users/{mailbox}/mailFolders('Inbox')/messages" if mailbox else ""
 
     @property
     def configured_llm_provider_order(self) -> list[str]:
