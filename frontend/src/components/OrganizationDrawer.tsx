@@ -274,6 +274,7 @@ export function OrganizationDrawer({ open, onClose }: OrganizationDrawerProps) {
   const [logoutWorking, setLogoutWorking] = useState(false);
 
   const canManageMicrosoft = me?.role === "owner" || me?.role === "admin";
+  const isViewerRole = (me?.role || "").trim().toLowerCase() === "viewer";
   const canViewTeamMailboxes = canManageMicrosoft;
   const canManageUsers = Boolean(me?.permissions.includes("*") || me?.permissions.includes("members:invite"));
   const microsoftConfigured = Boolean(
@@ -578,6 +579,7 @@ export function OrganizationDrawer({ open, onClose }: OrganizationDrawerProps) {
 
               <div className={`overflow-hidden ${drawerQuietCard}`}>
                 {!microsoftConfigured ? (
+                  canManageMicrosoft ? (
                   <div className="flex items-center gap-3 px-4 py-4">
                     <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-[linear-gradient(145deg,rgba(14,165,233,0.22),rgba(15,23,42,0.35))] text-cyan-100">
                       <Mail size={20} />
@@ -588,14 +590,11 @@ export function OrganizationDrawer({ open, onClose }: OrganizationDrawerProps) {
                         Configure organization Graph credentials on the settings page to enable mailbox sync.
                       </p>
                     </div>
-                    {canManageMicrosoft ? (
-                      <Link href="/settings/outlook" className={`${drawerPrimaryBtn} gap-1`} onClick={onClose}>
-                        Settings <ArrowRight size={13} />
-                      </Link>
-                    ) : (
-                      <span className="shrink-0 text-[10px] text-slate-500">Owner / Admin</span>
-                    )}
+                    <Link href="/settings/outlook" className={`${drawerPrimaryBtn} gap-1`} onClick={onClose}>
+                      Settings <ArrowRight size={13} />
+                    </Link>
                   </div>
+                  ) : null
                 ) : (
                   <>
                     <div className="border-b border-white/[0.06] px-4 py-4">
@@ -682,64 +681,74 @@ export function OrganizationDrawer({ open, onClose }: OrganizationDrawerProps) {
                         </p>
                       </div>
 
-                      {/* Privacy */}
-                      <div className="px-4 py-3.5">
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Triage visibility</p>
-                        <p className="mt-1 text-[11px] leading-relaxed text-slate-500">{visibilityDescription(syncStatus?.connection?.visibility_mode)}</p>
-                        <div className="mt-2 flex items-center justify-between gap-3">
-                          <span className="text-sm font-medium text-white">{visibilityLabel(syncStatus?.connection?.visibility_mode)}</span>
+                      {!isViewerRole ? (
+                        <div className="px-4 py-3.5">
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Triage visibility</p>
+                          <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                            {visibilityDescription(syncStatus?.connection?.visibility_mode)}
+                          </p>
+                          <div className="mt-2 flex items-center justify-between gap-3">
+                            <span className="text-sm font-medium text-white">{visibilityLabel(syncStatus?.connection?.visibility_mode)}</span>
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-checked={syncStatus?.connection?.visibility_mode === "shared_ops"}
+                              onClick={() =>
+                                void updateEmailVisibility(syncStatus?.connection?.visibility_mode === "shared_ops" ? "private" : "shared_ops")
+                              }
+                              disabled={Boolean(working)}
+                              className={`flex h-8 w-[3.25rem] shrink-0 items-center rounded-full border p-[3px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/35 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c1522] disabled:opacity-50 ${
+                                syncStatus?.connection?.visibility_mode === "shared_ops"
+                                  ? "justify-end border-cyan-300/35 bg-cyan-400/[0.24]"
+                                  : "justify-start border-white/14 bg-white/[0.08]"
+                              }`}
+                              aria-label="Share synced email triage with organization team"
+                            >
+                              <span className="pointer-events-none size-[1.375rem] rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.28)] ring-1 ring-black/10" />
+                            </button>
+                          </div>
+                          <p className="mt-2 text-[10px] leading-relaxed text-slate-600">
+                            Shipments and workflow events stay visible to the org regardless of this setting.
+                          </p>
+                        </div>
+                      ) : null}
+
+                      {!isViewerRole ? (
+                        <div className="px-4 py-3.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Manual pull</p>
+                            <Settings className="text-slate-600" size={14} />
+                          </div>
+                          <p className="mt-1 text-[11px] text-slate-500">
+                            One-off fetch from your mailbox (requires auto-sync on).
+                          </p>
+                          <div className="mt-2 grid grid-cols-4 gap-1.5">
+                            {[5, 10, 25, 50].map((limit) => (
+                              <button
+                                key={limit}
+                                type="button"
+                                onClick={() => setSyncLimit(limit)}
+                                className={`rounded-lg px-2 py-1.5 text-xs font-medium transition ${
+                                  syncLimit === limit
+                                    ? "bg-white text-slate-950"
+                                    : "bg-white/[0.06] text-slate-400 hover:bg-white/10 hover:text-white"
+                                }`}
+                              >
+                                {limit}
+                              </button>
+                            ))}
+                          </div>
                           <button
                             type="button"
-                            role="switch"
-                            aria-checked={syncStatus?.connection?.visibility_mode === "shared_ops"}
-                            onClick={() => void updateEmailVisibility(syncStatus?.connection?.visibility_mode === "shared_ops" ? "private" : "shared_ops")}
-                            disabled={Boolean(working)}
-                            className={`flex h-8 w-[3.25rem] shrink-0 items-center rounded-full border p-[3px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/35 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c1522] disabled:opacity-50 ${
-                              syncStatus?.connection?.visibility_mode === "shared_ops"
-                                ? "justify-end border-cyan-300/35 bg-cyan-400/[0.24]"
-                                : "justify-start border-white/14 bg-white/[0.08]"
-                            }`}
-                            aria-label="Share synced email triage with organization team"
+                            onClick={() => void syncNow()}
+                            disabled={Boolean(working) || syncStatus?.status !== "auto_sync_on"}
+                            className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-400 py-2 text-xs font-semibold text-slate-950 shadow-[0_0_18px_-5px_rgba(34,211,238,0.55)] transition hover:bg-cyan-300 disabled:opacity-45 disabled:shadow-none"
                           >
-                            <span className="pointer-events-none size-[1.375rem] rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.28)] ring-1 ring-black/10" />
+                            {working === "sync" ? <Loader2 className="animate-spin" size={14} /> : <RefreshCcw size={14} />}
+                            Sync now
                           </button>
                         </div>
-                        <p className="mt-2 text-[10px] leading-relaxed text-slate-600">
-                          Shipments and workflow events stay visible to the org regardless of this setting.
-                        </p>
-                      </div>
-
-                      {/* Manual sync */}
-                      <div className="px-4 py-3.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">Manual pull</p>
-                          <Settings className="text-slate-600" size={14} />
-                        </div>
-                        <p className="mt-1 text-[11px] text-slate-500">One-off fetch from your mailbox (requires auto-sync on).</p>
-                        <div className="mt-2 grid grid-cols-4 gap-1.5">
-                          {[5, 10, 25, 50].map((limit) => (
-                            <button
-                              key={limit}
-                              type="button"
-                              onClick={() => setSyncLimit(limit)}
-                              className={`rounded-lg px-2 py-1.5 text-xs font-medium transition ${
-                                syncLimit === limit ? "bg-white text-slate-950" : "bg-white/[0.06] text-slate-400 hover:bg-white/10 hover:text-white"
-                              }`}
-                            >
-                              {limit}
-                            </button>
-                          ))}
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => void syncNow()}
-                          disabled={Boolean(working) || syncStatus?.status !== "auto_sync_on"}
-                          className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-400 py-2 text-xs font-semibold text-slate-950 shadow-[0_0_18px_-5px_rgba(34,211,238,0.55)] transition hover:bg-cyan-300 disabled:opacity-45 disabled:shadow-none"
-                        >
-                          {working === "sync" ? <Loader2 className="animate-spin" size={14} /> : <RefreshCcw size={14} />}
-                          Sync now
-                        </button>
-                      </div>
+                      ) : null}
 
                       {lastSyncSummary ? (
                         <div className="bg-slate-950/25 px-4 py-3">
@@ -790,24 +799,6 @@ export function OrganizationDrawer({ open, onClose }: OrganizationDrawerProps) {
                     </div>
                   </>
                 )}
-              </div>
-
-              {/* TMS */}
-              <div className={`mt-3 overflow-hidden ${drawerQuietCard}`}>
-                <div className="flex items-center gap-2 border-b border-white/[0.06] px-4 py-3">
-                  <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-violet-200">
-                    <Truck size={18} />
-                  </div>
-                  <span className="text-sm font-semibold text-white">TMS & dispatch</span>
-                  <span className="ml-auto rounded-full bg-white/[0.08] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-500">
-                    Planned
-                  </span>
-                </div>
-                <div className="px-4 py-3">
-                  <p className="text-xs leading-relaxed text-slate-500">
-                    Handoffs, PRO numbers, and carrier updates will live here so email and TMS stay in one integrations hub.
-                  </p>
-                </div>
               </div>
             </div>
           ) : null}

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Logistic Copilot",
-  "version": "1.0.1", 
+  "version": "1.0.2", 
   "description": "Chrome extension with Logistic Copilot AI agent side panel",
   "permissions": [
     "sidePanel",

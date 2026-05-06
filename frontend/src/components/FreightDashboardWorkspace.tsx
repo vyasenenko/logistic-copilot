@@ -832,7 +832,7 @@ function webhookStatusLabel(status: string | null | undefined) {
   if (status === "expiring_soon") return "Renew soon";
   if (status === "expired") return "Expired";
   if (status === "not_installed") return "Not installed";
-  if (status === "missing_configuration") return "Config missing";
+  if (status === "missing_configuration") return "Needs setup";
   return "Unknown";
 }
 
@@ -1449,11 +1449,28 @@ function ShipmentStatusPill({ status }: { status: string }) {
 }
 
 export function FreightDashboardWorkspace() {
+  const TAB_STORAGE_KEY = "logistic-copilot-dashboard-tab";
   const BOARD_FILTER_STORAGE_KEY = "logistic-copilot-board-filter";
   const BOARD_MONTH_STORAGE_KEY = "logistic-copilot-board-month";
   const BOARD_MAILBOX_SCOPE_STORAGE_KEY = "logistic-copilot-board-mailbox-scope";
   const OUTLOOK_STATUS_STORAGE_KEY = "logistic-copilot-outlook-webhook-status";
-  const [tab, setTab] = useState<DashboardTab>("shipments");
+  const isDashboardTab = (value: string): value is DashboardTab =>
+    value === "shipments" ||
+    value === "triage" ||
+    value === "status_ops" ||
+    value === "clients" ||
+    value === "carriers" ||
+    value === "archive";
+  const [tab, setTab] = useState<DashboardTab>(() => {
+    if (typeof window === "undefined") return "shipments";
+    try {
+      const stored = window.localStorage.getItem(TAB_STORAGE_KEY);
+      if (stored && isDashboardTab(stored)) return stored;
+    } catch {
+      // Ignore storage access failures.
+    }
+    return "shipments";
+  });
   const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>("overview");
   const [drawerMode, setDrawerMode] = useState<DrawerMode>("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -1691,6 +1708,15 @@ export function FreightDashboardWorkspace() {
     if (!canUseEmailTriage || tab !== "triage") return;
     void fetchEmailTriageFirstPage();
   }, [tab, triageSearchDebounced, triageIncludeHighConfidence, canUseEmailTriage, fetchEmailTriageFirstPage]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(TAB_STORAGE_KEY, tab);
+    } catch {
+      // Ignore storage access failures.
+    }
+  }, [tab, TAB_STORAGE_KEY]);
 
   useEffect(() => {
     const handle = window.setTimeout(() => setArchiveSearchDebounced(archiveSearch.trim()), 400);
@@ -4798,8 +4824,8 @@ export function FreightDashboardWorkspace() {
           <div className="pointer-events-none absolute inset-y-0 left-[22%] w-px bg-cyan-200/8" />
           <div className="pointer-events-none absolute inset-y-0 right-[26%] w-px bg-cyan-200/8" />
 
-          <div className="relative grid gap-3 sm:gap-4 lg:grid-cols-[minmax(0,1fr),minmax(260px,480px)] lg:items-start xl:grid-cols-[minmax(0,1fr),minmax(280px,520px)]">
-            <div className="min-w-0 max-w-xl space-y-2.5 self-start lg:max-w-lg xl:max-w-xl">
+          <div className="relative flex w-full min-w-0 flex-col gap-3 sm:gap-4 lg:flex-row lg:flex-nowrap lg:items-center lg:justify-between lg:gap-6 xl:gap-8">
+            <header className="min-w-0 w-full max-w-xl space-y-2.5 lg:w-auto lg:max-w-md lg:shrink-0 xl:max-w-lg">
               <div className="flex w-full flex-wrap items-center gap-2.5">
                 <div className="inline-flex items-center gap-2.5">
                   <DashboardLogo className="h-6 w-6 shrink-0 sm:h-7 sm:w-7" />
@@ -4816,66 +4842,79 @@ export function FreightDashboardWorkspace() {
                   Monitor active lanes. Surface blockers. Move faster.
                 </h1>
                 <p className="text-xs leading-snug text-slate-300 sm:text-sm sm:leading-relaxed">
-                  A sharper command deck for today&apos;s shipments, operator decisions, and time-sensitive follow-up.
+                  A sharper ops deck for today&apos;s shipments: decisions, blockers, and follow-ups.
                 </p>
               </div>
-            </div>
+            </header>
 
-            <div className="grid w-full max-w-[440px] shrink-0 grid-cols-3 grid-rows-2 gap-1 min-[1280px]:max-w-none min-[1280px]:grid-cols-6 min-[1280px]:grid-rows-1 min-[1280px]:gap-1.5 justify-self-start lg:justify-self-end">
-                {metrics.map((metric) => (
-                  <div key={metric.label} className="min-h-[58px] rounded-[11px] border border-cyan-200/10 bg-slate-950/26 px-2 py-1.5 backdrop-blur sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2">
-                    <p className="text-[9px] uppercase tracking-[0.2em] text-cyan-200/48 sm:text-[10px] sm:tracking-[0.22em]">{metric.label}</p>
-                    <div className="mt-0.5 space-y-0.5 sm:mt-1">
-                      <span className="block text-xl font-semibold leading-none text-white sm:text-[1.35rem]">{metric.value}</span>
-                      <span className="block text-[9px] leading-tight text-slate-300 sm:text-[10px] sm:leading-4">{metric.detail}</span>
-                    </div>
+            <div
+              className="grid w-full max-w-none min-w-0 grid-cols-3 grid-rows-2 gap-1 max-lg:self-stretch lg:ms-auto lg:flex-1 lg:grid-cols-6 lg:grid-rows-1 lg:items-center lg:gap-1.5 lg:self-center"
+              role="group"
+              aria-label="Dashboard summary"
+            >
+              {metrics.map((metric) => (
+                <div key={metric.label} className="flex max-lg:h-full min-h-[58px] min-w-0 flex-col rounded-[11px] border border-cyan-200/10 bg-slate-950/26 px-2 py-1.5 backdrop-blur sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2 lg:h-auto">
+                  <p className="text-[9px] uppercase tracking-[0.2em] text-cyan-200/48 sm:text-[10px] sm:tracking-[0.22em]">{metric.label}</p>
+                  <div className="mt-0.5 min-w-0 space-y-0.5 sm:mt-1">
+                    <span className="block text-xl font-semibold leading-none text-white sm:text-[1.35rem]">{metric.value}</span>
+                    <span
+                      className="block min-w-0 truncate text-[9px] leading-tight text-slate-300 sm:text-[10px] sm:leading-4"
+                      title={metric.detail}
+                    >
+                      {metric.detail}
+                    </span>
                   </div>
-                ))}
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => {
+                  setNotificationCenterOpen((open) => !open);
+                }}
+                className="relative flex max-lg:h-full min-h-[58px] min-w-0 flex-col overflow-hidden rounded-[11px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] px-2 py-1.5 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-cyan-200/24 hover:bg-cyan-200/10 sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2 lg:h-auto"
+              >
+                <span className="pointer-events-none absolute right-0.5 top-1/2 -translate-y-1/2 text-[48px] font-black leading-none tracking-[-0.05em] text-cyan-100/[0.08] sm:right-1 sm:text-[56px] lg:text-[64px]">
+                  {unreadNotificationCount}
+                </span>
+                <div className="relative z-[1] flex max-lg:flex-1 items-center justify-between gap-1.5 sm:gap-2">
+                  <div className="min-w-0 pr-2 sm:pr-4">
+                    <p className="text-[9px] uppercase tracking-[0.2em] text-cyan-100/70 sm:text-[10px] sm:tracking-[0.22em]">Signals</p>
+                    <span className="mt-0.5 inline-flex items-center gap-1 text-[13px] font-semibold text-white sm:gap-1.5 sm:text-[15px]">
+                      <Bell size={14} className="shrink-0" /> Alerts
+                    </span>
+                    <p className="mt-0.5 truncate text-[9px] text-cyan-100/70 sm:text-[10px]">
+                      {notifications[0]?.title || "Email, shipment, bid, review"}
+                    </p>
+                  </div>
+                </div>
+              </button>
+              <div className="relative flex max-lg:h-full min-h-0 min-w-0 flex-col lg:h-auto">
                 <button
+                  type="button"
                   onClick={() => {
-                    setNotificationCenterOpen((open) => !open);
+                    setNotificationCenterOpen(false);
+                    setOrganizationDrawerOpen(true);
                   }}
-                  className="relative min-h-[58px] overflow-hidden rounded-[11px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(255,255,255,0.06),rgba(255,255,255,0.02))] px-2 py-1.5 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition hover:border-cyan-200/24 hover:bg-cyan-200/10 sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2"
+                  disabled={submitting !== null && submitting !== "sync" && submitting !== "webhook"}
+                  className="flex max-lg:h-full min-h-[58px] w-full max-lg:flex-1 flex-col rounded-[11px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-2 py-1.5 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50 sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2 lg:h-auto"
                 >
-                  <span className="pointer-events-none absolute right-0.5 top-1/2 -translate-y-1/2 text-[48px] font-black leading-none tracking-[-0.05em] text-cyan-100/[0.08] sm:right-1 sm:text-[56px] min-[1280px]:text-[64px]">
-                    {unreadNotificationCount}
-                  </span>
-                  <div className="relative z-[1] flex items-center justify-between gap-1.5 sm:gap-2">
-                    <div className="min-w-0 pr-2 sm:pr-4">
-                      <p className="text-[9px] uppercase tracking-[0.2em] text-cyan-100/70 sm:text-[10px] sm:tracking-[0.22em]">Signals</p>
-                      <span className="mt-0.5 inline-flex items-center gap-1 text-[13px] font-semibold text-white sm:gap-1.5 sm:text-[15px]">
-                        <Bell size={14} className="shrink-0" /> Alerts
-                      </span>
-                      <p className="mt-0.5 truncate text-[9px] text-cyan-100/70 sm:text-[10px]">
-                        {notifications[0]?.title || "Email, shipment, bid, review"}
-                      </p>
+                  <div className="flex h-full min-w-0 flex-col justify-between gap-0.5 sm:gap-1">
+                    <div className="flex min-w-0 items-center justify-between gap-1.5 sm:gap-2">
+                      <p className="min-w-0 truncate text-[9px] uppercase tracking-[0.2em] text-cyan-100/70 sm:text-[10px] sm:tracking-[0.22em]">Organization</p>
+                      <span className={`h-1.5 w-1.5 shrink-0 rounded-full sm:h-2 sm:w-2 ${outlookStatusLoading ? "animate-pulse bg-cyan-200" : webhookStatus?.status === "active" ? "bg-emerald-200" : webhookStatus?.status === "expiring_soon" ? "bg-amber-200" : "bg-rose-200"}`} />
                     </div>
+                    <span className="flex min-w-0 items-center gap-1 text-[13px] font-semibold leading-tight text-white sm:gap-1.5 sm:text-[14px] sm:leading-5">
+                      {submitting === "sync" ? <Loader2 className="shrink-0 animate-spin" size={14} /> : <SlidersHorizontal size={14} className="shrink-0" />}
+                      <span className="min-w-0 truncate">Mailbox</span>
+                    </span>
+                    <p className="min-w-0 truncate text-[9px] leading-tight text-cyan-100/70 sm:text-[10px] sm:leading-4">
+                      {isViewerRole
+                        ? "Read-only · Ask admin to enable sync"
+                        : `Your inbox · ${outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}`}
+                    </p>
                   </div>
                 </button>
-                <div className="relative">
-                  <button
-                    onClick={() => {
-                      setNotificationCenterOpen(false);
-                      setOrganizationDrawerOpen(true);
-                    }}
-                    disabled={submitting !== null && submitting !== "sync" && submitting !== "webhook"}
-                    className="min-h-[58px] w-full rounded-[11px] border border-cyan-200/16 bg-[linear-gradient(135deg,rgba(132,236,255,0.2),rgba(85,202,255,0.14))] px-2 py-1.5 text-left shadow-[0_12px_30px_rgba(44,164,214,0.14),inset_0_1px_0_rgba(255,255,255,0.08)] transition hover:brightness-110 disabled:opacity-50 sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2"
-                  >
-                    <div className="flex h-full min-w-0 flex-col justify-between gap-0.5 sm:gap-1">
-                      <div className="flex min-w-0 items-center justify-between gap-1.5 sm:gap-2">
-                        <p className="min-w-0 truncate text-[9px] uppercase tracking-[0.2em] text-cyan-100/70 sm:text-[10px] sm:tracking-[0.22em]">Organization</p>
-                        <span className={`h-1.5 w-1.5 shrink-0 rounded-full sm:h-2 sm:w-2 ${outlookStatusLoading ? "animate-pulse bg-cyan-200" : webhookStatus?.status === "active" ? "bg-emerald-200" : webhookStatus?.status === "expiring_soon" ? "bg-amber-200" : "bg-rose-200"}`} />
-                      </div>
-                      <span className="flex min-w-0 items-center gap-1 text-[13px] font-semibold leading-tight text-white sm:gap-1.5 sm:text-[14px] sm:leading-5">
-                          {submitting === "sync" ? <Loader2 className="shrink-0 animate-spin" size={14} /> : <SlidersHorizontal size={14} className="shrink-0" />}
-                          <span className="min-w-0 truncate">Mailbox</span>
-                      </span>
-                      <p className="min-w-0 truncate text-[9px] leading-tight text-cyan-100/70 sm:text-[10px] sm:leading-4">
-                        Your inbox · {outlookStatusLoading ? "Checking" : webhookStatusLabel(webhookStatus?.status)}
-                      </p>
-                    </div>
-                  </button>
-                </div>
+              </div>
             </div>
           </div>
 
