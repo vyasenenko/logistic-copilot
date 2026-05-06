@@ -19,7 +19,7 @@ const SERVER_TOAST_SNAPSHOT: ToastRecord[] = [];
 
 let toasts: ToastRecord[] = [];
 const listeners = new Set<() => void>();
-const dismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const dismissTimers = new Map<string, number>();
 
 function emit() {
   listeners.forEach((listener) => listener());
@@ -48,7 +48,7 @@ export function getServerToastSnapshot(): ToastRecord[] {
 export function dismissToast(id: string) {
   const timer = dismissTimers.get(id);
   if (timer) {
-    clearTimeout(timer);
+    window.clearTimeout(timer);
     dismissTimers.delete(id);
   }
   const next = toasts.filter((item) => item.id !== id);
@@ -76,7 +76,7 @@ export function showToast(message: string, options?: ToastOptions) {
   for (const oldId of previousIds) {
     if (!nextIds.has(oldId)) {
       const timer = dismissTimers.get(oldId);
-      if (timer) clearTimeout(timer);
+      if (timer) window.clearTimeout(timer);
       dismissTimers.delete(oldId);
     }
   }

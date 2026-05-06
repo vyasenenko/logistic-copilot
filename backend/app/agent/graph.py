@@ -28,6 +28,7 @@ from langgraph.graph import END, StateGraph
 from app.agent.llm import get_primary_llm
 from app.agent.prompts import SYSTEM_PROMPT
 from app.agent.runtime import (
+    get_current_user_context,
     reset_current_conversation_id,
     reset_current_user_context,
     set_current_conversation_id,
@@ -35,16 +36,16 @@ from app.agent.runtime import (
 )
 from app.agent.state import AgentState
 from app.services.auth import CurrentUserContext
-from app.tools.registry import get_all_tools
+from app.tools.registry import get_all_tools_unfiltered, get_tools_for_context
 
 
-def _build_graph() -> StateGraph:
-    """Build and compile the ReAct agent graph."""
+def _build_graph(*, tools: list) -> StateGraph:
+    """Build and compile the ReAct agent graph for a specific tool set."""
 
-    tools = get_all_tools()
     tools_by_name = {tool.name: tool for tool in tools}
+    all_tools_by_name = {tool.name: tool for tool in get_all_tools_unfiltered()}
 
-    # Bind tools to the LLM so it can emit tool_calls
+    # Bind tools to the LLM so it can emit tool_calls.
     llm = get_primary_llm().bind_tools(tools)
 
     # ---- Nodes ----
@@ -66,14 +67,33 @@ def _build_graph() -> StateGraph:
         last_message: AIMessage = state.messages[-1]
 
         for tool_call in last_message.tool_calls:
-            tool = tools_by_name.get(tool_call["name"])
+            tool_name = tool_call["name"]
+            tool = tools_by_name.get(tool_name)
             if tool is None:
-                result = f"Error: tool '{tool_call['name']}' not found."
+                # Tool exists but is not permitted for this context.
+                if tool_name in all_tools_by_name:
+                    result = "Permission denied: viewer is read-only."
+                else:
+                    result = f"Error: tool '{tool_name}' not found."
             else:
-                try:
-                    result = await tool.ainvoke(tool_call["args"])
-                except Exception as e:
-                    result = f"Error executing {tool_call['name']}: {e}"
+                # Defense-in-depth: even allowed tools can add their own checks,
+                # but we keep a runtime guard here as a backstop.
+                ctx = get_current_user_context()
+                if ctx is not None and (ctx.role or "").strip().lower() == "viewer":
+                    # If a viewer somehow triggers a non-allowlisted tool (e.g. stale client),
+                    # block execution.
+                    if tool_name not in {t.name for t in get_tools_for_context(ctx)}:
+                        result = "Permission denied: viewer is read-only."
+                    else:
+                        try:
+                            result = await tool.ainvoke(tool_call["args"])
+                        except Exception as e:
+                            result = f"Error executing {tool_name}: {e}"
+                else:
+                    try:
+                        result = await tool.ainvoke(tool_call["args"])
+                    except Exception as e:
+                        result = f"Error executing {tool_name}: {e}"
 
             state.messages.append(
                 ToolMessage(content=str(result), tool_call_id=tool_call["id"])
@@ -113,10 +133,6 @@ def _build_graph() -> StateGraph:
     graph.add_edge("tools_node", "agent_node")  # loop back
 
     return graph.compile()
-
-
-# Singleton compiled graph
-agent_graph = _build_graph()
 
 
 def _tool_start_sse_payload(event: dict) -> dict[str, Any]:
@@ -162,6 +178,8 @@ async def run_agent(
     conversation_token = set_current_conversation_id(conversation_id)
     user_context_token = set_current_user_context(user_context)
     try:
+        tools = get_tools_for_context(user_context)
+        agent_graph = _build_graph(tools=tools)
         final_state = await agent_graph.ainvoke(initial_state)
         return final_state
     finally:
@@ -188,6 +206,8 @@ async def run_agent_stream(
     user_context_token = set_current_user_context(user_context)
     try:
         try:
+            tools = get_tools_for_context(user_context)
+            agent_graph = _build_graph(tools=tools)
             async for event in agent_graph.astream_events(initial_state, version="v2"):
                 kind = event["event"]
 

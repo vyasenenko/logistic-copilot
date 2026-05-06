@@ -7,6 +7,8 @@ Add new tools here and register them in registry.py.
 import httpx
 from langchain_core.tools import tool
 
+from app.agent.runtime import get_current_user_context
+
 
 @tool
 async def web_search(query: str) -> str:
@@ -44,11 +46,16 @@ async def http_request(url: str, method: str = "GET") -> str:
         url: The URL to request.
         method: HTTP method (GET or POST).
     """
-    if method.upper() not in ("GET", "POST"):
+    method_norm = method.upper().strip()
+    if method_norm not in ("GET", "POST"):
         return "Error: only GET and POST methods are supported."
 
+    context = get_current_user_context()
+    if method_norm == "POST" and context is not None and (context.role or "").strip().lower() == "viewer":
+        return "Error: permission denied (viewer is read-only; POST is not allowed)."
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.request(method.upper(), url)
+        resp = await client.request(method_norm, url)
         content_type = resp.headers.get("content-type", "")
 
         if "json" in content_type:

@@ -4055,7 +4055,7 @@ export function FreightDashboardWorkspace() {
 
         <div className="flex flex-col gap-4">
           <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
-              <div className="mb-4 flex items-center justify-between">
+              <div className="mb-4 flex flex-col gap-4 min-[1280px]:flex-row min-[1280px]:items-center min-[1280px]:justify-between">
                 <div>
                   <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Operational context</p>
                   <h3 className="mt-1 text-xl font-semibold text-white">Open only what you need</h3>
@@ -4075,7 +4075,7 @@ export function FreightDashboardWorkspace() {
 
               {workspaceSection === "overview" && (
                 <div className="space-y-4">
-                  <div className="grid gap-3 md:grid-cols-2">
+                  <div className="grid gap-3 min-[1280px]:grid-cols-2">
                     <div className="rounded-2xl bg-white/5 p-4">
                       <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">AI parsing</p>
                       <p className="mt-2 text-white">Intent: {selectedShipment.ai_intent || "not classified"}</p>
@@ -4106,7 +4106,7 @@ export function FreightDashboardWorkspace() {
                       )}
                     </div>
                     <div
-                      className={`rounded-[24px] border p-5 md:col-span-2 ${
+                      className={`rounded-[24px] border p-5 min-[1280px]:col-span-2 ${
                         senderTrustGateActive(selectedShipment)
                           ? "border-amber-300/35 bg-gradient-to-br from-amber-300/14 via-slate-950/50 to-rose-300/12 shadow-[0_20px_60px_rgba(0,0,0,0.35)]"
                           : selectedShipment.sender_verified_at
@@ -4114,8 +4114,8 @@ export function FreightDashboardWorkspace() {
                             : "border-white/10 bg-white/[0.04]"
                       }`}
                     >
-                      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                        <div className="space-y-2">
+                      <div className="flex flex-col gap-4 min-[1280px]:flex-row min-[1280px]:items-start min-[1280px]:justify-between">
+                        <div className="min-w-0 flex-1 space-y-2">
                           <div className="flex flex-wrap items-center gap-2">
                             {senderTrustGateActive(selectedShipment) ? (
                               <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-300/30 bg-amber-300/15 px-3 py-1 text-xs font-medium text-amber-50">
@@ -4149,7 +4149,7 @@ export function FreightDashboardWorkspace() {
                             ) : null}
                           </p>
                         </div>
-                        <div className="min-w-[240px] max-w-md rounded-2xl border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)]">
+                        <div className="w-full min-w-0 rounded-2xl border border-white/10 bg-slate-950/40 p-4 text-sm text-[var(--text-muted)] min-[1280px]:w-auto min-[1280px]:min-w-[240px] min-[1280px]:max-w-md">
                           <p className="text-xs uppercase tracking-[0.16em] text-white/50">Verification status</p>
                           <p className="mt-2 text-white">
                             {selectedShipment.sender_verified_at
@@ -4179,7 +4179,7 @@ export function FreightDashboardWorkspace() {
                       ) : senderTrustGateActive(selectedShipment) ? (
                         <div className="mt-4 space-y-4 border-t border-white/10 pt-4">
                           <div className="rounded-[22px] border border-cyan-300/18 bg-cyan-300/[0.06] p-4">
-                            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                            <div className="flex flex-col gap-2 min-[1280px]:flex-row min-[1280px]:items-start min-[1280px]:justify-between">
                               <div>
                                 <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/70">Verify sender</p>
                                 <h4 className="mt-1 text-lg font-semibold text-white">Identify who owns this email</h4>
@@ -4193,7 +4193,7 @@ export function FreightDashboardWorkspace() {
                             </div>
                           </div>
 
-                          <div className="grid gap-3 xl:grid-cols-3">
+                          <div className="grid grid-cols-1 gap-3 min-[1280px]:grid-cols-3">
                             <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
                               <div className="flex items-center gap-2">
                                 <span className="flex h-7 w-7 items-center justify-center rounded-full bg-white/10 text-xs font-semibold text-white">1</span>
@@ -4307,7 +4307,7 @@ export function FreightDashboardWorkspace() {
                           </div>
 
                           <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
-                            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                            <div className="flex flex-col gap-3 min-[1280px]:flex-row min-[1280px]:items-center min-[1280px]:justify-between">
                               <div>
                                 <p className="text-sm font-semibold text-white">
                                   {senderIdentityRole === "customer" ? (senderClientId ? "Link customer" : "Create customer") : senderCarrierId ? "Link carrier" : "Create carrier"} and verify{" "}
@@ -4329,14 +4329,14 @@ export function FreightDashboardWorkspace() {
                           </div>
 
                           <div className="rounded-2xl border border-rose-300/20 bg-rose-300/8 p-4">
-                            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                            <div className="flex flex-col gap-3 min-[1280px]:flex-row min-[1280px]:items-center min-[1280px]:justify-between">
                               <div>
                                 <p className="text-sm font-semibold text-rose-50">Fraud or spam?</p>
                                 <p className="mt-1 text-xs leading-5 text-rose-100/75">
                                   Blocking creates a denylist entry and archives this thread.
                                 </p>
                               </div>
-                              <div className="grid gap-2 sm:grid-cols-2">
+                              <div className="grid w-full min-w-0 grid-cols-1 gap-2 min-[1280px]:w-auto min-[1280px]:grid-cols-2">
                                 <button
                                   onClick={() => openFraudArchiveDialog(selectedShipment.id, "sender_email")}
                                   disabled={submitting !== null}
@@ -4392,7 +4392,7 @@ export function FreightDashboardWorkspace() {
 
               {workspaceSection === "bids" && (
                 <div className="space-y-4">
-                  <div className="grid gap-3 md:grid-cols-4">
+                  <div className="grid grid-cols-1 gap-3 min-[1280px]:grid-cols-4">
                     <button onClick={() => void handleEvaluateBids()} disabled={bids.length === 0 || submitting !== null} className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">
                       Evaluate bids
                     </button>
@@ -4429,7 +4429,7 @@ export function FreightDashboardWorkspace() {
                           </div>
                           <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white">{bid.status}</span>
                         </div>
-                        <div className="mt-3 grid gap-3 sm:grid-cols-3 text-sm">
+                        <div className="mt-3 grid grid-cols-1 gap-3 text-sm min-[1280px]:grid-cols-3">
                           <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Amount</p><p className="mt-1 text-white">{bid.amount ? `$${bid.amount.toFixed(2)}` : "--"}</p></div>
                           <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">ETA</p><p className="mt-1 text-white">{bid.eta_text || "--"}</p></div>
                           <div><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Score</p><p className="mt-1 text-white">{bid.score.total ?? "--"}</p></div>
@@ -4440,13 +4440,13 @@ export function FreightDashboardWorkspace() {
 
                   <form className="rounded-2xl bg-white/5 p-4" onSubmit={handleIntakeBid}>
                     <p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Manual bid intake</p>
-                    <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                    <div className="mt-3 grid grid-cols-1 gap-3 min-[1280px]:grid-cols-2">
                       <select className="field-input" value={bidForm.carrier_id} onChange={(event) => setBidForm((current) => ({ ...current, carrier_id: event.target.value }))}>
                         {carriers.map((carrier) => <option key={carrier.id} value={carrier.id}>{carrier.name}</option>)}
                       </select>
                       <input className="field-input" value={bidForm.amount} onChange={(event) => setBidForm((current) => ({ ...current, amount: event.target.value }))} placeholder="Amount" />
-                      <input className="field-input sm:col-span-2" value={bidForm.eta_text} onChange={(event) => setBidForm((current) => ({ ...current, eta_text: event.target.value }))} placeholder="ETA / timing" />
-                      <textarea className="field-input min-h-[100px] resize-none sm:col-span-2" value={bidForm.raw_email} onChange={(event) => setBidForm((current) => ({ ...current, raw_email: event.target.value }))} placeholder="Carrier reply" />
+                      <input className="field-input min-[1280px]:col-span-2" value={bidForm.eta_text} onChange={(event) => setBidForm((current) => ({ ...current, eta_text: event.target.value }))} placeholder="ETA / timing" />
+                      <textarea className="field-input min-h-[100px] resize-none min-[1280px]:col-span-2" value={bidForm.raw_email} onChange={(event) => setBidForm((current) => ({ ...current, raw_email: event.target.value }))} placeholder="Carrier reply" />
                     </div>
                     <button className="action-button mt-3 bg-white/10 text-white hover:bg-white/15" disabled={submitting !== null}>Record bid</button>
                   </form>
@@ -4473,13 +4473,13 @@ export function FreightDashboardWorkspace() {
 
               {workspaceSection === "status" && (
                 <div className="space-y-4">
-                  <div className="grid gap-3 sm:grid-cols-4">
+                  <div className="grid grid-cols-2 gap-3 min-[1280px]:grid-cols-4">
                     <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Status</p><p className="mt-2 text-white">{selectedShipment.last_known_status || "Unknown"}</p></div>
                     <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">ETA</p><p className="mt-2 text-white">{selectedShipment.last_known_eta || "Not available"}</p></div>
                     <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Location</p><p className="mt-2 text-white">{selectedShipment.last_known_location || "Not available"}</p></div>
                     <div className="rounded-2xl bg-white/5 p-4"><p className="text-xs uppercase tracking-[0.16em] text-[var(--text-muted)]">Age</p><p className="mt-2 text-white">{formatAge(selectedShipment.last_status_event_at)}</p></div>
                   </div>
-                  <div className="grid gap-3 md:grid-cols-3">
+                  <div className="grid grid-cols-1 gap-3 min-[1280px]:grid-cols-3">
                     <button onClick={() => void handleOperatorAction("rerun_status_lookup")} disabled={submitting !== null} className="action-button bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Re-run status lookup</button>
                     <button onClick={() => void handlePreviewStatusReply()} disabled={submitting !== null} className="action-button bg-white/10 text-white hover:bg-white/15 disabled:opacity-50">Preview status reply</button>
                     <button onClick={() => void handlePreviewTmsHandoff()} disabled={submitting !== null} className="action-button bg-rose-300/15 text-rose-100 hover:bg-rose-300/20 disabled:opacity-50">Preview TMS handoff</button>
@@ -4501,7 +4501,7 @@ export function FreightDashboardWorkspace() {
 
               {workspaceSection === "docs" && (
                 <div className="space-y-4">
-                  <div className="grid gap-3 md:grid-cols-3">
+                  <div className="grid grid-cols-1 gap-3 min-[1280px]:grid-cols-3">
                     <button onClick={() => void handleOperatorAction("rerun_document_extraction")} disabled={submitting !== null} className="action-button bg-cyan-300/15 text-cyan-100 hover:bg-cyan-300/20 disabled:opacity-50">Re-run document extraction</button>
                     <button onClick={() => void handleOperatorAction("approve_document_values")} disabled={submitting !== null} className="action-button bg-emerald-300/15 text-emerald-100 hover:bg-emerald-300/20 disabled:opacity-50">Approve document values</button>
                     <button onClick={() => void handleOperatorAction("ignore_document_warning")} disabled={submitting !== null} className="action-button bg-amber-300/15 text-amber-100 hover:bg-amber-300/20 disabled:opacity-50">Ignore warning</button>
@@ -4536,7 +4536,7 @@ export function FreightDashboardWorkspace() {
               )}
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr),220px]">
+          <div className="grid grid-cols-1 gap-4 min-[1280px]:grid-cols-[minmax(0,1fr),220px]">
             <div className="rounded-[28px] border border-white/10 bg-white/[0.03] p-5">
               <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Secondary actions</p>
               <div className="mt-4 grid gap-2">
@@ -4561,26 +4561,22 @@ export function FreightDashboardWorkspace() {
                 ))}
               </div>
               {selectedShipment && (
-                <div className="mt-4 rounded-[20px] border border-amber-300/18 bg-amber-300/6 p-3">
-                  <div className="flex items-center gap-3">
-                    <div className="rounded-full bg-amber-300/12 p-2 text-amber-100">
-                      <Archive size={16} />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium leading-5 text-amber-50">Archive invalid shipment</p>
-                      <p className="text-xs leading-5 text-amber-100/70">
-                        Remove from live board and ignore its source thread on future syncs.
-                      </p>
-                    </div>
-                    <button
-                      onClick={() => void handleOperatorAction("archive_shipment", selectedShipment.id)}
-                      disabled={submitting !== null}
-                      className="action-button shrink-0 bg-amber-300/16 px-3 py-2 text-sm text-amber-50 hover:bg-amber-300/22 disabled:opacity-50"
-                    >
-                      <Archive size={14} className="mr-2" /> Archive
-                    </button>
-                  </div>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleOperatorAction("archive_shipment", selectedShipment.id)}
+                  disabled={submitting !== null}
+                  className="action-button mt-3 !inline-flex w-full !items-start !justify-start gap-3 !rounded-[16px] border border-amber-300/18 bg-amber-300/5 px-3 py-2.5 text-left hover:bg-amber-300/10 disabled:opacity-50"
+                >
+                  <span className="flex size-8 shrink-0 items-center justify-center rounded-[14px] border border-amber-300/16 bg-amber-300/10 text-amber-100">
+                    <Archive size={14} strokeWidth={2} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-semibold leading-snug text-amber-50">Archive shipment</span>
+                    <span className="mt-0.5 block text-[11px] leading-snug text-amber-100/72">
+                      Removes from the live board and ignores the source thread on future syncs.
+                    </span>
+                  </span>
+                </button>
               )}
             </div>
 
@@ -4799,7 +4795,7 @@ export function FreightDashboardWorkspace() {
     }
 
     return (
-      <aside className="pointer-events-auto fixed top-6 right-[calc(50vw+160px)] bottom-6 z-[45] hidden w-[475px] overflow-hidden rounded-[30px] border border-cyan-300/14 bg-[linear-gradient(135deg,rgba(7,15,25,0.94),rgba(11,23,37,0.9)_46%,rgba(17,34,52,0.92)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.13),transparent_28%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.11),transparent_24%)] shadow-[-20px_22px_80px_rgba(0,0,0,0.32)] backdrop-blur-xl xl:flex">
+      <aside className="pointer-events-auto fixed top-4 bottom-4 z-[45] hidden w-[400px] overflow-hidden rounded-[30px] border border-cyan-300/14 bg-[linear-gradient(135deg,rgba(7,15,25,0.94),rgba(11,23,37,0.9)_46%,rgba(17,34,52,0.92)),radial-gradient(circle_at_0%_0%,rgba(108,213,255,0.13),transparent_28%),radial-gradient(circle_at_100%_0%,rgba(61,139,255,0.11),transparent_24%)] shadow-[-20px_22px_80px_rgba(0,0,0,0.32)] backdrop-blur-xl right-[544px] xl:flex min-[1280px]:top-6 min-[1280px]:bottom-6 min-[1280px]:right-[calc(50vw+160px)] min-[1280px]:w-[475px]">
         {renderThreadPanel()}
       </aside>
     );
@@ -4853,8 +4849,13 @@ export function FreightDashboardWorkspace() {
               aria-label="Dashboard summary"
             >
               {metrics.map((metric) => (
-                <div key={metric.label} className="flex max-lg:h-full min-h-[58px] min-w-0 flex-col rounded-[11px] border border-cyan-200/10 bg-slate-950/26 px-2 py-1.5 backdrop-blur sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2 lg:h-auto">
-                  <p className="text-[9px] uppercase tracking-[0.2em] text-cyan-200/48 sm:text-[10px] sm:tracking-[0.22em]">{metric.label}</p>
+                <div
+                  key={metric.label}
+                  className="flex max-lg:h-full min-h-[58px] min-w-0 flex-col overflow-hidden rounded-[11px] border border-cyan-200/10 bg-slate-950/26 px-2 py-1.5 backdrop-blur sm:min-h-[60px] sm:rounded-[12px] sm:px-2.5 sm:py-2 lg:h-auto"
+                >
+                  <p className="min-w-0 truncate text-[9px] uppercase tracking-[0.2em] text-cyan-200/48 sm:text-[10px] sm:tracking-[0.22em]">
+                    {metric.label}
+                  </p>
                   <div className="mt-0.5 min-w-0 space-y-0.5 sm:mt-1">
                     <span className="block text-xl font-semibold leading-none text-white sm:text-[1.35rem]">{metric.value}</span>
                     <span
@@ -6544,16 +6545,18 @@ export function FreightDashboardWorkspace() {
               </div>
             </div>
             <aside
-              className={`fixed inset-y-0 top-0 right-0 z-50 !mt-0 h-[100dvh] w-full max-w-[760px] border-l border-white/10 bg-[linear-gradient(180deg,rgba(13,21,32,0.98),rgba(9,16,26,0.96))] shadow-2xl transition-transform duration-300 ${
+              className={`fixed inset-y-0 top-0 right-0 z-50 !mt-0 h-[100dvh] w-full max-w-[520px] border-l border-white/10 bg-[linear-gradient(180deg,rgba(13,21,32,0.98),rgba(9,16,26,0.96))] shadow-2xl transition-transform duration-300 min-[1280px]:max-w-[760px] ${
                 drawerOpen ? "translate-x-0" : "translate-x-full"
               }`}
             >
               <div className="flex h-full flex-col">
                 <div className="shrink-0 border-b border-white/10">
-                  <div className="flex items-start justify-between gap-3 px-5 py-2.5">
+                  <div className="flex items-start justify-between gap-2 px-4 py-2 min-[1280px]:gap-3 min-[1280px]:px-5 min-[1280px]:py-2.5">
                     <div className="min-w-0">
                       <p className="text-xs uppercase tracking-[0.18em] text-[var(--text-muted)]">Shipment workspace</p>
-                      <p className="mt-0.5 text-lg font-medium text-white">{selectedShipment ? formatRoute(selectedShipment) : "No shipment selected"}</p>
+                      <p className="mt-0.5 text-base font-medium text-white min-[1280px]:text-lg">
+                        {selectedShipment ? formatRoute(selectedShipment) : "No shipment selected"}
+                      </p>
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         {selectedShipment?.quote_token && (
                           <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-[0.16em] text-[var(--text-muted)]">
@@ -6582,7 +6585,7 @@ export function FreightDashboardWorkspace() {
                     </div>
                   </div>
                   {selectedShipment ? (
-                    <div className="flex gap-2 border-t border-white/[0.06] bg-black/15 px-5 py-2 xl:hidden">
+                    <div className="flex gap-2 border-t border-white/[0.06] bg-black/15 px-4 py-1.5 min-[1280px]:px-5 min-[1280px]:py-2 xl:hidden">
                       {([
                         { key: "details", label: "Details" },
                         { key: "thread", label: "Thread" },
@@ -6604,7 +6607,7 @@ export function FreightDashboardWorkspace() {
                     </div>
                   ) : null}
                 </div>
-                <div ref={drawerScrollRef} className="flex-1 overflow-y-auto px-5 pb-5 pt-4">
+                <div ref={drawerScrollRef} className="flex-1 overflow-y-auto px-4 pb-4 pt-3 min-[1280px]:px-5 min-[1280px]:pb-5 min-[1280px]:pt-4">
                   {!selectedShipment ? (
                     renderShipmentWorkspace()
                   ) : (

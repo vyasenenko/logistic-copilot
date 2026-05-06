@@ -73,6 +73,14 @@ def _tool_context_or_error():
     return context, None
 
 
+def _require_freight_write_tool(context) -> str | None:
+    if context is None:
+        return "Error: authentication required."
+    if "*" in context.permissions or "freight:write" in context.permissions:
+        return None
+    return "Error: permission denied (freight:write required)."
+
+
 async def _get_tool_shipment(session, shipment_id: UUID, *, include_archived: bool = False) -> tuple[Shipment | None, str | None]:
     context, error = _tool_context_or_error()
     if error:
@@ -413,6 +421,12 @@ async def freight_update_shipment_details(
     clear_notes: bool = False,
 ) -> str:
     """Update active shipment details by UUID. Date fields accept local wall time only; UTC/timezone are derived automatically from route."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -462,6 +476,9 @@ async def freight_update_shipment_details_by_token(
     context, error = _tool_context_or_error()
     if error:
         return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     async with async_session() as session:
         result = await session.execute(
             select(Shipment).where(
@@ -691,6 +708,12 @@ async def freight_archive_shipment(
     dry_run: bool = True,
 ) -> str:
     """Archive an active shipment and optionally suppress its source thread. Prefer dry_run=True unless user explicitly asks to archive."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -865,6 +888,12 @@ async def freight_list_carriers() -> str:
 @tool
 async def freight_evaluate_shipment_bids(shipment_id: str) -> str:
     """Score priced bids for a shipment and select a recommended carrier (persists evaluation)."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -892,6 +921,12 @@ async def freight_intake_carrier_bid(
     create_carrier_if_missing: bool = False,
 ) -> str:
     """Record a carrier bid from email context (amount, carrier email, optional raw email body)."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -925,6 +960,12 @@ async def freight_send_customer_quote(
     custom_message: str | None = None,
 ) -> str:
     """Preview or send the customer quote email from the selected bid. Prefer dry_run=True first."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -953,6 +994,12 @@ async def freight_handoff_shipment_to_tms(
     bid_id: str | None = None,
 ) -> str:
     """Preview or submit the booked load payload to the configured TMS (dry_run recommended first)."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -976,6 +1023,12 @@ async def freight_send_carrier_outreach(
     custom_message: str | None = None,
 ) -> str:
     """Email active carriers for quotes. carrier_ids: comma-separated UUIDs, or empty string for all active."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -985,7 +1038,6 @@ async def freight_send_carrier_outreach(
         _shipment, error = await _get_tool_shipment(session, sid)
         if error:
             return error
-        context = get_current_user_context()
         if ids:
             for carrier_id in ids:
                 try:
@@ -1018,6 +1070,12 @@ async def freight_send_carrier_followup(
     subject: str | None = None,
 ) -> str:
     """Send a follow-up to one carrier. First outreach stays new; follow-ups reply in thread when possible."""
+    context, error = _tool_context_or_error()
+    if error:
+        return error
+    perm = _require_freight_write_tool(context)
+    if perm:
+        return perm
     try:
         sid = UUID(shipment_id.strip())
     except ValueError:
@@ -1028,7 +1086,6 @@ async def freight_send_carrier_followup(
         _shipment, error = await _get_tool_shipment(session, sid)
         if error:
             return error
-        context = get_current_user_context()
         if carrier_id:
             try:
                 cid = UUID(carrier_id)

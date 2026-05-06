@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from app.services.auth import CurrentUserContext, get_current_user_context
-from app.tools.registry import get_all_tools
+from app.tools.registry import get_tools_for_context
 
 router = APIRouter()
 
@@ -28,10 +28,9 @@ def _label_from_name(name: str) -> str:
 @router.get("/tools/metadata")
 def get_tools_metadata(context: CurrentUserContext = Depends(get_current_user_context)):
     """Return stable metadata for all registered tools."""
-    _ = context
     tools = []
     labels: dict[str, str] = {}
-    for tool in get_all_tools():
+    for tool in get_tools_for_context(context):
         name = str(getattr(tool, "name", "") or "").strip()
         if not name:
             continue
