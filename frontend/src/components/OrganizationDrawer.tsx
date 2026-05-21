@@ -20,14 +20,12 @@ import {
   X,
 } from "lucide-react";
 import { PUBLIC_API_URL as API_URL } from "@/constants/publicApi";
+import { CHROME_WEB_STORE_LOGISTIC_COPILOT_URL } from "@/constants/chromeExtension";
 import { notifyCopilotChromeExtensionLogout } from "@/lib/notifyChromeExtensionLogout";
 import { showToast } from "@/lib/toast-store";
 
 const AUTH_TOKEN_KEY = "logistic_copilot_auth_token";
 
-/** Logistic Copilot — Chrome Web Store listing (AI agent side panel). */
-const CHROME_WEB_STORE_LOGISTIC_COPILOT_URL =
-  "https://chromewebstore.google.com/detail/logistic-copilot/cgjgjfdnbdaahgmnalcjkockkogijhfj";
 
 interface CurrentUserResponse {
   user_id: string;
