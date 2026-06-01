@@ -63,6 +63,8 @@ SECTIONS: list[tuple[str, list[str]]] = [
             "k8s-helm-ingress-nginx",
             "k8s-bootstrap-infra",
             "k8s-ship-images",
+            "k8s-deploy",
+            "k8s-deploy-base",
         ],
     ),
     ("Help", ["help"]),

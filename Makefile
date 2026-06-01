@@ -55,7 +55,7 @@ endef
 	k8s-status k8s-get k8s-logs-backend k8s-logs-frontend k8s-describe-backend k8s-events \
 	k8s-certificates k8s-port-forward-backend \
 	k8s-do-kubeconfig k8s-helm-cert-manager k8s-helm-ingress-nginx \
-	k8s-bootstrap-infra k8s-ship-images
+	k8s-bootstrap-infra k8s-ship-images k8s-deploy k8s-deploy-base
 
 # =============================================================================
 # Help
@@ -298,7 +298,8 @@ clean-docker: ## docker image prune -f (unused images)
 # =============================================================================
 # Kubernetes — production (DOKS, Docker Hub, cert-manager + Let’s Encrypt)
 # =============================================================================
-# Typical: TAG=v1.2.3 make k8s-buildx-all && make k8s-apply-full && make k8s-rollout-restart
+# One-shot prod deploy: TAG=v1.2.3 make k8s-deploy
+# Image-only (manifests already applied): TAG=v1.2.3 make k8s-ship-images
 # On Apple Silicon always set PLATFORM=linux/amd64 for DOKS nodes unless you use arm nodes.
 
 K8S_DIR ?= k8s
@@ -493,3 +494,9 @@ k8s-bootstrap-infra: k8s-helm-ingress-nginx k8s-helm-cert-manager k8s-apply-lets
 
 k8s-ship-images: k8s-buildx-all k8s-rollout-restart ## Push TAG images and restart deployments (manifests already applied)
 	$(call log_ok,k8s-ship-images done)
+
+k8s-deploy-base: k8s-buildx-all k8s-apply-base k8s-rollout-restart ## Build, push, apply manifests (no secrets.yaml), rollout
+	$(call log_ok,k8s-deploy-base done — check: make k8s-status)
+
+k8s-deploy: k8s-buildx-all k8s-apply-full k8s-rollout-restart ## Build, push, apply all manifests (incl. secrets), rollout
+	$(call log_ok,k8s-deploy done — check: make k8s-status)
