@@ -17,14 +17,14 @@ WHITE = "\033[37m"
 
 SECTIONS: list[tuple[str, list[str]]] = [
     ("Environment", ["doctor", "env-init", "env-check", "env-set"]),
-    ("Install", ["install", "install-backend", "install-frontend", "install-mobile"]),
+    ("Install", ["install", "install-backend", "install-frontend"]),
     ("Docker Build", ["build", "build-nc", "pull"]),
     ("Docker Lifecycle", ["up", "up-d", "down", "stop", "restart", "restart-%", "rebuild", "destroy"]),
     ("Observability", ["ps", "status", "logs", "logs-json", "logs-%", "curl-health"]),
     ("Shells And Database", ["shell-backend", "shell-frontend", "psql"]),
     (
         "Quality",
-        ["test", "test-backend", "lint", "lint-backend", "lint-frontend", "lint-mobile", "format", "format-backend", "ci"],
+        ["test", "test-backend", "lint", "lint-backend", "lint-frontend", "format", "format-backend", "ci"],
     ),
     ("Cleanup", ["clean", "clean-docker"]),
     (

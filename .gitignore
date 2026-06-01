@@ -63,19 +63,6 @@ docker-compose.override.yml
 qdrant_storage/
 postgres_data/
 
-# Flutter / Dart (mobile/)
-**/doc/api/
-**/ios/Flutter/.last_build_id
-.dart_tool/
-**/flutter/ephemeral/
-**/build/
-**/ios/Pods/
-**/ios/.symlinks/
-**/android/.gradle/
-**/android/captures/
-**/android/**/generated/
-*.iml
-
 # Certificates / keys (never commit real secrets)
 *.pem
 *.p12

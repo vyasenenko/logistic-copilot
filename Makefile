@@ -36,14 +36,14 @@ define log_err
 endef
 
 # --- Phony targets ------------------------------------------------------------
-.PHONY: help doctor env-init env-check env-set install install-backend install-frontend install-mobile \
+.PHONY: help doctor env-init env-check env-set install install-backend install-frontend \
 	build build-nc pull up up-d down stop restart \
 	$(addprefix restart-,$(STACK_SERVICES)) \
 	logs logs-json \
 	$(addprefix logs-,$(STACK_SERVICES)) \
 	ps shell-backend shell-frontend psql \
 	rebuild destroy clean clean-docker \
-	test test-backend lint lint-backend lint-frontend lint-mobile \
+	test test-backend lint lint-backend lint-frontend \
 	format format-backend ci status curl-health \
 	k8s-vars k8s-context \
 	k8s-buildx-backend k8s-buildx-frontend k8s-buildx-all k8s-release \
@@ -80,7 +80,6 @@ doctor: ## Print local tool versions and runtime availability.
 	$(Q)command -v $(PYTHON) >/dev/null && $(PYTHON) --version || true
 	$(Q)command -v node >/dev/null && node --version || printf '  (node not on PATH — OK if you only use Docker for frontend)\n'
 	$(Q)command -v npm >/dev/null && npm --version || true
-	$(Q)command -v flutter >/dev/null && flutter --version | head -n 1 || printf '  (flutter not on PATH)\n'
 	$(Q)printf '\n'
 	$(call log_ok,doctor finished)
 
@@ -112,7 +111,7 @@ env-set: ## Set one .env value safely: make env-set KEY=NAME VALUE='secret'
 # Dependencies (host)
 # =============================================================================
 
-install: install-backend install-frontend install-mobile ## Install dependencies locally: backend, frontend, mobile
+install: install-backend install-frontend ## Install dependencies locally: backend and frontend
 	$(call log_ok,install complete)
 
 install-backend: ## pip install -e "backend[dev]" (editable install + dev extras)
@@ -124,11 +123,6 @@ install-frontend: ## npm ci in frontend directory
 	$(call log_info,npm ci — frontend)
 	$(Q)cd frontend && npm ci
 	$(call log_ok,frontend node_modules ready)
-
-install-mobile: ## flutter pub get in mobile directory
-	$(call log_info,flutter pub get — mobile)
-	$(Q)cd mobile && flutter pub get
-	$(call log_ok,mobile deps ready)
 
 # =============================================================================
 # Docker — build & registry
@@ -259,7 +253,7 @@ test-backend: ## pytest in backend/ (extra args: ARGS='-v -k name')
 	$(Q)cd backend && $(PYTHON) -m pytest $(ARGS)
 	$(call log_ok,pytest done)
 
-lint: lint-backend lint-frontend lint-mobile ## Run all linters
+lint: lint-backend lint-frontend ## Run all linters
 	$(call log_ok,lint complete)
 
 lint-backend: ## ruff check in backend
@@ -271,11 +265,6 @@ lint-frontend: ## next lint in frontend
 	$(call log_info,npm run lint — frontend)
 	$(Q)cd frontend && npm run lint
 	$(call log_ok,next lint ok)
-
-lint-mobile: ## flutter analyze in mobile
-	$(call log_info,flutter analyze — mobile)
-	$(Q)cd mobile && flutter analyze
-	$(call log_ok,flutter analyze ok)
 
 format: format-backend ## Format code (backend via ruff for now)
 
@@ -291,14 +280,13 @@ ci: lint test ## Like CI: lint then test
 # Cleanup
 # =============================================================================
 
-clean: ## Remove local Python/Node/Flutter caches (not docker volumes)
-	$(call log_info,Cleaning local caches under backend/ frontend/ mobile/)
+clean: ## Remove local Python/Node caches (not docker volumes)
+	$(call log_info,Cleaning local caches under backend/ and frontend/)
 	$(Q)find backend -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	$(Q)find backend -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	$(Q)find backend -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 	$(Q)find backend -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	$(Q)rm -rf frontend/.next frontend/node_modules/.cache
-	$(Q)rm -rf mobile/build mobile/.dart_tool
 	$(Q)rm -f "$(PROJECT_ROOT).k8s-dotenv.mk"
 	$(call log_ok,clean done)
 
