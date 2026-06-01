@@ -34,11 +34,7 @@ export function LandingProductPreview() {
         </h2>
         <p className="mx-auto mt-3 max-w-xl text-center text-sm leading-relaxed text-slate-500">{PRODUCT_PREVIEW.subcopy}</p>
 
-        <div className="relative mt-12 lg:mt-14">
-          <div
-            className="pointer-events-none absolute left-1/2 top-1/2 hidden h-px w-[72%] -translate-x-1/2 -translate-y-1/2 bg-gradient-to-r from-transparent via-cyan-400/35 to-transparent lg:block"
-            aria-hidden
-          />
+        <div className="mt-12 lg:mt-14">
           <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.15fr)] lg:items-stretch lg:gap-5">
             {/* Inbox */}
             <PreviewChrome title={PRODUCT_PREVIEW.inboxTitle}>
@@ -71,7 +67,7 @@ export function LandingProductPreview() {
                 <ArrowRight size={18} className="text-cyan-200" />
               </div>
               <p className="max-w-[4.5rem] text-center text-[9px] font-semibold uppercase tracking-[0.16em] text-cyan-200/60">
-                AI parse
+                AI
               </p>
             </div>
 
