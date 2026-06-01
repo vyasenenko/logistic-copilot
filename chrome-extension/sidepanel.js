@@ -843,7 +843,7 @@ function renderPageContext(snapshot) {
 
 function shouldAttachPageHint(text) {
   const haystack = String(text || '').toLowerCase();
-  return /(this page|current page|current tab|open page|open tab|that page|screen|form|what is on the page|look at the page|analyze the page|работай с текущей страницей|текущая страница|текущая вкладка|страниц[аеу]|вкладк[аеу]|что на странице|посмотри страницу|проанализируй страницу|заполни по странице)/i.test(
+  return /(this page|current page|current tab|open page|open tab|that page|screen|form|what is on the page|look at the page|analyze the page|fill.*page|work with.*page)/i.test(
     haystack
   );
 }

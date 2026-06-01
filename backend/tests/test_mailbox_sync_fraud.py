@@ -237,10 +237,10 @@ async def test_chrome_webstore_verification_email_does_not_create_shipment(monke
         provider_message_id="chrome-webstore-verify-1",
         conversation_id=None,
         internet_message_id="<chrome-webstore-verify-1@example.com>",
-        subject="Підтвердьте свою контактну електронну адресу",
+        subject="Confirm your contact email address",
         body_preview=(
-            "Шановний розробнику! Підтвердьте свою контактну електронну адресу "
-            "в обліковому записі видавця у Веб-магазині Chrome."
+            "Dear developer! Confirm your contact email address "
+            "in your publisher account in the Chrome Web Store."
         ),
         sender_email="chromewebstore-noreply@google.com",
         sender_name="Chrome Web Store",

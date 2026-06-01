@@ -1,11 +1,11 @@
 # Logistic Copilot — Document Quality Evaluation
 
-Этот слой нужен для безопасного улучшения `OCR + parsing` без ручной проверки каждого изменения в booking flow.
+This layer enables safer `OCR + parsing` improvements without manually checking every change in the booking flow.
 
-## Что проверяет evaluator
+## What the evaluator checks
 
 - `document_type`
-- наличие и exact-match ключевых полей
+- presence and exact-match of key fields
 - `review_required`
 - shipment-level enrichment
 - conflict detection
@@ -15,33 +15,33 @@
   - `ocr_confidence`
   - `field_confidence`
 
-## Где лежат samples
+## Where samples live
 
-- Manifest и synthetic fixtures: [backend/app/evals/fixtures/document_quality_samples.json](/Users/yasenenko/Documents/CopilotRunner/backend/app/evals/fixtures/document_quality_samples.json)
+- Manifest and synthetic fixtures: [backend/app/evals/fixtures/document_quality_samples.json](/Users/yasenenko/Documents/CopilotRunner/backend/app/evals/fixtures/document_quality_samples.json)
 
-## Как запускать
+## How to run
 
-Из директории `backend`:
+From the `backend` directory:
 
 ```bash
 python -m app.evals.document_quality
 ```
 
-С фильтром:
+With a filter:
 
 ```bash
 python -m app.evals.document_quality --sample-filter rate_confirmation
 ```
 
-С JSON-отчетом:
+With a JSON report:
 
 ```bash
 python -m app.evals.document_quality --json-out /tmp/document-quality.json
 ```
 
-## Как добавить новый sample
+## How to add a new sample
 
-Для каждого sample заполняем:
+For each sample, fill in:
 
 - `sample_id`
 - `document_family`
@@ -52,28 +52,28 @@ python -m app.evals.document_quality --json-out /tmp/document-quality.json
 - `notes`
 - `expectation`
 
-В `expectation` указываем:
+In `expectation`, specify:
 
 - `expected_document_type`
 - `expected_fields`
 - `expected_review_required`
-- `expected_enrichment_fields` при необходимости
-- `expected_conflict_fields` для conflict cases
+- `expected_enrichment_fields` when needed
+- `expected_conflict_fields` for conflict cases
 
-## Как читать mismatches
+## How to read mismatches
 
-- `document_type ...` — тип документа распознан неверно
-- `missing_field:<field>` — ожидаемое поле не извлечено
-- `field_value:<field> ...` — поле извлечено, но значение не совпало
-- `review_required ...` — review-routing отличается от expectation
-- `missing_enrichment:<field>` — shipment-level enrichment не поднялся
-- `conflict_fields ...` — conflict detection не совпала с expectation
+- `document_type ...` — document type recognized incorrectly
+- `missing_field:<field>` — expected field was not extracted
+- `field_value:<field> ...` — field extracted but value did not match
+- `review_required ...` — review routing differs from expectation
+- `missing_enrichment:<field>` — shipment-level enrichment was not applied
+- `conflict_fields ...` — conflict detection did not match expectation
 
-## Что дальше
+## Next steps
 
-Следующий подэтап после synthetic-first:
+Next sub-stage after synthetic-first:
 
-- подключить local-only real doc corpus вне git
-- добавить benchmark run по 10–20 обезличенным реальным файлам
-- расширить coverage на `POD`
-- при необходимости ввести CI threshold gating
+- connect a local-only real doc corpus outside git
+- add benchmark run on 10–20 anonymized real files
+- extend coverage to `POD`
+- introduce CI threshold gating if needed

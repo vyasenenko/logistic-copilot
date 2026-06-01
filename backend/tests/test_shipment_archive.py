@@ -264,7 +264,7 @@ def test_bounce_detector_flags_non_delivery_messages():
         conversation_id="conv-1",
         internet_message_id="<msg-1@example.com>",
         subject="Undeliverable: Quote request Newark to Miami",
-        body_preview="Не удалось выполнить доставку следующим получателям. Remote server returned 550 5.7.708",
+        body_preview="Delivery to the following recipients failed. Remote server returned 550 5.7.708",
         sender_email="postmaster@example.com",
         sender_name="Postmaster",
         recipients=["ops@example.com"],

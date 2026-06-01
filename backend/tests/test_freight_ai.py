@@ -166,12 +166,12 @@ def test_classify_short_ok_as_customer_quote_confirmation():
     assert result.confidence >= 0.85
 
 
-def test_classify_cyrillic_ok_with_outlook_quote_as_customer_quote_confirmation():
+def test_classify_short_ok_with_outlook_quote_as_customer_quote_confirmation():
     result = _classify_with_heuristics(
         {
             "subject": "Re: Quote Fresno, CA to Los Angeles, CA [Q-DC836F74]",
             "body_preview": (
-                "Окей\r\n\r\n"
+                "OK\r\n\r\n"
                 "Get Outlook for iOS\r\n"
                 "________________________________\r\n"
                 "From: Ops <ops@example.com>"

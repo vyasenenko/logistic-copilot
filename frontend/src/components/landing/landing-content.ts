@@ -46,6 +46,7 @@ export const HERO_PILLS = [
   { title: "Faster response", body: "Quote and status email handled in one flow" },
   { title: "Less manual work", body: "Stop re-keying lanes, dates, and bids" },
   { title: "Operator control", body: "Review gates before anything goes out" },
+  { title: "Safety zone", body: "Fraud checks and sender verification before automation runs" },
 ] as const;
 
 export const PAIN_ITEMS = [
@@ -185,6 +186,6 @@ export const FAQ_ITEMS: FaqItem[] = [
 export const FINAL_CTA_HEADLINE = "Ready to run freight from your inbox?";
 
 export const FINAL_CTA_SUBCOPY =
-  `Sign in to your ${PRODUCT_DISPLAY_NAME} workspace or book a walkthrough with our team.`;
+  `Sign in to your ${PRODUCT_DISPLAY_NAME} workspace to continue working with shipments, documents, bids, and status workflows.`;
 
 export const FOOTER_TAGLINE = `${PRODUCT_DISPLAY_NAME} — AI logistics workflow for freight brokers and dispatch teams.`;

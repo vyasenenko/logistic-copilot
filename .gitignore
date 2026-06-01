@@ -37,6 +37,7 @@ k8s/secrets.yaml
 .env
 .env.local
 .env.*.local
+.env-backups/
 
 # Kubernetes (local/generated; do not commit secrets)
 .k8s-dotenv.mk

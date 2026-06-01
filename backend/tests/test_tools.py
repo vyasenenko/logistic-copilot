@@ -8,7 +8,7 @@ from app.agent.runtime import reset_current_user_context, set_current_user_conte
 from app.services.auth import CurrentUserContext
 from app.tools.builtin import calculate, current_datetime
 from app.tools.freight_tools import get_freight_tools
-from app.tools.registry import get_tools_for_context
+from app.tools.registry import get_all_tools_unfiltered, get_tools_for_context
 
 
 def test_calculate():
@@ -40,6 +40,29 @@ def test_freight_shipment_listing_tools_are_registered():
     assert "freight_send_carrier_followup" in names
 
 
+def test_agent_registry_is_logistics_focused():
+    names = {tool.name for tool in get_all_tools_unfiltered()}
+
+    assert "current_datetime" in names
+    assert "freight_list_shipments" in names
+    assert "freight_send_customer_quote" in names
+
+    assert all(name == "current_datetime" or name.startswith("freight_") for name in names)
+    assert {
+        "web_search",
+        "http_request",
+        "calculate",
+        "save_to_memory",
+        "search_memory",
+        "browser_get_current_page_context",
+        "browser_get_current_page_excerpt",
+        "create_carousel",
+        "create_video_with_voiceover",
+        "list_uploaded_videos",
+        "list_available_voices",
+    }.isdisjoint(names)
+
+
 def _viewer_context() -> CurrentUserContext:
     return CurrentUserContext(
         user_id=uuid4(),
@@ -68,7 +91,10 @@ def test_registry_filters_mutating_tools_for_viewer():
     assert "freight_update_shipment_details" not in names
     assert "freight_archive_shipment" not in names
     assert "freight_send_customer_quote" not in names
+    assert "web_search" not in names
+    assert "http_request" not in names
     assert "save_to_memory" not in names
+    assert "browser_get_current_page_context" not in names
     assert "freight_get_overview" in names
 
 

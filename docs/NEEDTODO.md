@@ -1,89 +1,89 @@
 # Logistic Copilot — Need To Do Later
 
-Этот файл фиксирует задачи, которые мы осознанно не добивали сейчас, но к которым нужно вернуться позже.
+This file tracks tasks we intentionally deferred but should revisit later.
 
 ## Current Project Stage
 
-- `Phase 1`: functional MVP / operator-ready — закрыта
-- `Phase 2`: в активной реализации, сильно продвинута
-- `Phase 3`: следующий активный этап
+- `Phase 1`: functional MVP / operator-ready — done
+- `Phase 2`: actively in progress, substantially advanced
+- `Phase 3`: next active phase
 
 ## Carryover From Phase 2
 
 ### Document Processing Hardening
 
-- Подключить `real image OCR path` для `png/jpg/webp` вложений.
-- Решить, через что делать OCR:
+- Wire up `real image OCR path` for `png/jpg/webp` attachments.
+- Decide how to run OCR:
   - vision-capable LLM provider
-  - отдельный OCR service/backend
-- Добавить confidence/scoring для document extraction.
-- Добавить явный статус:
+  - dedicated OCR service/backend
+- Add confidence/scoring for document extraction.
+- Add explicit status:
   - `ocr_complete`
   - `ocr_failed`
   - `ocr_review_required`
-- Добавить retry/reprocess для OCR-heavy documents.
+- Add retry/reprocess for OCR-heavy documents.
 
 ### PDF / Attachment Processing
 
-- Улучшить extraction для реальных `rate confirmation`, `BOL`, `pickup docs`, `POD`.
-- Добавить parsing multi-page PDF, а не только первых страниц.
-- Добавить parsing для scanned PDF.
-- Добавить mapping extracted fields в shipment enrichment, а не только в TMS payload.
-- Добавить conflict detection между email body и extracted document data.
-- Подключить `real local-only document corpus` для quality benchmark поверх synthetic harness.
-- Добавить `provider benchmark runs` по реальным OCR-heavy файлам и сравнение `openai` vs `anthropic`.
-- Решить, когда вводить `CI threshold gating` для document quality metrics.
+- Improve extraction for real `rate confirmation`, `BOL`, `pickup docs`, `POD`.
+- Add multi-page PDF parsing, not only the first pages.
+- Add parsing for scanned PDFs.
+- Map extracted fields into shipment enrichment, not only TMS payload.
+- Add conflict detection between email body and extracted document data.
+- Connect a `real local-only document corpus` for quality benchmark on top of the synthetic harness.
+- Add `provider benchmark runs` on real OCR-heavy files and compare `openai` vs `anthropic`.
+- Decide when to introduce `CI threshold gating` for document quality metrics.
 
 ### Document-Aware Booking
 
-- Сделать document requirements rule-based, а не hardcoded.
-- Настроить per-client / per-flow required document policy.
-- Добавить strict mode:
+- Make document requirements rule-based instead of hardcoded.
+- Configure per-client / per-flow required document policy.
+- Add strict mode:
   - warning only
   - review required
   - block booking
-- Добавить document coverage summary в overview/dashboard metrics.
+- Add document coverage summary to overview/dashboard metrics.
 
 ## Phase 3 — Status Updates And Two-Way TMS/Email Sync
 
 ### Core Workflow
 
-- Научить систему распознавать `status request` от customer.
-- Научить систему распознавать `location / ETA update` от carrier.
-- Добавить agent path:
+- Teach the system to recognize customer `status request`.
+- Teach the system to recognize carrier `location / ETA update`.
+- Add agent path:
   - customer email -> TMS lookup -> draft/send reply
   - carrier email -> parse update -> push to TMS
-- Ввести отдельные intent types для status/update flows.
+- Introduce separate intent types for status/update flows.
 
 ### TMS Synchronization
 
-- Добавить read path из TMS:
+- Add read path from TMS:
   - ETA
   - location
   - shipment status
   - milestones
-- Добавить write path в TMS:
+- Add write path to TMS:
   - carrier location update
   - ETA change
   - status milestone update
-- Добавить idempotency для inbound status updates.
-- Добавить retry/error handling для TMS sync failures.
+- Add idempotency for inbound status updates.
+- Add retry/error handling for TMS sync failures.
 
 ### Email Automation
 
-- Добавить шаблоны customer status reply.
-- Добавить safe auto-send policy для status updates.
-- Добавить operator review для ambiguous status requests.
-- Добавить correlation между email thread и booked load/TMS entity.
+- Add customer status reply templates.
+- Add safe auto-send policy for status updates.
+- Add operator review for ambiguous status requests.
+- Add correlation between email thread and booked load/TMS entity.
 
 ### AI / Agent Layer
 
-- Расширить `classify_email_intent(...)` новыми intent:
+- Extend `classify_email_intent(...)` with new intents:
   - `customer_status_request`
   - `carrier_status_update`
   - `exception_or_issue`
-- Добавить extraction schema для status/update messages.
-- Добавить workflow decisions:
+- Add extraction schema for status/update messages.
+- Add workflow decisions:
   - `fetch_tms_status`
   - `reply_with_status`
   - `update_tms_status`
@@ -91,11 +91,11 @@
 
 ### Dashboard / Operator UX
 
-- Показать live shipment status timeline.
-- Показать last known ETA/location.
-- Добавить карточку status sync health.
-- Добавить review queue для status exceptions.
-- Дать оператору manual actions:
+- Show live shipment status timeline.
+- Show last known ETA/location.
+- Add status sync health card.
+- Add review queue for status exceptions.
+- Give operator manual actions:
   - `re-run status lookup`
   - `re-run TMS update`
   - `approve status reply`
@@ -106,7 +106,7 @@
 
 - rules engine
 - verification layer
-- Gmail integration
+- Outlook sync and webhook hardening
 - multi-user operations
 - roles / audit / permissions
 
@@ -120,9 +120,9 @@
 
 ## Notes
 
-- Не превращать Phase 3 в хаотичный набор email handlers.
-- Сохранять текущий принцип архитектуры:
+- Do not turn Phase 3 into a chaotic set of email handlers.
+- Keep the current architecture principle:
   - AI decides
   - deterministic services execute
   - workflow state persists
-- Не смешивать universal chat-agent и freight inbox orchestration.
+- Do not mix universal chat-agent and freight inbox orchestration.

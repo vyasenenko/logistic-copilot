@@ -76,7 +76,6 @@ def _looks_like_bounce_or_non_delivery(mailbox_message: OutlookMailboxMessage) -
         "returned mail",
     )
     body_hints = (
-        "не удалось выполнить доставку",
         "message not delivered",
         "remote server returned",
         "delivery to the following recipients failed",

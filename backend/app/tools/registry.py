@@ -1,4 +1,4 @@
-"""Tool registry — single place to collect all tools for the agent.
+"""Tool registry — single place to collect tools for the logistics agent.
 
 IMPORTANT: RBAC must be enforced server-side. Viewer users are read-only and must not
 be able to invoke mutating tools (even if a client UI exposes them).
@@ -6,27 +6,26 @@ be able to invoke mutating tools (even if a client UI exposes them).
 
 from langchain_core.tools import BaseTool
 
-from app.tools.browser_tools import get_browser_tools
-from app.tools.builtin import calculate, current_datetime, http_request, web_search
-from app.tools.memory_tools import save_to_memory, search_memory
+from app.tools.builtin import current_datetime
 from app.tools.freight_tools import get_freight_tools
 from app.services.auth import CurrentUserContext
 
 
 def _is_viewer(context: CurrentUserContext | None) -> bool:
+    if context is None:
+        return False
     return bool((context.role or "").strip().lower() == "viewer")
 
 
 def get_all_tools_unfiltered() -> list[BaseTool]:
-    """Return the full tool list (no RBAC filtering)."""
+    """Return the full logistics tool list (no RBAC filtering).
+
+    Keep this registry intentionally narrow. The agent is a logistics copilot, not a
+    general automation/content bot, so browser, memory, web, HTTP, carousel, audio,
+    and video tools should not be exposed here.
+    """
     return [
-        web_search,
-        http_request,
-        calculate,
         current_datetime,
-        save_to_memory,
-        search_memory,
-        *get_browser_tools(),
         *get_freight_tools(),
     ]
 
@@ -34,26 +33,14 @@ def get_all_tools_unfiltered() -> list[BaseTool]:
 def get_tools_for_context(context: CurrentUserContext | None) -> list[BaseTool]:
     """Return the tool list filtered by user context (RBAC).
 
-    Viewer users must be strictly read-only: no freight mutations, no memory writes, and
-    no arbitrary POST requests through http_request.
+    Viewer users must be strictly read-only: no freight mutations.
     """
     tools = get_all_tools_unfiltered()
     if not _is_viewer(context):
         return tools
 
     allowlist = {
-        # Built-ins (read-only)
-        "web_search",
-        "calculate",
         "current_datetime",
-        # Built-in HTTP (read-only for viewers; POST is blocked in-tool)
-        "http_request",
-        # Memory (read-only)
-        "search_memory",
-        # Browser context (read-only)
-        "browser_get_current_page_context",
-        "browser_get_current_page_excerpt",
-        # Freight (read-only)
         "freight_domain_foundation",
         "freight_get_overview",
         "freight_list_shipments",

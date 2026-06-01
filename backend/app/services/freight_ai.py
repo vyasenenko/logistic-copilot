@@ -77,7 +77,7 @@ QUOTE_REQUEST_HINTS = ("quote", "need to move", "need moved", "move", "load", "p
 BID_HINTS = ("all in", "can do", "rate", "quote back", "our quote", "best rate", "$")
 CONFIRM_HINTS = ("ok book", "please book", "book it", "go ahead and book", "approved", "confirmed", "confirm booking")
 SHORT_CONFIRM_PATTERN = re.compile(
-    r"^\s*(?:ok|okay|yes|yep|approved|confirmed|confirm|book it|ок|окей|да|подтверждаю|согласен|согласна)\s*[.!]?\s*$",
+    r"^\s*(?:ok|okay|yes|yep|approved|confirmed|confirm|book it)\s*[.!]?\s*$",
     re.IGNORECASE,
 )
 CONFIRMABLE_SHIPMENT_STATUSES = {"quoted", "awaiting_confirmation"}
@@ -430,7 +430,7 @@ async def classify_email_intent(email_context: dict) -> IntentResult:
             "even if the subject line repeats customer route text (Re: Quote request …). "
             "Prefer carrier_bid_reply over new_quote_request when known_carrier is set or sender_role is carrier and the body quotes or confirms a rate. "
             "When sender_role is client and shipment_status is quoted or awaiting_confirmation, "
-            "a short affirmative body such as OK, Okay, Yes, Confirm, Approved, Book it, Окей, ОК, Да, or Подтверждаю means customer_quote_confirmation.\n\n"
+            "a short affirmative body such as OK, Okay, Yes, Confirm, Approved, or Book it means customer_quote_confirmation.\n\n"
             f"{_context_blob(email_context)}"
         )
         result = await _invoke_structured_with_fallback(

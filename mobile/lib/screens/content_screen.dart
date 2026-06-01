@@ -149,12 +149,12 @@ class _ContentScreenState extends State<ContentScreen> {
     _showTopicDialog(
       context,
       title: 'Create Carousel',
-      hint: 'e.g., 7 советов по продуктивности',
+      hint: 'e.g., 7 productivity tips',
       onSubmit: (topic) {
         final chat = context.read<ChatProvider>();
         chat.sendMessage(
-          'Создай Instagram карусель на тему: "$topic". '
-          'Сгенерируй контент для слайдов и используй инструмент create_carousel.',
+          'Create an Instagram carousel on the topic: "$topic". '
+          'Generate slide content and use the create_carousel tool.',
         );
         // Switch to chat tab to see result
         _switchToChat(context);
@@ -177,13 +177,13 @@ class _ContentScreenState extends State<ContentScreen> {
     _showTopicDialog(
       context,
       title: 'Create Video',
-      hint: 'e.g., 5 привычек успешных людей',
+      hint: 'e.g., 5 habits of successful people',
       onSubmit: (topic) {
         final chat = context.read<ChatProvider>();
         chat.sendMessage(
-          'Создай видео на тему: "$topic". '
-          'Напиши сценарий, озвучь через ElevenLabs и собери видео из моих загруженных клипов. '
-          'Используй инструменты create_video_with_voiceover.',
+          'Create a video on the topic: "$topic". '
+          'Write a script, voice it with ElevenLabs, and assemble the video from my uploaded clips. '
+          'Use the create_video_with_voiceover tools.',
         );
         _switchToChat(context);
       },
