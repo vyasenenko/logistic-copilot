@@ -5,16 +5,17 @@ export const LANDING_NAV = [
   { href: "#workflow", label: "Workflow" },
   { href: "#features", label: "Features" },
   { href: "#extension", label: "Extension" },
+  { href: "#open-source", label: "Open source" },
   { href: "#faq", label: "FAQ" },
 ] as const;
 
 export const PRODUCT_PREVIEW = {
-  eyebrow: "See the control tower",
-  headline: "Inbox threads become shipments your team can run",
+  eyebrow: "AI workspace agent",
+  headline: "One agent understands your inbox, shipments, documents, and workflow",
   subcopy:
-    "A representative view of how Logistic Copilot connects Outlook intake, structured lanes, and the live operations board — without leaving email context behind.",
+    "A representative view of how Logistic Copilot monitors Outlook intake, shipment statuses, document signals, and live workflow events — so your team can ask what happened and what needs attention.",
   inboxTitle: "Outlook · Triage",
-  boardTitle: "Operations board",
+  boardTitle: "Agent workspace",
   inboxThreads: [
     { sender: "acme@shipper.com", subject: "Quote: Dallas → Chicago · 26 pallets", badge: "Quote", active: true },
     { sender: "carrier@linehaul.net", subject: "Re: RFQ Q-8842 — $2,450 all-in", badge: null, active: false },
@@ -31,22 +32,22 @@ export const PRODUCT_PREVIEW = {
     status: "Awaiting bid",
     tags: ["3 carrier replies", "Sender verified", "Ready today"],
   },
-  liveHint: "Workflow events stream to your org in real time",
-  flowLabels: ["Email classified", "Shipment structured", "Ops board updated"],
+  liveHint: "The agent keeps workflow status and document context current in real time",
+  flowLabels: ["Email understood", "Status explained", "Documents analyzed"],
 } as const;
 
-export const HERO_BADGE = "AI logistics workflow for brokers & dispatch";
+export const HERO_BADGE = "AI agent for freight workflow visibility";
 
-export const HERO_HEADLINE = "Turn your Outlook inbox into a freight operating system.";
+export const HERO_HEADLINE = "AI agent for your freight workspace.";
 
 export const HERO_SUBCOPY =
-  "Quote intake, shipment parsing, carrier outreach, bid evaluation, customer quotes, document processing, and status workflows — with operator control where automation should pause.";
+  "Logistic Copilot monitors your freight workspace: Outlook threads, shipment statuses, carrier replies, documents, bids, and workflow events. Ask what is happening, what changed, and what needs action — from the dashboard or the Chrome extension.";
 
 export const HERO_PILLS = [
-  { title: "Faster response", body: "Quote and status email handled in one flow" },
-  { title: "Less manual work", body: "Stop re-keying lanes, dates, and bids" },
-  { title: "Operator control", body: "Review gates before anything goes out" },
-  { title: "Safety zone", body: "Fraud checks and sender verification before automation runs" },
+  { title: "Workflow awareness", body: "The agent understands statuses, handoffs, and next steps" },
+  { title: "Inbox context", body: "Ask about emails, senders, quote requests, and carrier replies" },
+  { title: "Document analysis", body: "BOLs, rate confirmations, and attachments become usable context" },
+  { title: "Chrome side panel", body: "Work from Outlook or any browser tab with the same AI agent" },
 ] as const;
 
 export const PAIN_ITEMS = [
@@ -57,8 +58,8 @@ export const PAIN_ITEMS = [
   },
   {
     before: "Scattered tools",
-    after: "One control tower",
-    detail: "Triage, bids, documents, and status in a single workspace.",
+    after: "One AI workspace agent",
+    detail: "Ask about triage, bids, documents, shipment status, and workflow history in one place.",
   },
   {
     before: "Blind automation",
@@ -83,8 +84,8 @@ export const WORKFLOW_STEPS = [
 
 export const FEATURES = [
   {
-    title: "AI shipment extraction",
-    body: "Turn customer and carrier email into structured shipment records with confidence signals.",
+    title: "AI workflow agent",
+    body: "Ask what is happening across your workspace: email threads, shipment status, carrier replies, bids, documents, and next actions.",
   },
   {
     title: "Carrier bid automation",
@@ -92,7 +93,7 @@ export const FEATURES = [
   },
   {
     title: "Document OCR & parsing",
-    body: "Attachments become reviewable fields — approve or correct before they drive workflow.",
+    body: "Attachments become reviewable fields and agent context — ask what a document says before it drives workflow.",
   },
   {
     title: "Operator review queue",
@@ -100,11 +101,11 @@ export const FEATURES = [
   },
   {
     title: "Status workflows",
-    body: "Status lookups, customer replies, and ops queues for in-transit freight.",
+    body: "Status lookups, customer replies, and ops queues for in-transit freight, with the agent explaining what changed.",
   },
   {
-    title: "Outlook-first ops",
-    body: "Mailbox sync and thread context built for how brokers actually work.",
+    title: "Outlook and Chrome context",
+    body: "Mailbox sync plus a Chrome side panel, so the agent can help while you are working inside email or the web.",
   },
 ] as const;
 
@@ -115,7 +116,7 @@ export const TRUST_POINTS = [
   },
   {
     title: "Team visibility",
-    body: "Organization-scoped board with real-time workflow events across shipments.",
+    body: "Organization-scoped board with real-time workflow events the AI agent can summarize and explain.",
   },
   {
     title: "Role-based access",
@@ -125,9 +126,18 @@ export const TRUST_POINTS = [
 
 export const EXTENSION_SECTION = {
   label: "Chrome extension",
-  headline: "Your AI copilot lives in Chrome — next to Outlook and the web.",
+  headline: "Your AI agent lives in Chrome — next to Outlook and the web.",
   subcopy:
-    "Install the Logistic Copilot side panel to ask freight questions, use page context from the tab you are on, and stay signed in with your workspace — the same agent powers the dashboard and the extension.",
+    "Install the Logistic Copilot side panel to ask freight questions while you are in Outlook or another browser tab. The agent can use workspace context to explain which email arrived, which shipment it belongs to, what status changed, what a document contains, and what should happen next.",
+  agentHeadline: "Workspace-aware assistant",
+  agentBody:
+    "Use the extension as a live operations companion: ask about a sender, summarize a thread, check shipment status, review carrier bids, or understand documents without switching back to the dashboard.",
+  agentBullets: [
+    "Understands Outlook threads and sender context",
+    "Explains shipment status and workflow history",
+    "Answers questions about documents and attachments",
+    "Works from the Chrome side panel while you stay in your current tab",
+  ],
   antiFraudHeadline: "Built-in anti-fraud layer",
   antiFraudBody:
     "Suspicious senders are flagged before automation runs wild. Risk signals, sender verification gates, email and domain denylist actions, and operator review on triage keep bad threads off your live board.",
@@ -138,7 +148,7 @@ export const EXTENSION_SECTION = {
     "Human review queue for high-risk and ambiguous cases",
   ],
   installLabel: "Install on Chrome Web Store",
-  installHint: "Free to install · Side panel · Uses your workspace sign-in",
+  installHint: "Free to install · Chrome side panel · Uses your workspace sign-in",
 } as const;
 
 export const INTEGRATIONS = [
@@ -155,6 +165,16 @@ export const INTEGRATIONS = [
     body: "Preview and push booked loads to your configured TMS when the lane is won.",
   },
 ] as const;
+
+export const OPEN_SOURCE_SECTION = {
+  label: "Open source",
+  headline: "Built in the open for logistics teams.",
+  subcopy:
+    "Logistic Copilot is open source. Review the code, follow the roadmap, or reach out if you want to run it with your freight workflow.",
+  githubHref: "https://github.com/vyasenenko/logistic-copilot",
+  githubLabel: "View on GitHub",
+  contactEmail: "vitalii@logisticopilot.com",
+} as const;
 
 export type FaqItem = {
   question: string;
@@ -179,7 +199,12 @@ export const FAQ_ITEMS: FaqItem[] = [
   {
     question: "What does the AI actually do?",
     answer:
-      "It classifies email, extracts shipment data, drafts outreach, and scores bids. Operators stay in control — review gates, edits, and blocks before anything customer-facing sends.",
+      "It works as a workspace-aware freight agent: it classifies email, extracts shipment data, understands statuses, reads document context, drafts outreach, scores bids, and explains what is happening across your workflow. Operators stay in control — review gates, edits, and blocks before anything customer-facing sends.",
+  },
+  {
+    question: "Can I use it directly from email?",
+    answer:
+      "Yes. The Chrome extension opens Logistic Copilot as a side panel next to Outlook and the web, so you can ask about emails, shipment status, documents, bids, and workflow activity without leaving the tab you are working in.",
   },
 ];
 

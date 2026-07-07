@@ -76,6 +76,10 @@ class EnvSpec:
     def prod_required(self) -> bool:
         return boolish(self.metadata.get("prod_required"))
 
+    @property
+    def dev_placeholder_ok(self) -> bool:
+        return boolish(self.metadata.get("dev_placeholder_ok"))
+
 
 def boolish(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "y", "on", "required"}
@@ -228,8 +232,10 @@ def parse_backend_defaults(path: Path) -> dict[str, str]:
     return defaults
 
 
-def is_placeholder(value: str, spec: EnvSpec) -> bool:
+def is_placeholder(value: str, spec: EnvSpec, *, allow_dev_placeholder: bool = False) -> bool:
     normalized = value.strip().lower()
+    if allow_dev_placeholder and spec.dev_placeholder_ok and spec.default and normalized == spec.default.strip().lower():
+        return False
     if normalized in PLACEHOLDER_VALUES:
         return True
     if spec.prod_required and spec.default and value.strip() == spec.default.strip():
@@ -346,10 +352,14 @@ def main() -> int:
         for key, spec in specs.items()
         if key in values and not values[key].strip() and not (spec.required and not spec.allowed_empty)
     ]
+    allow_dev_placeholders = args.env.name == ".env"
     placeholders = [
         key
         for key, spec in specs.items()
-        if key in values and values[key].strip() and spec.required and is_placeholder(values[key], spec)
+        if key in values
+        and values[key].strip()
+        and spec.required
+        and is_placeholder(values[key], spec, allow_dev_placeholder=allow_dev_placeholders)
     ]
     policy_errors = custom_policy_errors(values)
     extra = [key for key in values if key not in specs]

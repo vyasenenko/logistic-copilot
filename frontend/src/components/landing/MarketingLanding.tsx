@@ -6,6 +6,7 @@ import {
   ArrowRight,
   BookOpen,
   ExternalLink,
+  Github,
   Inbox,
   Mail,
   Package2,
@@ -29,11 +30,13 @@ import {
   FINAL_CTA_SUBCOPY,
   FOOTER_TAGLINE,
   HERO_BADGE,
+  HERO_HEADLINE,
   HERO_PILLS,
   HERO_SUBCOPY,
   EXTENSION_SECTION,
   INTEGRATIONS,
   LANDING_NAV,
+  OPEN_SOURCE_SECTION,
   PAIN_ITEMS,
   TRUST_POINTS,
   WORKFLOW_STEPS,
@@ -131,8 +134,7 @@ export function MarketingLanding() {
                     {HERO_BADGE}
                   </div>
                   <h1 className="mt-6 text-[2.35rem] font-semibold leading-[1.08] tracking-[-0.04em] text-slate-50 sm:text-5xl lg:text-[3.25rem]">
-                    Turn your Outlook inbox into a{" "}
-                    <span className="landing-gradient-text">freight operating system</span>.
+                    {HERO_HEADLINE}
                   </h1>
                   <p className="mt-5 max-w-xl text-base leading-relaxed text-slate-400 sm:text-[1.05rem]">{HERO_SUBCOPY}</p>
                   <ul className="mt-10 grid gap-3 border-t border-white/[0.06] pt-8 sm:grid-cols-2">
@@ -305,19 +307,34 @@ export function MarketingLanding() {
                 <p className="mt-3 text-xs text-slate-600">{EXTENSION_SECTION.installHint}</p>
               </div>
               <div className="border-t border-white/[0.06] bg-black/25 p-8 sm:p-12 lg:border-t-0">
-                <div className="flex items-center gap-2 text-rose-200/90">
-                  <ShieldAlert size={18} aria-hidden />
-                  <span className="text-xs font-semibold uppercase tracking-[0.2em]">{EXTENSION_SECTION.antiFraudHeadline}</span>
+                <div className="flex items-center gap-2 text-cyan-100/90">
+                  <Sparkles size={18} aria-hidden />
+                  <span className="text-xs font-semibold uppercase tracking-[0.2em]">{EXTENSION_SECTION.agentHeadline}</span>
                 </div>
-                <p className="mt-4 text-sm leading-relaxed text-slate-400">{EXTENSION_SECTION.antiFraudBody}</p>
+                <p className="mt-4 text-sm leading-relaxed text-slate-400">{EXTENSION_SECTION.agentBody}</p>
                 <ul className="mt-6 space-y-4">
-                  {EXTENSION_SECTION.antiFraudBullets.map((bullet) => (
+                  {EXTENSION_SECTION.agentBullets.map((bullet) => (
                     <li key={bullet} className="flex gap-3 text-sm text-slate-300">
                       <span className="mt-2 size-1 shrink-0 rounded-full bg-cyan-400/80" aria-hidden />
                       {bullet}
                     </li>
                   ))}
                 </ul>
+                <div className="mt-8 border-t border-white/[0.06] pt-8">
+                  <div className="flex items-center gap-2 text-rose-200/90">
+                    <ShieldAlert size={18} aria-hidden />
+                    <span className="text-xs font-semibold uppercase tracking-[0.2em]">{EXTENSION_SECTION.antiFraudHeadline}</span>
+                  </div>
+                  <p className="mt-4 text-sm leading-relaxed text-slate-400">{EXTENSION_SECTION.antiFraudBody}</p>
+                  <ul className="mt-6 space-y-4">
+                    {EXTENSION_SECTION.antiFraudBullets.map((bullet) => (
+                      <li key={bullet} className="flex gap-3 text-sm text-slate-300">
+                        <span className="mt-2 size-1 shrink-0 rounded-full bg-rose-300/80" aria-hidden />
+                        {bullet}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               </div>
             </div>
           </div>
@@ -340,6 +357,43 @@ export function MarketingLanding() {
                   </div>
                 ))}
               </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Open source */}
+        <section
+          id="open-source"
+          className="scroll-mt-24 border-t border-white/[0.06] px-4 py-20 sm:px-6 lg:px-8"
+        >
+          <div className="mx-auto grid max-w-6xl gap-8 rounded-[2rem] border border-cyan-300/15 bg-[linear-gradient(135deg,rgba(34,211,238,0.08),rgba(8,18,32,0.78))] p-8 sm:p-12 lg:grid-cols-[1fr_auto] lg:items-end">
+            <div className="max-w-2xl">
+              <SectionEyebrow>{OPEN_SOURCE_SECTION.label}</SectionEyebrow>
+              <h2 className="mt-3 text-2xl font-semibold tracking-tight text-white sm:text-3xl">
+                {OPEN_SOURCE_SECTION.headline}
+              </h2>
+              <p className="mt-4 text-sm leading-relaxed text-slate-400 sm:text-base">
+                {OPEN_SOURCE_SECTION.subcopy}
+              </p>
+            </div>
+            <div className="flex flex-col gap-3 sm:flex-row lg:flex-col">
+              <a
+                href={OPEN_SOURCE_SECTION.githubHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center justify-center gap-2 rounded-full border border-cyan-200/25 bg-cyan-300/12 px-5 py-3 text-sm font-semibold text-cyan-50 transition hover:bg-cyan-300/20"
+              >
+                <Github size={18} aria-hidden />
+                {OPEN_SOURCE_SECTION.githubLabel}
+                <ExternalLink size={15} className="opacity-70" aria-hidden />
+              </a>
+              <a
+                href={`mailto:${OPEN_SOURCE_SECTION.contactEmail}`}
+                className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 px-5 py-3 text-sm font-semibold text-slate-200 transition hover:border-white/20 hover:bg-white/[0.04]"
+              >
+                <Mail size={18} aria-hidden />
+                {OPEN_SOURCE_SECTION.contactEmail}
+              </a>
             </div>
           </div>
         </section>
@@ -421,6 +475,20 @@ export function MarketingLanding() {
             <Link href="/privacy-policy" className="text-slate-500 transition hover:text-slate-200">
               Privacy
             </Link>
+            <a
+              href={OPEN_SOURCE_SECTION.githubHref}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-slate-500 transition hover:text-slate-200"
+            >
+              GitHub
+            </a>
+            <a
+              href={`mailto:${OPEN_SOURCE_SECTION.contactEmail}`}
+              className="text-slate-500 transition hover:text-slate-200"
+            >
+              Contact
+            </a>
           </div>
         </div>
       </footer>
