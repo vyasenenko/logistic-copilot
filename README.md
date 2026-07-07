@@ -480,10 +480,13 @@ The current connector is generic and should be adapted to the customer's real TM
 ### Frontend
 
 - `NEXT_PUBLIC_API_URL`
+- `NEXT_PUBLIC_GA_MEASUREMENT_ID`
 - `NEXT_PUBLIC_TURNSTILE_SITE_KEY`
 - `NEXT_PUBLIC_TURNSTILE_THEME`
 - `NEXT_PUBLIC_TURNSTILE_LANGUAGE`
 - `NEXT_PUBLIC_TURNSTILE_SIZE`
+
+`NEXT_PUBLIC_GA_MEASUREMENT_ID` enables Google Analytics 4 page-view tracking across the landing page and app routes. Create a GA4 Web data stream, copy the measurement ID (`G-...`), set it before building the frontend, then use GA4 Realtime and Reports to see visits, traffic sources, country/city, device, and page paths.
 
 ## Local Development
 

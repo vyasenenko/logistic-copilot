@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 
 import { AppShell } from "@/components/AppShell";
+import { GoogleAnalytics } from "@/components/GoogleAnalytics";
 
 import "./globals.css";
 
@@ -24,6 +25,7 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body className="antialiased" suppressHydrationWarning>
+        <GoogleAnalytics />
         <AppShell>{children}</AppShell>
       </body>
     </html>

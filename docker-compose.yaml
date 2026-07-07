@@ -39,6 +39,7 @@ services:
     environment:
       # Browser on host must use the published backend port (same as BACKEND_HTTP_PORT in .env)
       - NEXT_PUBLIC_API_URL=http://localhost:${BACKEND_HTTP_PORT:-8000}
+      - NEXT_PUBLIC_GA_MEASUREMENT_ID=${NEXT_PUBLIC_GA_MEASUREMENT_ID:-}
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules

@@ -328,6 +328,7 @@ NEXT_PUBLIC_API_URL := https://api.logisticopilot.com
 endif
 # Public site key — must match Cloudflare widget; baked in at Next.js build (Dockerfile builder stage).
 NEXT_PUBLIC_TURNSTILE_SITE_KEY ?=
+NEXT_PUBLIC_GA_MEASUREMENT_ID ?= G-NTGQ0PGRW3
 # Turnstile widget (see Cloudflare docs: theme, language, size).
 NEXT_PUBLIC_TURNSTILE_THEME ?= light
 NEXT_PUBLIC_TURNSTILE_LANGUAGE ?= en
@@ -349,6 +350,11 @@ k8s-vars: ## Show K8s/image variables (TAG, PLATFORM, K8S_NS, …)
 	$(Q)printf '  IMAGE_BACKEND=%s:%s\n' "$(IMAGE_BACKEND)" "$(TAG)"
 	$(Q)printf '  IMAGE_FRONTEND=%s:%s\n' "$(IMAGE_FRONTEND)" "$(TAG)"
 	$(Q)printf '  PLATFORM=%s NEXT_PUBLIC_API_URL=%s\n' "$(PLATFORM)" "$(NEXT_PUBLIC_API_URL)"
+	$(Q)if [ -z "$(NEXT_PUBLIC_GA_MEASUREMENT_ID)" ]; then \
+		printf '  NEXT_PUBLIC_GA_MEASUREMENT_ID=(empty — analytics disabled)\n'; \
+	else \
+		printf '  NEXT_PUBLIC_GA_MEASUREMENT_ID=(set)\n'; \
+	fi
 	$(Q)if [ -z "$(NEXT_PUBLIC_TURNSTILE_SITE_KEY)" ]; then \
 		printf '  NEXT_PUBLIC_TURNSTILE_SITE_KEY=(empty — pass for prod frontend build)\n'; \
 	else \
@@ -369,6 +375,7 @@ k8s-buildx-frontend: ## Build and push frontend (NEXT_PUBLIC_* from env; Turnsti
 	$(call log_info,buildx push $(IMAGE_FRONTEND):$(TAG))
 	$(Q)docker buildx build --platform $(PLATFORM) \
 		--build-arg NEXT_PUBLIC_API_URL=$(NEXT_PUBLIC_API_URL) \
+		--build-arg NEXT_PUBLIC_GA_MEASUREMENT_ID=$(NEXT_PUBLIC_GA_MEASUREMENT_ID) \
 		--build-arg NEXT_PUBLIC_TURNSTILE_SITE_KEY=$(NEXT_PUBLIC_TURNSTILE_SITE_KEY) \
 		--build-arg NEXT_PUBLIC_TURNSTILE_THEME=$(NEXT_PUBLIC_TURNSTILE_THEME) \
 		--build-arg NEXT_PUBLIC_TURNSTILE_LANGUAGE=$(NEXT_PUBLIC_TURNSTILE_LANGUAGE) \
