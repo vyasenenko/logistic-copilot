@@ -173,7 +173,7 @@ export const OPEN_SOURCE_SECTION = {
     "Logistic Copilot is open source. Review the code, follow the roadmap, or reach out if you want to run it with your freight workflow.",
   githubHref: "https://github.com/vyasenenko/logistic-copilot",
   githubLabel: "View on GitHub",
-  contactEmail: "vitalii@logisticopilot.com",
+  contactEmail: "vyasenenko@gmail.com",
 } as const;
 
 export type FaqItem = {

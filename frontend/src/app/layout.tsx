@@ -2,10 +2,12 @@ import type { Metadata } from "next";
 
 import { AppShell } from "@/components/AppShell";
 import { GoogleAnalytics } from "@/components/GoogleAnalytics";
+import { SITE_URL } from "@/constants/site";
 
 import "./globals.css";
 
 export const metadata: Metadata = {
+  metadataBase: new URL(SITE_URL),
   title: "Freight Control Tower",
   description: "Outlook-first logistics workflow dashboard",
   icons: {

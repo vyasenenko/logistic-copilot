@@ -1,0 +1,51 @@
+name: Deploy to Kubernetes
+
+# Manual rollout of images already built by "Build and push images".
+# Requires repository secret KUBE_CONFIG: base64 of a kubeconfig with access to the cluster
+#   base64 -i ~/.kube/config | pbcopy      (macOS)
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to deploy (default: latest)"
+        required: false
+        default: latest
+        type: string
+      namespace:
+        description: "Kubernetes namespace"
+        required: false
+        default: ai-agent
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl config current-context
+
+      - name: Set images and wait for rollout
+        env:
+          NS: ${{ inputs.namespace }}
+          TAG: ${{ inputs.tag }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Image refs must be lowercase even when the GitHub owner is not.
+          owner=$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')
+          stamp=$(date -u +%FT%TZ)
+          # One patch per deployment: new image + a restart annotation, so redeploying an
+          # unchanged tag (e.g. :latest) still rolls pods and re-pulls the image.
+          for app in backend frontend; do
+            patch=$(printf '{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}},"spec":{"containers":[{"name":"%s","image":"ghcr.io/%s/logistic-copilot-%s:%s"}]}}}}' \
+              "$stamp" "$app" "$owner" "$app" "$TAG")
+            kubectl patch deployment/"$app" -n "$NS" --type strategic -p "$patch"
+          done
+          kubectl rollout status deployment/backend -n "$NS" --timeout=300s
+          kubectl rollout status deployment/frontend -n "$NS" --timeout=300s

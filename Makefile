@@ -50,7 +50,7 @@ endef
 	k8s-apply-namespace k8s-apply-secrets k8s-apply-config k8s-apply-databases \
 	k8s-apply-app k8s-apply-ingress k8s-apply-letsencrypt-issuer \
 	k8s-apply-base k8s-apply-full k8s-apply-dry-run \
-	k8s-secret-from-env \
+	k8s-secret-from-env k8s-ghcr-secret k8s-set-image \
 	k8s-rollout-restart k8s-rollout-restart-backend k8s-rollout-restart-frontend \
 	k8s-status k8s-get k8s-logs-backend k8s-logs-frontend k8s-describe-backend k8s-events \
 	k8s-certificates k8s-port-forward-backend \
@@ -296,10 +296,12 @@ clean-docker: ## docker image prune -f (unused images)
 	$(call log_ok,clean-docker done)
 
 # =============================================================================
-# Kubernetes — production (DOKS, Docker Hub, cert-manager + Let’s Encrypt)
+# Kubernetes — production (DOKS, GitHub Container Registry, cert-manager + Let’s Encrypt)
 # =============================================================================
-# One-shot prod deploy: TAG=v1.2.3 make k8s-deploy
-# Image-only (manifests already applied): TAG=v1.2.3 make k8s-ship-images
+# Images are normally built by GitHub Actions (.github/workflows/docker-build.yml) and pushed to GHCR.
+# Deploy a CI-built tag: TAG=v1.2.3 make k8s-set-image   (no local build)
+# Local build+push fallback (needs `docker login ghcr.io`): TAG=v1.2.3 make k8s-ship-images
+# One-shot prod deploy from local images: TAG=v1.2.3 make k8s-deploy
 # On Apple Silicon always set PLATFORM=linux/amd64 for DOKS nodes unless you use arm nodes.
 
 K8S_DIR ?= k8s
@@ -310,7 +312,8 @@ K8S_BUILD_ENV ?= $(PROJECT_ROOT).env
 $(shell $(PYTHON) "$(PROJECT_ROOT)scripts/k8s_build_env_from_dotenv.py" "$(K8S_BUILD_ENV)" > "$(PROJECT_ROOT).k8s-dotenv.mk" 2>/dev/null)
 -include $(PROJECT_ROOT).k8s-dotenv.mk
 
-DOCKER_REGISTRY ?= issist
+# GHCR namespace = ghcr.io/<github owner>, lowercase.
+DOCKER_REGISTRY ?= ghcr.io/vyasenenko
 IMAGE_BACKEND ?= $(DOCKER_REGISTRY)/logistic-copilot-backend
 IMAGE_FRONTEND ?= $(DOCKER_REGISTRY)/logistic-copilot-frontend
 TAG ?= latest
@@ -326,6 +329,16 @@ NEXT_PUBLIC_API_URL := https://api.logisticopilot.com
 else ifneq ($(findstring [::1],$(NEXT_PUBLIC_API_URL)),)
 NEXT_PUBLIC_API_URL := https://api.logisticopilot.com
 endif
+# Canonical site origin baked into sitemap.xml / robots.txt / metadata. Same loopback guard as the API URL.
+ifeq ($(NEXT_PUBLIC_SITE_URL),)
+NEXT_PUBLIC_SITE_URL := https://logisticopilot.com
+else ifneq ($(findstring localhost,$(NEXT_PUBLIC_SITE_URL)),)
+NEXT_PUBLIC_SITE_URL := https://logisticopilot.com
+else ifneq ($(findstring 127.0.0.1,$(NEXT_PUBLIC_SITE_URL)),)
+NEXT_PUBLIC_SITE_URL := https://logisticopilot.com
+else ifneq ($(findstring [::1],$(NEXT_PUBLIC_SITE_URL)),)
+NEXT_PUBLIC_SITE_URL := https://logisticopilot.com
+endif
 # Public site key — must match Cloudflare widget; baked in at Next.js build (Dockerfile builder stage).
 NEXT_PUBLIC_TURNSTILE_SITE_KEY ?=
 NEXT_PUBLIC_GA_MEASUREMENT_ID ?= G-NTGQ0PGRW3
@@ -335,6 +348,10 @@ NEXT_PUBLIC_TURNSTILE_LANGUAGE ?= en
 NEXT_PUBLIC_TURNSTILE_SIZE ?= flexible
 # buildx --provenance=false avoids unknown/unknown in Hub manifest lists for single-platform pushes
 K8S_BUILDX_EXTRA ?= --provenance=false
+# GHCR pull secret (k8s-ghcr-secret): GitHub username + a PAT with read:packages
+GHCR_USER ?=
+GHCR_TOKEN ?=
+GHCR_SECRET_NAME ?= ghcr-creds
 # Path to env file for k8s-secret-from-env (only key=value lines, no export)
 K8S_SECRET_ENV ?=
 # DigitalOcean: cluster name or ID for doctl kubernetes cluster kubeconfig save
@@ -350,6 +367,7 @@ k8s-vars: ## Show K8s/image variables (TAG, PLATFORM, K8S_NS, …)
 	$(Q)printf '  IMAGE_BACKEND=%s:%s\n' "$(IMAGE_BACKEND)" "$(TAG)"
 	$(Q)printf '  IMAGE_FRONTEND=%s:%s\n' "$(IMAGE_FRONTEND)" "$(TAG)"
 	$(Q)printf '  PLATFORM=%s NEXT_PUBLIC_API_URL=%s\n' "$(PLATFORM)" "$(NEXT_PUBLIC_API_URL)"
+	$(Q)printf '  NEXT_PUBLIC_SITE_URL=%s\n' "$(NEXT_PUBLIC_SITE_URL)"
 	$(Q)if [ -z "$(NEXT_PUBLIC_GA_MEASUREMENT_ID)" ]; then \
 		printf '  NEXT_PUBLIC_GA_MEASUREMENT_ID=(empty — analytics disabled)\n'; \
 	else \
@@ -375,6 +393,7 @@ k8s-buildx-frontend: ## Build and push frontend (NEXT_PUBLIC_* from env; Turnsti
 	$(call log_info,buildx push $(IMAGE_FRONTEND):$(TAG))
 	$(Q)docker buildx build --platform $(PLATFORM) \
 		--build-arg NEXT_PUBLIC_API_URL=$(NEXT_PUBLIC_API_URL) \
+		--build-arg NEXT_PUBLIC_SITE_URL=$(NEXT_PUBLIC_SITE_URL) \
 		--build-arg NEXT_PUBLIC_GA_MEASUREMENT_ID=$(NEXT_PUBLIC_GA_MEASUREMENT_ID) \
 		--build-arg NEXT_PUBLIC_TURNSTILE_SITE_KEY=$(NEXT_PUBLIC_TURNSTILE_SITE_KEY) \
 		--build-arg NEXT_PUBLIC_TURNSTILE_THEME=$(NEXT_PUBLIC_TURNSTILE_THEME) \
@@ -431,6 +450,27 @@ k8s-secret-from-env: ## Secret from file: K8S_SECRET_ENV=./prod.secrets.env make
 	fi
 	$(Q)kubectl create secret generic agent-secrets --from-env-file="$(K8S_SECRET_ENV)" -n "$(K8S_NS)" --dry-run=client -o yaml | kubectl apply -f -
 	$(call log_ok,secret agent-secrets applied)
+
+k8s-ghcr-secret: ## Pull secret for private GHCR packages: GHCR_USER=... GHCR_TOKEN=<PAT read:packages> make k8s-ghcr-secret
+	$(call log_info,kubectl create secret docker-registry $(GHCR_SECRET_NAME))
+	$(Q)if [ -z "$(GHCR_USER)" ] || [ -z "$(GHCR_TOKEN)" ]; then \
+		printf '\033[31mSet GHCR_USER and GHCR_TOKEN (PAT with read:packages)\033[0m\n' >&2; \
+		exit 1; \
+	fi
+	$(Q)kubectl create secret docker-registry "$(GHCR_SECRET_NAME)" \
+		--docker-server=ghcr.io \
+		--docker-username="$(GHCR_USER)" \
+		--docker-password="$(GHCR_TOKEN)" \
+		-n "$(K8S_NS)" --dry-run=client -o yaml | kubectl apply -f -
+	$(call log_ok,secret $(GHCR_SECRET_NAME) applied)
+
+k8s-set-image: ## Point deployments at CI-built images: TAG=v1.2.3 make k8s-set-image
+	$(call log_info,kubectl set image → $(TAG))
+	$(Q)kubectl set image deployment/backend backend=$(IMAGE_BACKEND):$(TAG) -n "$(K8S_NS)"
+	$(Q)kubectl set image deployment/frontend frontend=$(IMAGE_FRONTEND):$(TAG) -n "$(K8S_NS)"
+	$(Q)kubectl rollout status deployment/backend -n "$(K8S_NS)" --timeout=300s
+	$(Q)kubectl rollout status deployment/frontend -n "$(K8S_NS)" --timeout=300s
+	$(call log_ok,k8s-set-image done — check: make k8s-status)
 
 k8s-rollout-restart-backend: ## rollout restart backend (pick up new image for TAG/latest)
 	$(call log_info,kubectl rollout restart deployment/backend)

@@ -39,6 +39,8 @@ services:
     environment:
       # Browser on host must use the published backend port (same as BACKEND_HTTP_PORT in .env)
       - NEXT_PUBLIC_API_URL=http://localhost:${BACKEND_HTTP_PORT:-8000}
+      # Canonical origin for sitemap.xml / robots.txt / metadata
+      - NEXT_PUBLIC_SITE_URL=http://localhost:${FRONTEND_HTTP_PORT:-3000}
       - NEXT_PUBLIC_GA_MEASUREMENT_ID=${NEXT_PUBLIC_GA_MEASUREMENT_ID:-}
     volumes:
       - ./frontend:/app

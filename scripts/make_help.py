@@ -47,6 +47,8 @@ SECTIONS: list[tuple[str, list[str]]] = [
             "k8s-apply-full",
             "k8s-apply-dry-run",
             "k8s-secret-from-env",
+            "k8s-ghcr-secret",
+            "k8s-set-image",
             "k8s-rollout-restart",
             "k8s-rollout-restart-backend",
             "k8s-rollout-restart-frontend",

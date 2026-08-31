@@ -1,6 +1,8 @@
-# Set image tags per release: issist/logistic-copilot-backend:TAG and issist/logistic-copilot-frontend:TAG
-# Private Hub images: create secret in ai-agent, e.g. kubectl create secret docker-registry dockerhub-issist ...
-# then reference it below (or change name to match your secret).
+# Images are built and pushed by GitHub Actions (.github/workflows/docker-build.yml) to GHCR:
+#   ghcr.io/vyasenenko/logistic-copilot-backend:TAG and ...-frontend:TAG
+# Deploy a tag: TAG=v1.2.3 make k8s-set-image  (or run the "Deploy to Kubernetes" workflow).
+# Private packages need a pull secret in ai-agent: make k8s-ghcr-secret GHCR_USER=... GHCR_TOKEN=...
+# If you make the GHCR packages public, drop the imagePullSecrets blocks below.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,10 +25,10 @@ spec:
         app: backend
     spec:
       imagePullSecrets:
-        - name: dockerhub-issist
+        - name: ghcr-creds
       containers:
         - name: backend
-          image: issist/logistic-copilot-backend:latest
+          image: ghcr.io/vyasenenko/logistic-copilot-backend:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
@@ -88,10 +90,10 @@ spec:
         app: frontend
     spec:
       imagePullSecrets:
-        - name: dockerhub-issist
+        - name: ghcr-creds
       containers:
         - name: frontend
-          image: issist/logistic-copilot-frontend:latest
+          image: ghcr.io/vyasenenko/logistic-copilot-frontend:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
