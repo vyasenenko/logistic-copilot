@@ -1,8 +1,9 @@
 # Images are built and pushed by GitHub Actions (.github/workflows/docker-build.yml) to GHCR:
 #   ghcr.io/vyasenenko/logistic-copilot-backend:TAG and ...-frontend:TAG
 # Deploy a tag: TAG=v1.2.3 make k8s-set-image  (or run the "Deploy to Kubernetes" workflow).
-# Private packages need a pull secret in ai-agent: make k8s-ghcr-secret GHCR_USER=... GHCR_TOKEN=...
-# If you make the GHCR packages public, drop the imagePullSecrets blocks below.
+# The GHCR packages are public, so no pull secret is needed. If you switch them to private,
+# run `make k8s-ghcr-secret GHCR_USER=... GHCR_TOKEN=<PAT read:packages>` and add back to both
+# pod specs:  imagePullSecrets: [{name: ghcr-creds}]
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,8 +25,6 @@ spec:
       labels:
         app: backend
     spec:
-      imagePullSecrets:
-        - name: ghcr-creds
       containers:
         - name: backend
           image: ghcr.io/vyasenenko/logistic-copilot-backend:latest
@@ -89,8 +88,6 @@ spec:
       labels:
         app: frontend
     spec:
-      imagePullSecrets:
-        - name: ghcr-creds
       containers:
         - name: frontend
           image: ghcr.io/vyasenenko/logistic-copilot-frontend:latest
